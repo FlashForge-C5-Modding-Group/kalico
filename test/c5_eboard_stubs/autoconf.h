@@ -1,0 +1,3 @@
+#ifndef __C5_EBOARD_TEST_AUTOCONF_H
+#define __C5_EBOARD_TEST_AUTOCONF_H
+#endif

@@ -22,6 +22,10 @@ class QueryEndstops:
             desc=self.cmd_QUERY_ENDSTOPS_help,
         )
         gcode.register_command("M119", self.cmd_QUERY_ENDSTOPS)
+        gcode.register_command(
+            "RECOVER_ENDSTOPS", self.cmd_RECOVER_ENDSTOPS,
+            desc=self.cmd_RECOVER_ENDSTOPS_help,
+        )
 
     def register_endstop(self, mcu_endstop, name):
         self.endstops.append((mcu_endstop, name))
@@ -46,6 +50,7 @@ class QueryEndstops:
         )
 
     cmd_QUERY_ENDSTOPS_help = "Report on the status of each endstop"
+    cmd_RECOVER_ENDSTOPS_help = "Request MCU-side endstop state recovery"
 
     def cmd_QUERY_ENDSTOPS(self, gcmd):
         # Query the endstops
@@ -62,6 +67,18 @@ class QueryEndstops:
             ]
         )
         gcmd.respond_raw(msg)
+
+    def cmd_RECOVER_ENDSTOPS(self, gcmd):
+        recovered = 0
+        for mcu_endstop, name in self.endstops:
+            recover = getattr(mcu_endstop, "recover_endstop_state", None)
+            if recover is not None:
+                recover()
+                recovered += 1
+        gcmd.respond_info(
+            "RECOVER_ENDSTOPS: requested recovery on %d endstop(s)"
+            % recovered
+        )
 
 
 def load_config(config):

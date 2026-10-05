@@ -1,0 +1,3 @@
+#ifndef __C5_LEVELBOARD_TEST_MISC_H
+#define __C5_LEVELBOARD_TEST_MISC_H
+#endif

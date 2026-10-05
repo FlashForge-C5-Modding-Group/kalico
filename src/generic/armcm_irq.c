@@ -4,6 +4,7 @@
 //
 // This file may be distributed under the terms of the GNU GPLv3 license.
 
+#include "autoconf.h" // CONFIG_MACH_N32G45x
 #include "board/internal.h" // __CORTEX_M
 #include "irq.h" // irqstatus_t
 #include "sched.h" // DECL_SHUTDOWN
@@ -38,8 +39,8 @@ irq_restore(irqstatus_t flag)
 void
 irq_wait(void)
 {
-    if (__CORTEX_M == 7)
-        // Cortex-m7 may disable cpu counter on wfi, so use nop
+    // The N32 parts' flash cache also makes wfi unsafe for interrupt wakeup.
+    if (__CORTEX_M == 7 || CONFIG_MACH_N32G45x || CONFIG_MACH_N32G430)
         asm volatile("cpsie i\n    nop\n    cpsid i\n" ::: "memory");
     else
         asm volatile("cpsie i\n    wfi\n    cpsid i\n" ::: "memory");

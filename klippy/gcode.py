@@ -216,7 +216,8 @@ class GCodeDispatch:
                 cmd.upper() != cmd
                 or not cmd.replace("_", "A").isalnum()
                 or cmd[0].isdigit()
-                or cmd[1:2].isdigit()
+                or (cmd[1:2].isdigit() and not re.match(
+                    r"^[A-Z][0-9]+_[A-Z0-9_]+$", cmd))
             ):
                 raise self.printer.config_error(
                     "Can't register '%s' as it is an invalid name" % (cmd,)
@@ -292,6 +293,11 @@ class GCodeDispatch:
     args_r = re.compile("([A-Z_]+|[A-Z*])")
 
     def _process_commands(self, commands, need_ack=True):
+        reactor = (
+            self.printer.get_reactor() if not need_ack and len(commands) > 1
+            else None
+        )
+        next_yield = reactor.monotonic() + 0.010 if reactor is not None else None
         for line in commands:
             # Ignore comments and leading/trailing spaces
             line = origline = line.strip()
@@ -305,6 +311,8 @@ class GCodeDispatch:
                 cmd = "".join(parts[3:5]).strip()
             else:
                 cmd = "".join(parts[:3]).strip()
+            if re.match(r"^[A-Z][0-9]+_[A-Z0-9_]+(?:\s|$)", line.upper()):
+                cmd = line.split(None, 1)[0].upper()
             # Build gcode "params" dictionary
             params = {
                 parts[i]: parts[i + 1].strip() for i in range(1, len(parts), 2)
@@ -329,6 +337,9 @@ class GCodeDispatch:
                 if not need_ack:
                     raise
             gcmd.ack()
+            if next_yield is not None and reactor.monotonic() >= next_yield:
+                reactor.pause(reactor.NOW)
+                next_yield = reactor.monotonic() + 0.010
 
     def run_script_from_command(self, script):
         self._script_context += 1

@@ -4,7 +4,11 @@
 
 #include "autoconf.h" // CONFIG_MACH_STM32F1
 
-#if CONFIG_MACH_STM32F0
+#if CONFIG_MACH_GD32H7
+#include "gd32h7.h"
+#elif CONFIG_MACH_N32G430
+#include "n32g430.h"
+#elif CONFIG_MACH_STM32F0
 #include "stm32f0xx.h"
 #elif CONFIG_MACH_STM32F1
 #include "stm32f1xx.h"
@@ -25,7 +29,8 @@
 #endif
 
 // gpio.c
-extern GPIO_TypeDef * const digital_regs[];
+GPIO_TypeDef *gpio_pin_to_regs(uint32_t pin);
+int gpio_regs_to_pin(GPIO_TypeDef *regs, uint32_t bit);
 #define GPIO(PORT, NUM) (((PORT)-'A') * 16 + (NUM))
 #define GPIO2PORT(PIN) ((PIN) / 16)
 #define GPIO2BIT(PIN) (1<<((PIN) % 16))
@@ -52,5 +57,8 @@ struct cline { volatile uint32_t *en, *rst; uint32_t bit; };
 struct cline lookup_clock_line(uint32_t periph_base);
 uint32_t get_pclock_frequency(uint32_t periph_base);
 void gpio_clock_enable(GPIO_TypeDef *regs);
+#if CONFIG_MACH_N32G45x
+void stm32f1_alternative_remap(uint32_t mapr_mask, uint32_t mapr_value);
+#endif
 
 #endif // internal.h

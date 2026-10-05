@@ -109,7 +109,12 @@ reset_handler_stage_two(void)
 
 // Initial code entry point - invoked by the processor after a reset
 // Reset interrupts and stack to take control from bootloaders
-void __section(".text.armcm_boot.stage_one")
+#if CONFIG_ARMCM_EXPLICIT_RESET_ENTRY
+#define ARMCM_ENTRY_ATTR __visible
+#else
+#define ARMCM_ENTRY_ATTR
+#endif
+void __section(".text.armcm_boot.stage_one") ARMCM_ENTRY_ATTR
 ResetHandler(void)
 {
     __disable_irq();

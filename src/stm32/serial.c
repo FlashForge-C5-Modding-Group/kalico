@@ -11,12 +11,24 @@
 #include "internal.h" // enable_pclock
 #include "sched.h" // DECL_INIT
 
+#if CONFIG_MACH_N32G430
+#define GPIO_MODE_FLAGS GPIO_HIGH_SPEED
+#define GPIO_TX_PULLUP 1
+#else
+#define GPIO_MODE_FLAGS 0
+#define GPIO_TX_PULLUP 0
+#endif
+
 // Select the configured serial port
 #if CONFIG_STM32_SERIAL_USART1
   DECL_CONSTANT_STR("RESERVE_PINS_serial", "PA10,PA9");
   #define GPIO_Rx GPIO('A', 10)
   #define GPIO_Tx GPIO('A', 9)
-  #define GPIO_AF_MODE 7
+  #if CONFIG_MACH_N32G430
+    #define GPIO_AF_MODE 5
+  #else
+    #define GPIO_AF_MODE 7
+  #endif
   #define USARTx USART1
   #define USARTx_IRQn USART1_IRQn
 #elif CONFIG_STM32_SERIAL_USART1_ALT_PB7_PB6
@@ -110,7 +122,10 @@ serial_init(void)
     USARTx->CR1 = CR1_FLAGS;
     armcm_enable_irq(USARTx_IRQHandler, USARTx_IRQn, 0);
 
-    gpio_peripheral(GPIO_Rx, GPIO_FUNCTION(GPIO_AF_MODE), 1);
-    gpio_peripheral(GPIO_Tx, GPIO_FUNCTION(GPIO_AF_MODE), 0);
+    gpio_peripheral(GPIO_Rx,
+                    GPIO_FUNCTION(GPIO_AF_MODE) | GPIO_MODE_FLAGS, 1);
+    gpio_peripheral(GPIO_Tx,
+                    GPIO_FUNCTION(GPIO_AF_MODE) | GPIO_MODE_FLAGS,
+                    GPIO_TX_PULLUP);
 }
 DECL_INIT(serial_init);

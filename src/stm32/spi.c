@@ -4,7 +4,9 @@
 //
 // This file may be distributed under the terms of the GNU GPLv3 license.
 
+#include "autoconf.h" // CONFIG_MACH_N32G45x
 #include "board/io.h" // readb, writeb
+#include "board/misc.h" // timer_read_time
 #include "command.h" // shutdown
 #include "gpio.h" // spi_setup
 #include "internal.h" // gpio_peripheral
@@ -330,6 +332,11 @@ spi_prepare(struct spi_config config)
     spi->CR1 = cr1 & ~SPI_CR1_SPE;
     spi->CR1; // Force flush of previous write
     spi->CR1 = config.spi_cr1;
+    if (CONFIG_MACH_N32G45x) {
+        uint32_t end = timer_read_time() + timer_from_us(1);
+        while (timer_is_before(timer_read_time(), end))
+            ;
+    }
 }
 
 #ifdef SPI_CR2_FRXTH // stm32 f0/f7/g0/l4/g4 supports buffering

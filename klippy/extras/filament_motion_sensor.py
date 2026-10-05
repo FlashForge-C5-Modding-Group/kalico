@@ -40,6 +40,16 @@ class EncoderSensor:
         self.printer.register_event_handler(
             "idle_timeout:idle", self._handle_not_printing
         )
+        self.gcode.register_mux_command(
+            "RESET_FILAMENT_SENSOR", "SENSOR", config.get_name().split()[-1],
+            self.cmd_RESET_FILAMENT_SENSOR
+        )
+
+    def cmd_RESET_FILAMENT_SENSOR(self, gcmd):
+        if self.extruder is None:
+            raise gcmd.error("Filament motion sensor is not ready")
+        self._update_filament_runout_pos()
+        self.runout_helper.filament_present = True
 
     def _update_filament_runout_pos(self, eventtime=None):
         if eventtime is None:
@@ -75,6 +85,8 @@ class EncoderSensor:
         return self.extruder.find_past_position(print_time)
 
     def _extruder_pos_update_event(self, eventtime):
+        if not self.runout_helper.sensor_enabled:
+            return eventtime + CHECK_RUNOUT_TIMEOUT
         extruder_pos = self.get_extruder_pos(eventtime)
         # Check for filament runout
         self.runout_helper.note_filament_present(

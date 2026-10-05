@@ -17,10 +17,14 @@ dirs-$(CONFIG_MACH_STM32L4) += lib/stm32l4
 
 MCU := $(shell echo $(CONFIG_MCU))
 MCU_UPPER := $(shell echo $(CONFIG_MCU) | tr a-z A-Z | tr X x)
+ifeq ($(CONFIG_MACH_N32G45x),y)
+MCU_UPPER := STM32F103xE
+endif
 
 CFLAGS-$(CONFIG_MACH_STM32F0) += -mcpu=cortex-m0 -Ilib/stm32f0/include
 CFLAGS-$(CONFIG_MACH_STM32F103) += -mcpu=cortex-m3
 CFLAGS-$(CONFIG_MACH_N32G45x) += -mcpu=cortex-m4 -Ilib/n32g45x/include
+CFLAGS-$(CONFIG_MACH_N32G430) += -mcpu=cortex-m4
 CFLAGS-$(CONFIG_MACH_STM32F1) += -Ilib/stm32f1/include
 CFLAGS-$(CONFIG_MACH_STM32F2) += -mcpu=cortex-m3 -Ilib/stm32f2/include
 CFLAGS-$(CONFIG_MACH_STM32F4) += -mcpu=cortex-m4 -Ilib/stm32f4/include
@@ -28,6 +32,8 @@ CFLAGS-$(CONFIG_MACH_STM32F7) += -mcpu=cortex-m7 -Ilib/stm32f7/include
 CFLAGS-$(CONFIG_MACH_STM32G0) += -mcpu=cortex-m0plus -Ilib/stm32g0/include
 CFLAGS-$(CONFIG_MACH_STM32G4) += -mcpu=cortex-m4 -Ilib/stm32g4/include
 CFLAGS-$(CONFIG_MACH_STM32H7) += -mcpu=cortex-m7 -Ilib/stm32h7/include
+CFLAGS-$(CONFIG_MACH_GD32H7) += -mcpu=cortex-m7
+CFLAGS-$(CONFIG_C5_MAINBOARDGD) += -mfpu=fpv5-d16 -mfloat-abi=softfp -ffp-contract=off -fno-math-errno
 CFLAGS-$(CONFIG_MACH_STM32L4) += -mcpu=cortex-m4 -Ilib/stm32l4/include
 CFLAGS-$(CONFIG_MACH_AT32F403) = -mcpu=cortex-m4 -Ilib/stm32f1/include
 CFLAGS += $(CFLAGS-y) -D$(MCU_UPPER) -mthumb -Ilib/cmsis-core -Ilib/fast-hash
@@ -37,18 +43,30 @@ CFLAGS_klipper.elf += -T $(OUT)src/generic/armcm_link.ld
 $(OUT)klipper.elf: $(OUT)src/generic/armcm_link.ld
 
 # Add source files
-src-y += stm32/watchdog.c stm32/clockline.c stm32/dfu_reboot.c
+watchdog-src-y := stm32/watchdog.c
+watchdog-src-$(CONFIG_MACH_GD32H7) := stm32/gd32h7_watchdog.c
+src-y += $(watchdog-src-y) stm32/clockline.c stm32/dfu_reboot.c
 src-y += generic/crc16_ccitt.c
-src-y += generic/armcm_boot.c generic/armcm_irq.c generic/armcm_reset.c
+reset-src-y := generic/armcm_reset.c
+reset-src-$(CONFIG_C5_LEVELBOARD) := stm32/n32g430_reset.c
+reset-src-$(CONFIG_C5_EBOARD) := stm32/c5_n32g45x_reset.c
+reset-src-$(CONFIG_C5_HEATERBOARD) := stm32/c5_n32g45x_reset.c
+src-y += generic/armcm_boot.c generic/armcm_irq.c $(reset-src-y)
+src-$(CONFIG_MACH_N32G430) += stm32/n32g430.c
+src-$(CONFIG_C5_LEVELBOARD) += stm32/c5_levelboard.c
 
 src-$(CONFIG_MACH_STM32F0) += stm32/stm32f0.c ../lib/stm32f0/system_stm32f0xx.c
-src-$(CONFIG_MACH_STM32F1) += stm32/stm32f1.c ../lib/stm32f1/system_stm32f1xx.c
+stm32f1-system-src-y := ../lib/stm32f1/system_stm32f1xx.c
+stm32f1-system-src-$(CONFIG_MACH_N32G45x) :=
+src-$(CONFIG_MACH_STM32F1) += stm32/stm32f1.c $(stm32f1-system-src-y)
+src-$(CONFIG_MACH_N32G45x) += stm32/n32g45x.c
 src-$(CONFIG_MACH_STM32F2) += stm32/stm32f4.c ../lib/stm32f2/system_stm32f2xx.c
 src-$(CONFIG_MACH_STM32F4) += stm32/stm32f4.c ../lib/stm32f4/system_stm32f4xx.c
 src-$(CONFIG_MACH_STM32F7) += stm32/stm32f7.c ../lib/stm32f7/system_stm32f7xx.c
 src-$(CONFIG_MACH_STM32G0) += stm32/stm32g0.c
 src-$(CONFIG_MACH_STM32G4) += stm32/stm32g4.c ../lib/stm32g4/system_stm32g4xx.c
 src-$(CONFIG_MACH_STM32H7) += stm32/stm32h7.c ../lib/stm32h7/system_stm32h7xx.c
+src-$(CONFIG_MACH_GD32H7) += stm32/gd32h7.c
 src-$(CONFIG_MACH_STM32L4) += stm32/stm32l4.c ../lib/stm32l4/system_stm32l4xx.c
 
 timer-src-y := generic/armcm_timer.c
@@ -56,8 +74,13 @@ timer-src-$(CONFIG_MACH_STM32F0) := generic/timer_irq.c stm32/stm32f0_timer.c
 timer-src-$(CONFIG_MACH_STM32G0) := generic/timer_irq.c stm32/stm32f0_timer.c
 gpio-src-y := stm32/gpio.c stm32/gpioperiph.c
 gpio-src-$(CONFIG_MACH_STM32F1) := stm32/gpio.c
+gpio-src-$(CONFIG_MACH_N32G45x) := stm32/gpio.c stm32/n32g455_gpio.c
 gpio-src-$(CONFIG_MACH_STM32H7) := stm32/stm32h7_gpio.c stm32/gpioperiph.c
+gpio-src-$(CONFIG_MACH_GD32H7) := stm32/gd32h7_gpio.c stm32/gpioperiph.c
+gpio-src-$(CONFIG_C5_MAINBOARDGD) := stm32/c5_mainboardgd_gpio.c stm32/gpioperiph.c
+gpio-src-$(CONFIG_MACH_N32G430) := stm32/gpio.c stm32/n32g430_gpio.c
 src-y += $(timer-src-y) $(gpio-src-y)
+src-$(CONFIG_MACH_N32G430F8S7) += stm32/n32g430f8s7_gpio.c
 
 adc-src-y := stm32/adc.c
 adc-src-$(CONFIG_MACH_STM32F0) := stm32/stm32f0_adc.c
@@ -65,6 +88,7 @@ adc-src-$(CONFIG_MACH_N32G45x) := ../lib/n32g45x/n32g45x_adc.c stm32/n32g45x_adc
 adc-src-$(CONFIG_MACH_STM32G0) := stm32/stm32f0_adc.c
 adc-src-$(CONFIG_MACH_STM32G4) := stm32/stm32h7_adc.c
 adc-src-$(CONFIG_MACH_STM32H7) := stm32/stm32h7_adc.c
+adc-src-$(CONFIG_MACH_GD32H7) := stm32/gd32h7_adc.c
 adc-src-$(CONFIG_MACH_STM32L4) := stm32/stm32h7_adc.c
 src-$(CONFIG_WANT_ADC) += $(adc-src-y)
 
@@ -83,6 +107,7 @@ serial-src-$(CONFIG_MACH_STM32F0) := stm32/stm32f0_serial.c
 serial-src-$(CONFIG_MACH_STM32G0) := stm32/stm32f0_serial.c
 serial-src-$(CONFIG_MACH_STM32G4) := stm32/stm32f0_serial.c
 serial-src-$(CONFIG_MACH_STM32H7) := stm32/stm32f0_serial.c
+serial-src-$(CONFIG_MACH_GD32H7) := stm32/gd32h7_serial.c
 src-$(CONFIG_SERIAL) += $(serial-src-y) generic/serial_irq.c
 
 usb-src-$(CONFIG_HAVE_STM32_USBFS) := stm32/usbfs.c
@@ -100,6 +125,9 @@ src-$(CONFIG_WANT_HARD_PWM) += stm32/hard_pwm.c
 sdio-src-y := stm32/sdio.c
 src-$(CONFIG_HAVE_GPIO_SDIO) += $(sdio-src-y)
 
+src-$(CONFIG_C5_MAINBOARDGD) += stm32/c5_mainboardgd.c stm32/c5_mainboardgd_fault.c
+src-$(CONFIG_C5_EBOARD) += stm32/c5_eboard.c
+
 # Binary output file rules
 target-y += $(OUT)klipper.bin
 
@@ -112,10 +140,30 @@ lib/hidflash/hid-flash:
 	@echo "  Building hid-flash"
 	$(Q)make -C lib/hidflash
 
+ifeq ($(CONFIG_C5_MAINBOARDGD),y)
+flash serialflash:
+	@echo "flash and serialflash are unsupported for C5 mainBoardGD; use the stock ISP update path" >&2
+	@false
+else
 flash: $(OUT)klipper.bin lib/hidflash/hid-flash
 	@echo "  Flashing $< to $(FLASH_DEVICE)"
 	$(Q)$(PYTHON) ./scripts/flash_usb.py -t $(CONFIG_MCU) -d "$(FLASH_DEVICE)" -s "$(CONFIG_FLASH_APPLICATION_ADDRESS)" $(if $(NOSUDO),--no-sudo) $(OUT)klipper.bin
 
+ifeq ($(CONFIG_C5_EBOARD),y)
+serialflash:
+	@echo "serialflash is unsupported for C5 eBoard; use the stock IAP update path" >&2
+	@false
+else ifeq ($(CONFIG_C5_LEVELBOARD),y)
+serialflash:
+	@echo "serialflash is unsupported for C5 levelBoard; use the stock IAP update path" >&2
+	@false
+else ifeq ($(CONFIG_MACH_N32G430),y)
+serialflash:
+	@echo "serialflash is unsupported for N32G430; no serial flashing transport is implemented" >&2
+	@false
+else
 serialflash: $(OUT)klipper.bin
 	@echo "  Flashing $< to $(FLASH_DEVICE) via stm32flash"
 	$(Q)stm32flash -w $< -v -g 0 $(FLASH_DEVICE)
+endif
+endif

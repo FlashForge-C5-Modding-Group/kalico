@@ -54,6 +54,8 @@ config SERIAL_BOOTLOADER_SIDECHANNEL
 config SERIAL_BAUD
     depends on SERIAL
     int "Baud rate for serial port" if LOW_LEVEL_OPTIONS
+    default 460800 if C5_EBOARD
+    default 230400 if C5_LEVELBOARD || C5_HEATERBOARD || C5_MAINBOARDGD
     default 250000
     help
         Specify the baud rate of the serial port. This should be set

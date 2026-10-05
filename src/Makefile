@@ -1,9 +1,20 @@
 # Main code build rules
 
 src-y += sched.c command.c basecmd.c debugcmds.c
-src-$(CONFIG_HAVE_GPIO) += initial_pins.c gpiocmds.c stepper.c endstop.c \
-    trsync.c
-src-$(CONFIG_WANT_ADC) += adccmds.c
+src-$(CONFIG_C5_BOARD) += c5_version.c
+src-$(CONFIG_C5_MAINBOARDGD) += c5_mainboardgd.c c5_mclib.c
+src-$(CONFIG_C5_LEVELBOARD) += c5_levelboard.c
+src-$(CONFIG_C5_EBOARD) += c5_eboard.c c5_eboard_pa.c
+endstop-src-y := endstop.c
+endstop-src-$(CONFIG_C5_LEVELBOARD) := c5_endstop.c
+endstop-src-$(CONFIG_C5_EBOARD) := c5_endstop.c
+src-$(CONFIG_HAVE_GPIO) += initial_pins.c gpiocmds.c stepper.c \
+    $(endstop-src-y) trsync.c
+adccmds-src-y := adccmds.c
+adccmds-src-$(CONFIG_C5_MAINBOARDGD) := c5_adccmds.c
+adccmds-src-$(CONFIG_C5_EBOARD) := c5_adccmds.c
+adccmds-src-$(CONFIG_C5_HEATERBOARD) := c5_adccmds.c
+src-$(CONFIG_WANT_ADC) += $(adccmds-src-y)
 src-$(CONFIG_WANT_SPI) += spicmds.c
 src-$(CONFIG_WANT_I2C) += i2ccmds.c
 src-$(CONFIG_WANT_HARD_PWM) += pwmcmds.c

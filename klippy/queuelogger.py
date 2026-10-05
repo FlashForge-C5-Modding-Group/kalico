@@ -42,6 +42,7 @@ class QueueListener(logging.handlers.TimedRotatingFileHandler):
         self.bg_thread = threading.Thread(target=self._bg_thread)
         self.bg_thread.start()
         self.rollover_info = {}
+        self._last_rollover_date = None
 
     def _bg_thread(self):
         while True:
@@ -63,11 +64,22 @@ class QueueListener(logging.handlers.TimedRotatingFileHandler):
     def clear_rollover_info(self):
         self.rollover_info.clear()
 
+    def shouldRollover(self, record):
+        today = time.localtime()[:3]
+        if self._last_rollover_date == today:
+            return False
+        return logging.handlers.TimedRotatingFileHandler.shouldRollover(
+            self, record
+        )
+
     def doRollover(self):
-        before = self.rolloverAt
         logging.handlers.TimedRotatingFileHandler.doRollover(self)
-        if self.rolloverAt <= before:
-            return
+        now = int(time.time())
+        self._last_rollover_date = time.localtime(now)[:3]
+        if self.rolloverAt <= now:
+            self.rolloverAt = self.computeRollover(now)
+            if self.rolloverAt <= now:
+                self.rolloverAt = now + self.interval
         lines = [
             self.rollover_info[name] for name in sorted(self.rollover_info)
         ]
@@ -75,7 +87,7 @@ class QueueListener(logging.handlers.TimedRotatingFileHandler):
             "=============== Log rollover at %s ==============="
             % (time.asctime(),)
         )
-        self.emit(
+        logging.FileHandler.emit(self,
             logging.makeLogRecord(
                 {"msg": "\n".join(lines), "level": logging.INFO}
             )

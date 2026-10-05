@@ -54,6 +54,18 @@ lookup_clock_line(uint32_t periph_base)
 uint32_t
 get_pclock_frequency(uint32_t periph_base)
 {
+    if (CONFIG_MACH_N32G45x) {
+        if (periph_base >= AHBPERIPH_BASE)
+            return CONFIG_CLOCK_FREQ;
+        if (periph_base >= APB2PERIPH_BASE)
+            return CONFIG_CLOCK_FREQ > 72000000
+                ? CONFIG_CLOCK_FREQ / 2 : CONFIG_CLOCK_FREQ;
+        if (CONFIG_CLOCK_FREQ > 72000000)
+            return CONFIG_CLOCK_FREQ / 4;
+        if (CONFIG_CLOCK_FREQ > 36000000)
+            return CONFIG_CLOCK_FREQ / 2;
+        return CONFIG_CLOCK_FREQ;
+    }
     return FREQ_PERIPH;
 }
 
@@ -69,6 +81,7 @@ gpio_clock_enable(GPIO_TypeDef *regs)
 // PLL (f103) input: 1 to 25Mhz, output: 16 to 72Mhz
 
 // Main clock setup called at chip startup
+#if !CONFIG_MACH_N32G45x
 static void
 clock_setup(void)
 {
@@ -123,13 +136,18 @@ clock_setup(void)
     while ((RCC->CFGR & RCC_CFGR_SWS_Msk) != RCC_CFGR_SWS_PLL)
         ;
 }
+#endif
 
 
 /****************************************************************
  * GPIO setup
  ****************************************************************/
 
+#if CONFIG_MACH_N32G45x
+void
+#else
 static void
+#endif
 stm32f1_alternative_remap(uint32_t mapr_mask, uint32_t mapr_value)
 {
     // The MAPR register is a mix of write only and r/w bits
@@ -147,7 +165,7 @@ stm32f1_alternative_remap(uint32_t mapr_mask, uint32_t mapr_value)
 void
 gpio_peripheral(uint32_t gpio, uint32_t mode, int pullup)
 {
-    GPIO_TypeDef *regs = digital_regs[GPIO2PORT(gpio)];
+    GPIO_TypeDef *regs = gpio_pin_to_regs(gpio);
 
     // Enable GPIO clock
     gpio_clock_enable(regs);
@@ -291,6 +309,7 @@ bootloader_request(void)
  ****************************************************************/
 
 // Main entry point - called from armcm_boot.c:ResetHandler()
+#if !CONFIG_MACH_N32G45x
 void
 armcm_main(void)
 {
@@ -318,3 +337,4 @@ armcm_main(void)
 
     sched_main();
 }
+#endif
