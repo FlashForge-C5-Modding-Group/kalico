@@ -8,6 +8,7 @@
 #include "autoconf.h" // CONFIG_C5_EBOARD
 #include "board/armcm_boot.h" // armcm_enable_irq
 #include "c5_eboard.h" // c5_eboard_capture
+#include "command.h" // DECL_COMMAND
 #include "internal.h" // enable_pclock
 #include "sched.h" // DECL_INIT
 
@@ -213,6 +214,29 @@ c5_tmc_boot_write(const uint8_t *data, uint_fast8_t length)
             ;
     }
 }
+
+// The extruder TMC normally uses rising-edge steps.  Only switch it to
+// both-edge mode when a host that also configures PB14 for both-edge steps
+// explicitly requests it.  Older hosts therefore retain the stock behavior.
+DECL_CONSTANT("C5_EBOARD_FAST_EXTRUDER_STEP", 1);
+void
+command_c5_eboard_fast_extruder_step(uint32_t *args)
+{
+    (void)args;
+    // GCONF: keep the stock settings, but disable multistep_filt (bit 8).
+    // The TMC2209 datasheet specifies that it is incompatible with DEDGE.
+    static const uint8_t gconf[] = {
+        0x05, 0x00, 0x80, 0x00, 0x00, 0x00, 0xd0, 0x78,
+    };
+    // CHOPCONF: keep 16 microsteps and interpolation; enable DEDGE (bit 29).
+    static const uint8_t chopconf[] = {
+        0x05, 0x00, 0xec, 0x34, 0x00, 0x82, 0xc3, 0x7b,
+    };
+    c5_tmc_boot_write(gconf, sizeof(gconf));
+    c5_tmc_boot_write(chopconf, sizeof(chopconf));
+}
+DECL_COMMAND(command_c5_eboard_fast_extruder_step,
+             "c5_eboard_fast_extruder_step");
 
 void
 c5_eboard_hardware_init(void)
