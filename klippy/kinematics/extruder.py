@@ -304,26 +304,6 @@ class PrinterExtruder:
             )
         axis_r = move.axes_r[ea_index]
         axis_d = move.axes_d[ea_index]
-        # The derivative of smoothed PA * E velocity can peak at a
-        # print/travel boundary.  Bound that E rate without changing PA.
-        if (
-            axis_r > 0.0
-            and (move.axes_d[0] or move.axes_d[1])
-            and self.extruder_stepper is not None
-        ):
-            pa = self.extruder_stepper.pressure_advance
-            smooth_time = self.extruder_stepper.pressure_advance_smooth_time
-            if pa > 0.0 and smooth_time > 0.0:
-                half_smooth_time = 0.5 * smooth_time
-                max_e_speed = self.max_e_velocity / (1.0 + pa / half_smooth_time)
-                speed_limit = min(
-                    math.sqrt(move.max_cruise_v2), max_e_speed / axis_r
-                )
-                nominal_e_speed = axis_r * speed_limit
-                move.limit_speed(
-                    speed_limit,
-                    (self.max_e_velocity - nominal_e_speed) / (pa * axis_r),
-                )
         if (not move.axes_d[0] and not move.axes_d[1]) or axis_r < 0.0:
             # Extrude only move (or retraction move) - limit accel and velocity
             if abs(axis_d) > self.max_e_dist:
