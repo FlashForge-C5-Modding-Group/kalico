@@ -1,8 +1,25 @@
 """Keep the Creator 5 eboard TMC and MCU step-edge modes matched."""
 
-import pytest
+import importlib.util
+from pathlib import Path
+import sys
+import types
+import unittest
+from unittest.mock import patch
 
-from klippy import stepper
+
+# Load only the stepper module, without importing Klippy's optional runtime
+# dependencies (such as cffi) into this small configuration test.
+package = types.ModuleType("c5_fast_step_test_package")
+package.__path__ = [str(Path(__file__).resolve().parents[1] / "klippy")]
+sys.modules[package.__name__] = package
+chelper = types.ModuleType(package.__name__ + ".chelper")
+sys.modules[chelper.__name__] = chelper
+spec = importlib.util.spec_from_file_location(
+    package.__name__ + ".stepper", Path(package.__path__[0]) / "stepper.py"
+)
+stepper = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(stepper)
 
 
 class FakeCommand:
@@ -57,33 +74,42 @@ def build_stepper(mcu, pin="PB14", pulse=None):
     return s
 
 
-@pytest.fixture(autouse=True)
-def fake_stepcompress(monkeypatch):
-    class FakeLib:
-        def stepcompress_fill(self, *args):
-            pass
+class FastStepTest(unittest.TestCase):
+    def setUp(self):
+        class FakeLib:
+            def stepcompress_fill(self, *args):
+                pass
 
-    monkeypatch.setattr(stepper.chelper, "get_ffi", lambda: (None, FakeLib()))
+        self.ffi_patch = patch.object(
+            stepper.chelper, "get_ffi", return_value=(None, FakeLib()), create=True
+        )
+        self.ffi_patch.start()
+        self.addCleanup(self.ffi_patch.stop)
+
+    def test_fast_firmware_enables_tmc_once_for_four_extruders(self):
+        mcu = FakeMCU(fast=True)
+        steppers = [build_stepper(mcu) for _ in range(4)]
+        configs = [c for c in mcu.commands if c.startswith("config_stepper ")]
+        self.assertEqual(mcu.commands.count("c5_eboard_fast_extruder_step"), 1)
+        self.assertEqual(len(configs), 4)
+        self.assertTrue(
+            all("invert_step=-1 step_pulse_ticks=14" in c for c in configs)
+        )
+        self.assertTrue(all(s._step_both_edge for s in steppers))
+
+    def test_old_firmware_keeps_rising_edge_and_two_microsecond_pulse(self):
+        mcu = FakeMCU(fast=False)
+        s = build_stepper(mcu)
+        self.assertNotIn("c5_eboard_fast_extruder_step", mcu.commands)
+        self.assertTrue(
+            any("invert_step=0 step_pulse_ticks=288" in c for c in mcu.commands)
+        )
+        self.assertFalse(s._step_both_edge)
+
+    def test_fast_firmware_rejects_incompatible_explicit_pulse(self):
+        with self.assertRaisesRegex(ValueError, "at most 500ns"):
+            build_stepper(FakeMCU(fast=True), pulse=0.000002)
 
 
-def test_fast_firmware_enables_tmc_once_for_four_extruders():
-    mcu = FakeMCU(fast=True)
-    steppers = [build_stepper(mcu) for _ in range(4)]
-    configs = [c for c in mcu.commands if c.startswith("config_stepper ")]
-    assert mcu.commands.count("c5_eboard_fast_extruder_step") == 1
-    assert len(configs) == 4
-    assert all("invert_step=-1 step_pulse_ticks=14" in c for c in configs)
-    assert all(s._step_both_edge for s in steppers)
-
-
-def test_old_firmware_keeps_rising_edge_and_two_microsecond_pulse():
-    mcu = FakeMCU(fast=False)
-    s = build_stepper(mcu)
-    assert "c5_eboard_fast_extruder_step" not in mcu.commands
-    assert any("invert_step=0 step_pulse_ticks=288" in c for c in mcu.commands)
-    assert not s._step_both_edge
-
-
-def test_fast_firmware_rejects_incompatible_explicit_pulse():
-    with pytest.raises(ValueError, match="at most 500ns"):
-        build_stepper(FakeMCU(fast=True), pulse=0.000002)
+if __name__ == "__main__":
+    unittest.main()
