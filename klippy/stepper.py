@@ -105,21 +105,20 @@ class MCU_stepper:
     def _build_config(self):
         constants = self._mcu.get_constants()
         if (self._step_pin == "PB14"
-                and int(constants.get("C5_EBOARD_FAST_EXTRUDER_STEP", "0"))):
+                and constants.get("MCU") == "n32g455ccl7"):
+            # Creator 5 eBoard extruder: the stock TMC2209 counts rising
+            # edges only.  A 2us pulse requires at least 4us per step in
+            # stepper_event_full(), which is longer than some valid print
+            # step intervals.  Keep single-edge mode and use a 500ns pulse.
             if (self._step_pulse_duration is not None
-                    and self._step_pulse_duration > MIN_BOTH_EDGE_DURATION):
+                    and not 0.0000002 <= self._step_pulse_duration
+                    <= 0.0000005):
                 raise self._mcu.get_printer().config_error(
-                    "The Creator 5 eboard extruder requires a step pulse "
-                    "of at most 500ns in fast-step mode")
-            if not int(constants.get("STEPPER_OPTIMIZED_EDGE", "0")):
-                raise self._mcu.get_printer().config_error(
-                    "Creator 5 eboard fast stepping requires the MCU "
-                    "optimized both-edge stepper path")
-            self._step_pulse_duration = 0.000000100
-            self._req_step_both_edge = True
-            if not getattr(self._mcu, "_c5_fast_extruder_step_configured", False):
-                self._mcu.add_config_cmd("c5_eboard_fast_extruder_step")
-                self._mcu._c5_fast_extruder_step_configured = True
+                    "Creator 5 eBoard extruder step_pulse_duration must "
+                    "be between 0.0000002 and 0.0000005")
+            if self._step_pulse_duration is None:
+                self._step_pulse_duration = 0.0000005
+            self._req_step_both_edge = False
         if self._step_pulse_duration is None:
             self._step_pulse_duration = 0.000002
         invert_step = self._invert_step

@@ -1,4 +1,4 @@
-"""Keep the Creator 5 eboard TMC and MCU step-edge modes matched."""
+"""Keep the Creator 5 eboard extruder on stock rising-edge stepping."""
 
 import importlib.util
 from pathlib import Path
@@ -29,7 +29,8 @@ class FakeCommand:
 
 class FakeMCU:
     def __init__(self, fast):
-        self.constants = {"STEPPER_STEP_BOTH_EDGE": 1}
+        self.constants = {"STEPPER_STEP_BOTH_EDGE": 1,
+                          "MCU": "n32g455ccl7"}
         if fast:
             self.constants.update(
                 C5_EBOARD_FAST_EXTRUDER_STEP=1, STEPPER_OPTIMIZED_EDGE=18
@@ -86,29 +87,41 @@ class FastStepTest(unittest.TestCase):
         self.ffi_patch.start()
         self.addCleanup(self.ffi_patch.stop)
 
-    def test_fast_firmware_enables_tmc_once_for_four_extruders(self):
+    def test_fast_capable_firmware_still_uses_rising_edge(self):
         mcu = FakeMCU(fast=True)
         steppers = [build_stepper(mcu) for _ in range(4)]
         configs = [c for c in mcu.commands if c.startswith("config_stepper ")]
-        self.assertEqual(mcu.commands.count("c5_eboard_fast_extruder_step"), 1)
+        self.assertNotIn("c5_eboard_fast_extruder_step", mcu.commands)
         self.assertEqual(len(configs), 4)
-        self.assertTrue(
-            all("invert_step=-1 step_pulse_ticks=14" in c for c in configs)
-        )
-        self.assertTrue(all(s._step_both_edge for s in steppers))
+        self.assertTrue(all("invert_step=0 step_pulse_ticks=72" in c
+                            for c in configs))
+        self.assertTrue(all(not s._step_both_edge for s in steppers))
 
-    def test_old_firmware_keeps_rising_edge_and_two_microsecond_pulse(self):
+    def test_old_firmware_keeps_rising_edge_and_short_pulse(self):
         mcu = FakeMCU(fast=False)
         s = build_stepper(mcu)
         self.assertNotIn("c5_eboard_fast_extruder_step", mcu.commands)
         self.assertTrue(
-            any("invert_step=0 step_pulse_ticks=288" in c for c in mcu.commands)
+            any("invert_step=0 step_pulse_ticks=72" in c for c in mcu.commands)
         )
         self.assertFalse(s._step_both_edge)
 
-    def test_fast_firmware_rejects_incompatible_explicit_pulse(self):
-        with self.assertRaisesRegex(ValueError, "at most 500ns"):
-            build_stepper(FakeMCU(fast=True), pulse=0.000002)
+    def test_excessively_long_explicit_pulse_is_rejected(self):
+        mcu = FakeMCU(fast=True)
+        with self.assertRaisesRegex(ValueError, "step_pulse_duration"):
+            build_stepper(mcu, pulse=0.000002)
+        self.assertNotIn("c5_eboard_fast_extruder_step", mcu.commands)
+
+    def test_too_short_explicit_pulse_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "step_pulse_duration"):
+            build_stepper(FakeMCU(fast=False), pulse=0.0000001)
+
+    def test_other_mcu_keeps_generic_two_microsecond_pulse(self):
+        mcu = FakeMCU(fast=False)
+        mcu.constants["MCU"] = "stm32f103"
+        s = build_stepper(mcu)
+        self.assertFalse(s._step_both_edge)
+        self.assertTrue(any("step_pulse_ticks=288" in c for c in mcu.commands))
 
 
 if __name__ == "__main__":
