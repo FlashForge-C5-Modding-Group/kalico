@@ -72,6 +72,7 @@ class TMC2209:
         # Allow other registers to be set from the config
         set_config_field = self.fields.set_config_field
         # GCONF
+        set_config_field(config, "index_otpw", False)
         set_config_field(config, "multistep_filt", True)
         # CHOPCONF
         set_config_field(config, "toff", 3)

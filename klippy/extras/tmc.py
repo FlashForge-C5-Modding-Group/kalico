@@ -610,7 +610,11 @@ class TMCCommandHelper:
         self.stepper = force_move.lookup_stepper(self.stepper_name)
         self.stepper.set_tmc_current_helper(self.current_helper)
         # Note pulse duration and step_both_edge optimizations available
-        self.stepper.setup_default_pulse_duration(0.000000100, True)
+        if getattr(self.mcu_tmc, "is_c5_shared_driver", False):
+            # Stock eBoard uses single-edge stepping for the shared motor.
+            self.stepper.setup_default_pulse_duration(0.000000500, False)
+        else:
+            self.stepper.setup_default_pulse_duration(0.000000100, True)
 
     def _handle_connect(self):
         # Check if using step on both edges optimization
@@ -620,7 +624,9 @@ class TMCCommandHelper:
         # Check for soft stepper enable/disable
         enable_line = self.stepper_enable.lookup_enable(self.stepper_name)
         enable_line.register_state_callback(self._handle_stepper_enable)
-        if not enable_line.has_dedicated_enable():
+        if not enable_line.has_dedicated_enable() and not getattr(
+            self.mcu_tmc, "is_c5_shared_driver", False
+        ):
             self.toff = self.fields.get_field("toff")
             self.fields.set_field("toff", 0)
             logging.info(
@@ -638,6 +644,9 @@ class TMCCommandHelper:
                 self._init_registers()
         except self.printer.command_error as e:
             logging.info("TMC %s failed to init: %s", self.name, str(e))
+            if getattr(self.mcu_tmc, "is_c5_shared_driver", False):
+                # The eBoard no longer configures this driver at boot.
+                raise
 
     # get_status information export
     def get_status(self, eventtime=None):

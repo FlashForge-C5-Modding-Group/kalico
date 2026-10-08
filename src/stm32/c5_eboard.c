@@ -7,7 +7,10 @@
 #include <stdint.h> // uintptr_t
 #include "autoconf.h" // CONFIG_C5_EBOARD
 #include "board/armcm_boot.h" // armcm_enable_irq
+#include "board/irq.h" // irq_save
+#include "board/misc.h" // timer_read_time
 #include "c5_eboard.h" // c5_eboard_capture
+#include "command.h" // DECL_COMMAND
 #include "internal.h" // enable_pclock
 #include "sched.h" // DECL_INIT
 
@@ -42,6 +45,7 @@ static volatile uint32_t dma_snapshot;
 static uint32_t previous_snapshot, poll_divider;
 static volatile uint8_t pa_mode_active;
 static uint8_t tmc_request[4] = { 0x05, 0x00, 0x41, 0xcf };
+static uint8_t tmc_transfer[8];
 static volatile uint8_t tmc_response[15];
 
 static volatile uint32_t *
@@ -203,16 +207,93 @@ c5_eboard_set_pa_mode(uint8_t active)
     C5_EBOARD_REGISTER_TRACE(C5_TRACE_NORMAL_TIM1_ENABLE);
 }
 
-static void
-c5_tmc_boot_write(const uint8_t *data, uint_fast8_t length)
+// Host-controlled TMC2209 access uses the eBoard's dedicated USART3 and
+// DMA receive path. GPIO bitbanging PB10/PB11 would contend with pressure-
+// advance sampling, so only this command may transfer on that UART.
+void
+command_c5_tmc_uart_send(uint32_t *args)
 {
-    for (uint_fast8_t i = 0; i < length; i++) {
-        USART3->SR = ~USART_SR_TC;
-        USART3->DR = data[i];
-        while (!(USART3->SR & USART_SR_TC))
-            ;
+    uint8_t bus = args[0], write_len = args[1], read_len = args[3];
+    uint8_t *write = command_decode_ptr(args[2]);
+    uint8_t reply[15], reply_len = 0;
+    if (bus || !((write_len == 4 && read_len == 8)
+                 || (write_len == 8 && read_len == 0))) {
+        sendf("c5_tmc_uart_response bus=%c read=%*s", bus, 0, reply);
+        return;
     }
+
+    irqstatus_t flag = irq_save();
+    uint8_t resume_pa = pa_mode_active;
+    pa_mode_active = 0;
+    TIM4->CR1 &= ~TIM_CR1_CEN;
+    DMA1_Channel2->CCR &= ~1u;
+    DMA1_Channel3->CCR &= ~1u;
+    USART3->CR1 &= ~USART_CR1_IDLEIE;
+    DMA1->IFCR = N32_DMA1_CH2_ALL | N32_DMA1_CH3_ALL;
+    c5_clear_usart_idle();
+    c5_clear_tmc_response();
+    DMA1_Channel3->CNDTR = sizeof(tmc_response);
+    if (read_len)
+        DMA1_Channel3->CCR |= 1u;
+    for (uint_fast8_t i = 0; i < write_len; i++)
+        tmc_transfer[i] = write[i];
+    DMA1_Channel2->CMAR = (uint32_t)(uintptr_t)tmc_transfer;
+    DMA1_Channel2->CNDTR = write_len;
+    DMA1_Channel2->CCR |= 1u;
+    irq_restore(flag);
+
+    uint32_t deadline = timer_read_time() + timer_from_us(3000);
+    // Use the same DMA transmitter as the stock eBoard PA query.  USART3
+    // remains at its stock baud rate and the complete datagram is contiguous.
+    while (DMA1_Channel2->CCR & 1u)
+        if (!timer_is_before(timer_read_time(), deadline))
+            goto done;
+    while (!(USART3->SR & USART_SR_TC))
+        if (!timer_is_before(timer_read_time(), deadline))
+            goto done;
+    if (read_len) {
+        // Capture the whole DMA frame, including the request echo.  Klippy
+        // validates the echo and CRC and can report a partial frame.
+        while (DMA1_Channel3->CNDTR > 3)
+            if (!timer_is_before(timer_read_time(), deadline))
+                goto done;
+        // A stale leading byte can precede the request echo.  Once twelve
+        // bytes have arrived, allow the final CRC byte to reach DMA too.
+        uint32_t settle_deadline = (timer_read_time()
+                                    + timer_from_us(300));
+        while (timer_is_before(timer_read_time(), settle_deadline))
+            if (!DMA1_Channel3->CNDTR)
+                break;
+    }
+
+done:
+    flag = irq_save();
+    if (read_len) {
+        reply_len = sizeof(tmc_response) - DMA1_Channel3->CNDTR;
+        for (uint_fast8_t i = 0; i < reply_len; i++)
+            reply[i] = tmc_response[i];
+    }
+    DMA1_Channel2->CCR &= ~1u;
+    DMA1_Channel3->CCR &= ~1u;
+    DMA1->IFCR = N32_DMA1_CH2_ALL | N32_DMA1_CH3_ALL;
+    c5_clear_usart_idle();
+    c5_clear_tmc_response();
+    DMA1_Channel2->CMAR = (uint32_t)(uintptr_t)tmc_request;
+    DMA1_Channel2->CNDTR = sizeof(tmc_request);
+    DMA1_Channel3->CNDTR = sizeof(tmc_response);
+    if (resume_pa) {
+        DMA1_Channel3->CCR |= 1u;
+        pa_mode_active = 1;
+        TIM4->SR = 0;
+        TIM4->CR1 |= TIM_CR1_CEN;
+    }
+    USART3->CR1 |= USART_CR1_IDLEIE;
+    irq_restore(flag);
+    sendf("c5_tmc_uart_response bus=%c read=%*s", bus, reply_len, reply);
 }
+DECL_COMMAND(command_c5_tmc_uart_send,
+             "c5_tmc_uart_send bus=%c write=%*s read=%c");
+DECL_CONSTANT("C5_EBOARD_TMC_UART", 1);
 
 void
 c5_eboard_hardware_init(void)
@@ -286,22 +367,6 @@ c5_eboard_hardware_init(void)
     armcm_enable_irq(DMA1_Channel3_IRQHandler, DMA1_Channel3_IRQn, 14);
     armcm_enable_irq(TIM4_IRQHandler, TIM4_IRQn, 0);
     armcm_enable_irq(USART3_IRQHandler, USART3_IRQn, 14);
-
-    // TMC UART write: sync, slave, register | 0x80, big-endian data, CRC.
-    static const uint8_t tmc_init[][8] = {
-        // GCONF (0x00) = 0x000001d0
-        { 0x05, 0x00, 0x80, 0x00, 0x00, 0x01, 0xd0, 0xce },
-        // IHOLD_IRUN (0x10) = 0x000a0c0c
-        { 0x05, 0x00, 0x90, 0x00, 0x0a, 0x0c, 0x0c, 0x1d },
-        // TPOWERDOWN (0x11) = 0x00000080
-        { 0x05, 0x00, 0x91, 0x00, 0x00, 0x00, 0x80, 0xc0 },
-        // CHOPCONF (0x6c) = 0x140082c3
-        { 0x05, 0x00, 0xec, 0x14, 0x00, 0x82, 0xc3, 0x23 },
-        // PWMCONF (0x70) = 0xc80d174b
-        { 0x05, 0x00, 0xf0, 0xc8, 0x0d, 0x17, 0x4b, 0x77 },
-    };
-    for (uint_fast8_t i = 0; i < sizeof(tmc_init) / sizeof(tmc_init[0]); i++)
-        c5_tmc_boot_write(tmc_init[i], sizeof(tmc_init[i]));
 
     c5_eboard_init();
 }
