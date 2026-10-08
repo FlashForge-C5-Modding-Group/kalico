@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import traceback
 import inspect
@@ -165,7 +166,9 @@ class afc:
         self.print_metadata_delay = config.getfloat(
             "print_metadata_delay", 5., above=0.)
         self.unit_order_list        = config.get('unit_order_list','')
-        self.VarFile                = config.get('VarFile','../printer_data/config/AFC/AFC.var')# Path to the variables file for AFC configuration.
+        # Resolve a user's ~/printer_data without tying this to one username.
+        self.VarFile                = os.path.expanduser(config.get(
+            'VarFile', '../printer_data/config/AFC/AFC.var'))
         self.cfgloc                 = self._remove_after_last(self.VarFile,"/")
         self.default_material_temps = config.getlists("default_material_temps",
                                                       ("default: 235", "PLA:210", "PETG:235", "ABS:235", "ASA:235"))# Default temperature to set extruder when loading/unloading lanes. Material needs to be either manually set or uses material from spoolman if extruder temp is not set in spoolman.

@@ -100,13 +100,13 @@ class Creator5Toolchanger:
         self.station_x = config.getfloat('station_x', 28.815)
         self.station_y = config.getfloat('station_y', 215.097)
         self.station_z = config.getfloat('station_z', -1.078)
-        self.extruder_json_path = config.get(
-            'extruder_json_path', '/usr/data/firmwareRes/config/extruder.json')
+        self.extruder_json_path = os.path.expanduser(config.get(
+            'extruder_json_path', '/usr/data/firmwareRes/config/extruder.json'))
         self._load_extruder_json()
-        self.zoffset_json_path = config.get(
-            'zoffset_json_path', '/usr/data/firmwareRes/config/zoffset.json')
-        self.test_json_path = config.get(
-            'test_json_path', '/usr/data/firmwareRes/config/test.json')
+        self.zoffset_json_path = os.path.expanduser(config.get(
+            'zoffset_json_path', '/usr/data/firmwareRes/config/zoffset.json'))
+        self.test_json_path = os.path.expanduser(config.get(
+            'test_json_path', '/usr/data/firmwareRes/config/test.json'))
         self.z_adjustments = [0.] * 4
         self._load_zoffset_json()
         self.print_z_baseline = [None] * 4
