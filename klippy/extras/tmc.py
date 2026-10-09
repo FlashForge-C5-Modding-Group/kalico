@@ -609,18 +609,23 @@ class TMCCommandHelper:
         force_move = self.printer.lookup_object("force_move")
         self.stepper = force_move.lookup_stepper(self.stepper_name)
         self.stepper.set_tmc_current_helper(self.current_helper)
-        # Note pulse duration and step_both_edge optimizations available
-        if getattr(self.mcu_tmc, "is_c5_shared_driver", False):
-            # Stock eBoard uses single-edge stepping for the shared motor.
-            self.stepper.setup_default_pulse_duration(0.000000500, False)
-        else:
-            self.stepper.setup_default_pulse_duration(0.000000100, True)
+        # Note pulse duration and step_both_edge optimizations available.
+        # The eBoard shared extruder motor used to be held back to
+        # single-edge/500ns here, out of suspicion it caused
+        # under-extrusion; that turned out to be an unrelated
+        # pressure_advance_smooth_time misconfiguration (0.06 instead of
+        # the intended 0.02). With that fixed, it double-steps (DEDGE)
+        # the same as every other stepper.
+        self.stepper.setup_default_pulse_duration(0.000000100, True)
 
     def _handle_connect(self):
         # Check if using step on both edges optimization
         pulse_duration, step_both_edge = self.stepper.get_pulse_duration()
         if step_both_edge:
             self.fields.set_field("dedge", 1)
+            # TMC2209 datasheet: multistep_filt must be disabled when
+            # DEDGE is in use -- the two are documented as incompatible.
+            self.fields.set_field("multistep_filt", 0)
         # Check for soft stepper enable/disable
         enable_line = self.stepper_enable.lookup_enable(self.stepper_name)
         enable_line.register_state_callback(self._handle_stepper_enable)
