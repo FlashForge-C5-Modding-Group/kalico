@@ -2252,7 +2252,7 @@ class PackageTransformationTests(unittest.TestCase):
             shutil.which("sh"), shutil.which("md5sum"), repository)
         serialized = json.dumps(manifest)
         self.assertEqual(manifest["schema_version"], 2)
-        self.assertFalse(manifest["validation"]["hardware_verified"])
+        self.assertNotIn("hardware_verified", manifest["validation"])
         self.assertEqual(
             manifest["firmwares"]["levelBoard"]["dictionary"]["kconfig"],
             "[redacted: validated separately]")
