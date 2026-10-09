@@ -251,12 +251,6 @@ class Creator5Toolchanger:
         self.quiet_mode_switch = Creator5MiscSwitch(
             self.printer, self.gcode, 'quiet_mode',
             config.getboolean('quiet_mode_default', False))
-        self.startup_tune_switch = Creator5MiscSwitch(
-            self.printer, self.gcode, 'startup_tune',
-            config.getboolean('startup_tune_default', True))
-        self.print_start_tune_switch = Creator5MiscSwitch(
-            self.printer, self.gcode, 'print_start_tune',
-            config.getboolean('print_start_tune_default', True))
         for name, handler in (
             ('C5_TOOL_STATUS', self.cmd_status),
             ('C5_TOOL_SELECT', self.cmd_select),
