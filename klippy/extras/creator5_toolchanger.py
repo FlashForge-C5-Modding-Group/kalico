@@ -27,10 +27,6 @@ HOLDER_REFERENCE_Y_PITCH = 50.
 
 
 class Creator5MiscSwitch:
-    """Mainsail Misc switch, analogous to AFC's virtual quiet_mode sensor.
-
-    This is a setting, never a real filament sensor or a runout source.
-    """
     def __init__(self, printer, gcode, name, enabled, on_change=None):
         self.printer = printer
         self.gcode = gcode
@@ -38,12 +34,10 @@ class Creator5MiscSwitch:
         self.saved_key = 'c5_' + name
         self.enabled = bool(enabled)
         self.on_change = on_change
-        printer.add_object('filament_switch_sensor ' + name, self)
+        printer.add_object('output_pin ' + name, self)
         printer.register_event_handler('klippy:ready', self._handle_ready)
-        gcode.register_mux_command('SET_FILAMENT_SENSOR', 'SENSOR',
+        gcode.register_mux_command('SET_PIN', 'PIN',
                                    name, self.cmd_set)
-        gcode.register_mux_command('QUERY_FILAMENT_SENSOR', 'SENSOR',
-                                   name, self.cmd_query)
 
     def _handle_ready(self):
         saved = self.printer.lookup_object('save_variables', None)
@@ -67,14 +61,10 @@ class Creator5MiscSwitch:
             self.on_change()
 
     def get_status(self, eventtime):
-        return {'enabled': self.enabled, 'filament_detected': self.enabled}
+        return {'value': float(self.enabled)}
 
     def cmd_set(self, gcmd):
-        self.set_enabled(gcmd.get_int('ENABLE', 1, minval=0, maxval=1))
-        gcmd.respond_info('Creator 5 %s %s' % (
-            self.name, 'enabled' if self.enabled else 'disabled'))
-
-    def cmd_query(self, gcmd):
+        self.set_enabled(gcmd.get_float('VALUE', 0., minval=0., maxval=1.) > 0.)
         gcmd.respond_info('Creator 5 %s %s' % (
             self.name, 'enabled' if self.enabled else 'disabled'))
 
@@ -228,6 +218,8 @@ class Creator5Toolchanger:
                                                above=self.flow_slow_speed)
         self.flow_verdict_settle_ms = config.getint(
             'flow_verdict_settle_ms', 50, minval=0, maxval=500)
+        self.bed_soak_minutes = config.getfloat(
+            'bed_soak_minutes', 10., minval=0., maxval=180.)
         self.door_buttons = config.getlist('door_buttons', [])
         self.dock_buttons = config.getlist('dock_buttons',
             ['extruder_pos%d' % (i + 1) for i in range(4)])
@@ -243,6 +235,12 @@ class Creator5Toolchanger:
         self.purge_switch = Creator5MiscSwitch(
             self.printer, self.gcode, 'purge',
             config.getboolean('purge_default', True))
+        self.bed_leveling_switch = Creator5MiscSwitch(
+            self.printer, self.gcode, 'bed_leveling',
+            config.getboolean('bed_leveling_default', True))
+        self.bed_soak_switch = Creator5MiscSwitch(
+            self.printer, self.gcode, 'bed_soak',
+            config.getboolean('bed_soak_default', False))
         self.clog_switch = Creator5MiscSwitch(
             self.printer, self.gcode, 'clog_detection',
             config.getboolean('clog_detection_default', False),
@@ -253,6 +251,12 @@ class Creator5Toolchanger:
         self.quiet_mode_switch = Creator5MiscSwitch(
             self.printer, self.gcode, 'quiet_mode',
             config.getboolean('quiet_mode_default', False))
+        self.startup_tune_switch = Creator5MiscSwitch(
+            self.printer, self.gcode, 'startup_tune',
+            config.getboolean('startup_tune_default', True))
+        self.print_start_tune_switch = Creator5MiscSwitch(
+            self.printer, self.gcode, 'print_start_tune',
+            config.getboolean('print_start_tune_default', True))
         for name, handler in (
             ('C5_TOOL_STATUS', self.cmd_status),
             ('C5_TOOL_SELECT', self.cmd_select),
@@ -260,6 +264,7 @@ class Creator5Toolchanger:
             ('C5_WHEEL_RUNOUT', self.cmd_wheel_runout),
             ('C5_WHEEL_CLOG', self.cmd_wheel_runout),
             ('C5_TOOL_PURGE', self.cmd_purge),
+            ('C5_BED_SOAK', self.cmd_bed_soak),
             ('C5_LOWER_BED', self.cmd_lower_bed),
             ('C5_FLOW_STROKES', self.cmd_flow_strokes),
             ('C5_MISC_FLOW_ON', self.cmd_flow_on),
@@ -326,6 +331,23 @@ class Creator5Toolchanger:
     def cmd_flow_off(self, gcmd):
         self.flow_switch.set_enabled(False)
         gcmd.respond_info('Creator 5 flow calibration disabled')
+
+    def cmd_bed_soak(self, gcmd):
+        """Wait after bed heat-up without queuing a long MCU dwell."""
+        if not self.bed_soak_switch.enabled:
+            return
+        minutes = gcmd.get_float('MINUTES', self.bed_soak_minutes,
+                                 minval=0., maxval=180.)
+        if not minutes:
+            return
+        self.printer.lookup_object('toolhead').wait_moves()
+        reactor = self.printer.get_reactor()
+        deadline = reactor.monotonic() + minutes * 60.
+        gcmd.respond_info('Creator 5 bed soak: %.1f minutes before mesh'
+                          % (minutes,))
+        while reactor.monotonic() < deadline:
+            reactor.pause(min(deadline, reactor.monotonic() + 1.))
+        gcmd.respond_info('Creator 5 bed soak complete')
 
     def cmd_lower_bed(self, gcmd):
         """Move to the physical Z maximum, without G-code or nozzle offsets."""

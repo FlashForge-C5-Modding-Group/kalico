@@ -249,52 +249,49 @@ class Creator5OffsetTests(unittest.TestCase):
         printer, gcode = mock.Mock(), mock.Mock()
         switch = MODULE.Creator5FlowSwitch(printer, gcode, True)
         printer.add_object.assert_called_once_with(
-            'filament_switch_sensor flow_calibration', switch)
-        self.assertTrue(switch.get_status(0.)['enabled'])
-        switch.cmd_set(GCmd(ENABLE=0))
-        self.assertFalse(switch.get_status(0.)['enabled'])
-        self.assertFalse(switch.get_status(0.)['filament_detected'])
-        switch.cmd_set(GCmd(ENABLE=1))
-        self.assertTrue(switch.get_status(0.)['enabled'])
-        self.assertEqual(gcode.register_mux_command.call_count, 2)
+            'output_pin flow_calibration', switch)
+        self.assertEqual(switch.get_status(0.), {'value': 1.})
+        switch.cmd_set(GCmd(VALUE=0))
+        self.assertEqual(switch.get_status(0.), {'value': 0.})
+        switch.cmd_set(GCmd(VALUE=.2))
+        self.assertEqual(switch.get_status(0.), {'value': 1.})
+        gcode.register_mux_command.assert_called_once_with(
+            'SET_PIN', 'PIN', 'flow_calibration', switch.cmd_set)
 
     def test_purge_misc_switch_controls_live_state(self):
         printer, gcode = mock.Mock(), mock.Mock()
         switch = MODULE.Creator5MiscSwitch(printer, gcode, 'purge', True)
         printer.add_object.assert_called_once_with(
-            'filament_switch_sensor purge', switch)
-        self.assertTrue(switch.get_status(0.)['enabled'])
-        command = GCmd(ENABLE=0)
+            'output_pin purge', switch)
+        self.assertEqual(switch.get_status(0.), {'value': 1.})
+        command = GCmd(VALUE=0)
         switch.cmd_set(command)
-        self.assertFalse(switch.get_status(0.)['enabled'])
-        self.assertFalse(switch.get_status(0.)['filament_detected'])
+        self.assertEqual(switch.get_status(0.), {'value': 0.})
         self.assertEqual(command.message, 'Creator 5 purge disabled')
-        switch.cmd_query(command)
-        self.assertEqual(command.message, 'Creator 5 purge disabled')
-        self.assertEqual(gcode.register_mux_command.call_count, 2)
+        self.assertEqual(gcode.register_mux_command.call_count, 1)
 
     def test_lower_bed_on_end_misc_switch_starts_disabled(self):
         printer, gcode = mock.Mock(), mock.Mock()
         switch = MODULE.Creator5MiscSwitch(
             printer, gcode, 'lower_bed_on_end', False)
         printer.add_object.assert_called_once_with(
-            'filament_switch_sensor lower_bed_on_end', switch)
-        self.assertFalse(switch.get_status(0.)['enabled'])
-        switch.cmd_set(GCmd(ENABLE=1))
-        self.assertTrue(switch.get_status(0.)['enabled'])
+            'output_pin lower_bed_on_end', switch)
+        self.assertEqual(switch.get_status(0.), {'value': 0.})
+        switch.cmd_set(GCmd(VALUE=1))
+        self.assertEqual(switch.get_status(0.), {'value': 1.})
 
-    def test_misc_switch_restores_and_saves_mainsail_changes(self):
+    def test_misc_switch_restores_and_saves_fluidd_changes(self):
         printer, gcode = mock.Mock(), mock.Mock()
         printer.lookup_object.return_value = mock.Mock(
             allVariables={'c5_purge': 0})
         switch = MODULE.Creator5MiscSwitch(printer, gcode, 'purge', True)
         switch._handle_ready()
         self.assertFalse(switch.enabled)
-        switch.cmd_set(GCmd(ENABLE=1))
+        switch.cmd_set(GCmd(VALUE=1))
         self.assertTrue(switch.enabled)
         gcode.run_script_from_command.assert_called_once_with(
             'SAVE_VARIABLE VARIABLE=c5_purge VALUE=1')
-        switch.cmd_set(GCmd(ENABLE=1))
+        switch.cmd_set(GCmd(VALUE=1))
         gcode.run_script_from_command.assert_called_once()
 
     def test_misc_switch_does_not_change_when_save_fails(self):
@@ -304,7 +301,7 @@ class Creator5OffsetTests(unittest.TestCase):
         switch = MODULE.Creator5MiscSwitch(
             printer, gcode, 'lower_bed_on_end', False)
         with self.assertRaisesRegex(RuntimeError, 'disk full'):
-            switch.cmd_set(GCmd(ENABLE=1))
+            switch.cmd_set(GCmd(VALUE=1))
         self.assertFalse(switch.enabled)
 
     def test_flow_macro_commands_use_persistent_switch(self):
