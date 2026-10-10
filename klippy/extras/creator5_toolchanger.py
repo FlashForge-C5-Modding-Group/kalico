@@ -1769,16 +1769,13 @@ class Creator5Toolchanger:
         minimum_candidate = min(candidates)
         # The eboard classifies the *motor-current waveform*, not a bead on
         # the plate.  Keep the touchscreen's 1.13573/2.27146 mm extrusion
-        # pulses and their approximate durations.  Only X travel is folded
-        # into the bucket: scaling E down with X makes the waveform too short
-        # and weak for the stock classifier to ever return 9.
+        # pulses and their approximate durations; the toolhead itself stays
+        # put at the bucket position for the whole test -- only E moves.
         slow_feed = self.flow_slow_speed * 60.
         fast_feed = self.flow_fast_speed * 60.
         segments = ((slow_feed, 1.13573), (fast_feed, 2.27146),
                     (slow_feed, 1.13573), (slow_feed, 1.13573),
                     (fast_feed, 2.27146), (slow_feed, 1.13573))
-        left = self.purge_x - self.flow_sweep_x / 2.
-        right = self.purge_x + self.flow_sweep_x / 2.
 
         def measure():
             self._run('ACTIVATE_EXTRUDER EXTRUDER=%s' % extruder)
@@ -1793,7 +1790,6 @@ class Creator5Toolchanger:
                           % self.flow_test_accel)
                 self._move_to_prep_bucket()
                 self._move(z=self.flow_test_z, feed=1200, machine=False)
-                self._move(x=left, feed=3000, machine=False)
                 for repeat in range(5):
                     successful = []
                     for advance in candidates:
@@ -1801,10 +1797,9 @@ class Creator5Toolchanger:
                                   'ADVANCE=%.4f' % (extruder, advance))
                         pa.pa_action(11, 666)
                         try:
-                            for index, (feed, amount) in enumerate(segments):
-                                x = right if index % 2 == 0 else left
-                                self._run('G1 X%.3f E%.5f F%.0f' %
-                                          (x, amount, feed))
+                            for feed, amount in segments:
+                                self._run('G1 E%.5f F%.0f' %
+                                          (amount, feed))
                         finally:
                             self._run('M400')
                             pa.pa_action(0, 666)
