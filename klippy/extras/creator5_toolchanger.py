@@ -265,6 +265,7 @@ class Creator5Toolchanger:
             ('C5_WHEEL_RUNOUT', self.cmd_wheel_runout),
             ('C5_WHEEL_CLOG', self.cmd_wheel_runout),
             ('C5_TOOL_PURGE', self.cmd_purge),
+            ('C5_MOVE_TO_PURGE_BUCKET', self.cmd_move_to_purge_bucket),
             ('C5_BED_SOAK', self.cmd_bed_soak),
             ('C5_LOWER_BED', self.cmd_lower_bed),
             ('C5_FLOW_STROKES', self.cmd_flow_strokes),
@@ -1253,36 +1254,41 @@ class Creator5Toolchanger:
         gcmd.respond_info('T%d levelboard XY X=%.4f Y=%.4f' % (tool, x, y))
 
     def _probe_stock_pin(self, gcmd, x, y):
+        # Kalico's probe.py has no get_probe_params()/start_probe_session()
+        # (those are mainline klipper's ProbeSessionHelper API) -- its
+        # PrinterProbe.run_probe(gcmd) already does its own multi-sample
+        # averaging and returns a plain [x, y, z] list, so drive it
+        # directly using its own sample_retract_dist/get_lift_speed.
         probe = self.printer.lookup_object('probe', None)
         if probe is None:
             raise gcmd.error('Stock [probe] pin is required for offset calibration')
         toolhead = self.printer.lookup_object('toolhead')
-        params = probe.get_probe_params(gcmd)
+        sample_retract_dist = gcmd.get_float(
+            'SAMPLE_RETRACT_DIST', probe.sample_retract_dist, above=0.)
+        lift_speed = probe.get_lift_speed(gcmd)
         self._raise_z()
         self._move(x=x, y=y, feed=2400)
-        session = probe.start_probe_session(gcmd)
+        probe.multi_probe_begin(always_restore_toolhead=True)
         try:
+            values = []
             for i in range(3):
-                session.run_probe(gcmd)
+                pos = probe.run_probe(gcmd)
+                values.append(pos[2])
                 if i < 2:
-                    # run_probe() (SampleAveragingHelper, see probe.py)
-                    # only retracts between its OWN internal samples, never
-                    # after the last one -- every other multi-probe caller
-                    # in klipper (e.g. cmd_PROBE_ACCURACY) explicitly lifts
-                    # between calls for exactly this reason. Without it,
-                    # the next outer iteration here starts right at the
-                    # previous contact point with the probe still
-                    # physically triggered, which is what was producing
-                    # "Probe triggered prior to movement" consistently on
-                    # the 2nd/3rd outer probe.
-                    lift_z = (toolhead.get_position()[2]
-                             + params['sample_retract_dist'])
-                    self._move(z=lift_z, feed=params['lift_speed'] * 60)
-            positions = session.pull_probed_results()
+                    # run_probe() only retracts between its OWN internal
+                    # samples, never after the last one -- every other
+                    # multi-probe caller in klipper (e.g. cmd_PROBE_ACCURACY)
+                    # explicitly lifts between calls for exactly this
+                    # reason. Without it, the next outer iteration here
+                    # starts right at the previous contact point with the
+                    # probe still physically triggered, which is what was
+                    # producing "Probe triggered prior to movement"
+                    # consistently on the 2nd/3rd outer probe.
+                    lift_z = toolhead.get_position()[2] + sample_retract_dist
+                    self._move(z=lift_z, feed=lift_speed * 60)
         finally:
-            session.end_probe_session()
+            probe.multi_probe_end()
             self._raise_z()
-        values = [pos.bed_z for pos in positions]
         if (len(values) != 3 or not all(math.isfinite(z) for z in values)
                 or max(values) - min(values) >= .1):
             raise gcmd.error('Stock calibration pin is not repeatable within 0.1 mm')
@@ -1707,6 +1713,19 @@ class Creator5Toolchanger:
                     if state_saved and not complete:
                         self._run('RESTORE_GCODE_STATE NAME=C5_HOLDER_CALIBRATE MOVE=0')
         self._with_motion(gcmd, calibrate)
+
+    def cmd_move_to_purge_bucket(self, gcmd):
+        # Called before heating to the full priming temperature so any ooze
+        # during heat-soak lands in the purge bucket instead of wherever the
+        # pickup left the toolhead (often over the bed).
+        dock, grab, attached = self._preflight(gcmd)
+        if attached is None:
+            raise gcmd.error('No attached tool to move to the purge bucket')
+        def move():
+            self._raise_z()
+            self._run('G90')
+            self._move_to_prep_bucket()
+        self._with_motion(gcmd, move)
 
     def cmd_purge(self, gcmd):
         length = gcmd.get_float('LENGTH', self.purge_length,
