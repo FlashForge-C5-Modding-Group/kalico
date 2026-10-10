@@ -18,6 +18,7 @@
 import os
 import select
 import shutil
+import socket
 import subprocess
 import termios
 
@@ -41,6 +42,15 @@ class Creator5RemoteBeeper:
         self.serial = config.get('serial', '/dev/ttyGS4')
         self.baud = config.getint('baud', 115200)
         self.timeout = config.getfloat('timeout', 4., above=0.)
+        # Wi-Fi/LAN fallback for boards pinned to 4 tunnel ports (no
+        # ttyGS4 -- see BeeperPortMissing/pi/c5-tunnel-gadget.sh): the
+        # printer's own IP/hostname reachable over the network, running
+        # the tunnel bridge's beep network listener (BEEP_NET_PORT in
+        # printer-socat/c5_socat.py or printer/c5_bridge.py). Leave unset
+        # to keep the old behavior of silently disabling the beeper when
+        # the serial port isn't present.
+        self.network_host = config.get('network_host', None)
+        self.network_port = config.getint('network_port', 8411)
         self.local_command = shutil.which(self.command)
         self.reactor = self.printer.get_reactor()
         self._pwm_configured = False
@@ -176,17 +186,50 @@ class Creator5RemoteBeeper:
                 data += chunk
         finally:
             os.close(fd)
+        self._check_reply(data)
+
+    def _check_reply(self, data):
         reply = data.split(b"\n", 1)[0].decode('utf-8', 'replace').strip()
         if reply != 'OK':
             raise self.printer.command_error(
                 'Creator 5 buzzer command failed: %s'
                 % (reply or 'no response',))
 
+    def _send_network(self, duration_ms, frequency, level):
+        line = "BEEP DURATION=%d FREQUENCY=%d LEVEL=%d\n" % (
+            duration_ms, frequency, level)
+        try:
+            with socket.create_connection(
+                    (self.network_host, self.network_port),
+                    timeout=self.timeout) as sock:
+                sock.sendall(line.encode('ascii'))
+                sock.settimeout(self.timeout)
+                data = b""
+                while b"\n" not in data and len(data) < 256:
+                    chunk = sock.recv(256)
+                    if not chunk:
+                        break
+                    data += chunk
+        except OSError as exc:
+            raise self.printer.command_error(
+                'Creator 5 buzzer: network bridge unreachable at %s:%d: %s'
+                % (self.network_host, self.network_port, exc))
+        self._check_reply(data)
+
     def _beep(self, duration_ms, frequency, level):
         if self.local_command:
             self._play_tone_local(duration_ms, frequency, level)
-        else:
+            return
+        try:
             self._send_remote(duration_ms, frequency, level)
+        except BeeperPortMissing:
+            # No gadget serial port for the beep channel (board pinned
+            # to 4 tunnel ports) -- fall back to the network if
+            # configured, otherwise keep the old silent-disable behavior
+            # (re-raise so cmd_C5_BUZZER latches _remote_port_missing).
+            if not self.network_host:
+                raise
+            self._send_network(duration_ms, frequency, level)
 
     def cmd_C5_BUZZER(self, gcmd):
         if self._remote_port_missing:
