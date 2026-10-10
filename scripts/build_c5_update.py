@@ -32,6 +32,7 @@ _ARCHIVE_SUFFIXES = (".tar", ".tar.gz", ".tgz", ".tar.xz", ".txz",
 
 CANONICAL_TEMPLATE_PROFILES = (
     {
+        "device": "Creator5Pro",
         "plaintext":
             "d3c60574199ffd5797f6a6e1f839316dbc3d5dd42e53ca2135ff4b5a30302616",
         "control":
@@ -42,6 +43,7 @@ CANONICAL_TEMPLATE_PROFILES = (
             "a042533ff5be0392455fe06a8f5270b8e27da04661e8eef830146ad540ba47e6",
     },
     {
+        "device": "Creator5Pro",
         "plaintext":
             "5aeb22a7c0f7f16c286ed74433582ee7fc1557e050dbf5243a3fb48a93960cd6",
         "control":
@@ -53,6 +55,19 @@ CANONICAL_TEMPLATE_PROFILES = (
         "space_reclaim": True,
     },
     {
+        "device": "Creator5",
+        "plaintext":
+            "41e0fe72aeb26d366341af983f98431963659a5551b6c8713d08bf6a7080c2bb",
+        "control":
+            "c500fe39463cb30847cf30fbc7b172c7d020eca9838b7cbdadbb83157213ac21",
+        "installer":
+            "d939882236fb658097c67a9c5300e2b1cecc5d62def3044d3cc9d5158ef3fd05",
+        "control_script":
+            "a56d423fb7415dca1d18d6ed74649a6b9edbdeb6dd9f058ecb8f564c57665dc2",
+        "space_reclaim": True,
+    },
+    {
+        "device": "Creator5Pro",
         "plaintext":
             "89e7b26e92d27034a07bb15a9323a2879bc29d5a7d8603984151d28243f8f1f6",
         "control":
@@ -67,7 +82,7 @@ CANONICAL_TEMPLATE_PROFILES = (
 CANONICAL_IAP_SHA256 = (
     "c258bf965a92dad33b15bff616ef3ac72e958618b9cbb059f0a9cd4602c51f68")
 PACKAGE_NAME_RE = re.compile(
-    r"^Creator5Pro-[A-Za-z0-9][A-Za-z0-9._-]*\.tgz$")
+    r"^Creator5(?:Pro)?-[A-Za-z0-9][A-Za-z0-9._-]*\.tgz$")
 COMPONENT_NAME_RE = re.compile(
     r"^(?:\./)?(control|kernel|library|software)-.+\.tar\.xz$")
 CONTROL_MEMBER_PROFILES = (
@@ -2125,6 +2140,7 @@ def _canonical_template_profile(model, md5sum="md5sum"):
     for member, expected_hash, label in gates:
         if member["sha256"] != expected_hash:
             raise ToolError("unsupported canonical %s hash" % label)
+    profile["device"] = expected["device"]
     return profile
 
 
@@ -2527,7 +2543,8 @@ def _prepare_package_output(output, input_paths):
     except (OSError, RuntimeError):
         raise ToolError("unable to resolve package output path")
     if not PACKAGE_NAME_RE.fullmatch(output.name):
-        raise ToolError("output basename must match Creator5Pro-*.tgz")
+        raise ToolError("output basename must match Creator5-*.tgz or "
+                        "Creator5Pro-*.tgz")
     validate_output_root(output.parent)
     manifest = Path(str(output) + ".manifest.json")
     if output in inputs or manifest in inputs:
@@ -2764,6 +2781,8 @@ def package_update(template, firmware_inputs, output,
     md5sum_path = _program_path("md5sum", "md5sum")
     profile = _canonical_template_profile(
         template_model["payload"], md5sum_path)
+    if not output.name.startswith(profile["device"] + "-"):
+        raise ToolError("output model does not match canonical template")
     selected_boards = tuple(firmware_inputs)
     plaintext, evidence = _build_reduced_plaintext(
         profile, firmware_data, shell_path, md5sum_path)
@@ -2804,8 +2823,13 @@ def package_update(template, firmware_inputs, output,
     }
 
 
-def run_all_stages(boards, template, output_dir, output, jobs=1,
+def run_all_stages(boards, templates, output_dir, outputs, jobs=1,
                    cross_prefix="arm-none-eabi-", openssl="openssl"):
+    # templates/outputs are parallel lists: each board is built and
+    # validated exactly once below, then packaged once per (template,
+    # output) pair -- e.g. Creator5 and Creator5Pro from the same
+    # compile, instead of repeating the whole pipeline (and the
+    # compiler invocations) once per device model.
     boards = _canonical_boards(boards)
     root = validate_output_root(output_dir)
     build_root = root / "build"
@@ -2815,21 +2839,28 @@ def run_all_stages(boards, template, output_dir, output, jobs=1,
         "elf": build_dirs[board] / "klipper.elf",
         "dictionary": build_dirs[board] / "klipper.dict",
     } for board in boards}
-    output_path = _prepare_package_output(
-        output, [template] + [path for products in firmware_inputs.values()
-                             for path in products.values()])
-    if _inside(output_path, build_root.resolve(strict=False)):
-        raise ToolError("package output must be outside the build subtree")
+    firmware_paths = [path for products in firmware_inputs.values()
+                     for path in products.values()]
+    output_paths = []
+    for template, output in zip(templates, outputs):
+        output_path = _prepare_package_output(
+            output, [template] + firmware_paths)
+        if _inside(output_path, build_root.resolve(strict=False)):
+            raise ToolError("package output must be outside the build subtree")
+        output_paths.append(output_path)
     for board in boards:
         _preflight_build_output(build_dirs[board])
     build_reports = {}
     for board in boards:
         build_reports[board] = build_firmware(
             board, build_dirs[board], jobs, cross_prefix, openssl)
-    package_report = package_update(
-        template, firmware_inputs, output, cross_prefix, openssl)
+    package_reports = [
+        package_update(template, firmware_inputs, output,
+                       cross_prefix, openssl)
+        for template, output in zip(templates, outputs)]
     return {"stage": "all", "builds": build_reports,
-            "package": package_report}
+            "package": (package_reports if len(package_reports) > 1
+                        else package_reports[0])}
 
 
 def _add_global(parser):
@@ -2879,16 +2910,26 @@ def create_argument_parser():
     inspect.add_argument("--extract-temp", action="store_true")
     package = sub.add_parser("package",
                              help="create an encrypted update package")
-    package.add_argument("--template", required=True, type=Path)
+    # --template/--output each repeatable (paired positionally) so one
+    # already-built set of firmware can be packaged for every device
+    # model (Creator5, Creator5Pro -- same MCU firmware, different
+    # canonical outer container) in a single invocation, instead of
+    # re-running the whole pipeline -- and recompiling -- once per model.
+    package.add_argument("--template", required=True, action="append",
+                         type=Path)
     package.add_argument("--firmware", required=True, action="append", nargs=4,
                          metavar=("BOARD", "HEX", "ELF", "DICT"))
-    package.add_argument("--output", required=True, type=Path)
+    package.add_argument("--output", required=True, action="append", type=Path)
     all_cmd = sub.add_parser("all", help="build, validate, and package")
     all_cmd.add_argument("--board", required=True, action="append",
                          choices=tuple(BOARD_PROFILES))
-    all_cmd.add_argument("--template", required=True, type=Path)
+    # Same multi-device packaging as above: build+validate each board
+    # exactly once regardless of how many --template/--output pairs are
+    # given.
+    all_cmd.add_argument("--template", required=True, action="append",
+                         type=Path)
     all_cmd.add_argument("--output-dir", required=True, type=Path)
-    all_cmd.add_argument("--output", required=True, type=Path)
+    all_cmd.add_argument("--output", required=True, action="append", type=Path)
     all_cmd.add_argument("--jobs", type=int, default=1)
     return parser
 
@@ -2916,12 +2957,22 @@ def main(argv=None):
                 extract_temp=args.extract_temp, openssl=args.openssl))
         elif args.command == "package":
             _require_clean_repository()
+            if len(args.template) != len(args.output):
+                raise ToolError(
+                    "--template and --output must be given the same "
+                    "number of times (one pair per device model)")
             firmware_inputs = _cli_firmware_inputs(args.firmware)
-            _json_print(package_update(
-                args.template, firmware_inputs, args.output,
-                args.cross_prefix, args.openssl))
+            reports = [package_update(
+                template, firmware_inputs, output,
+                args.cross_prefix, args.openssl)
+                for template, output in zip(args.template, args.output)]
+            _json_print(reports if len(reports) > 1 else reports[0])
         elif args.command == "all":
             _require_clean_repository()
+            if len(args.template) != len(args.output):
+                raise ToolError(
+                    "--template and --output must be given the same "
+                    "number of times (one pair per device model)")
             _json_print(run_all_stages(
                 args.board, args.template, args.output_dir, args.output,
                 args.jobs, args.cross_prefix, args.openssl))
