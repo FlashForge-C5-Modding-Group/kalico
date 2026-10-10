@@ -2202,6 +2202,35 @@ def _remove_optional_shell_block(data, start, end, required, label):
     return data[:begin] + data[finish:]
 
 
+def _neutralize_machine_check(data):
+    # runFirmwareExe.sh refuses to proceed when invoked with $1/$2 (the
+    # stock OTA update flow does this) if they don't match its own baked
+    # MACHINE/PID. Firmware is hardware-identical between Creator5 and
+    # Creator5Pro (see package_update's comment on device/output-name
+    # cross-checking), so this is the actual reason a package built from
+    # one model's template still "specifies what printer it's for" when
+    # run through the stock updater -- strip the check so the package
+    # installs regardless of which model invokes it.
+    start = b"if [ ! -f $WORK_DIR/screwflag ]; then"
+    end = b"\t\tfi\n\tfi\nfi\n"
+    if data.count(start) != 1:
+        raise ToolError("control installer machine/PID check start marker "
+                        "is missing or ambiguous")
+    begin = data.index(start)
+    finish = data.find(end, begin)
+    if finish < 0:
+        raise ToolError("control installer machine/PID check end marker "
+                        "is missing")
+    finish += len(end)
+    block = data[begin:finish]
+    required = (b'"${MACHINE}"', b'"${PID}"',
+               b"Firmware does not match machine type.")
+    if any(block.count(token) != 1 for token in required):
+        raise ToolError("control installer machine/PID check block has an "
+                        "unsupported shape")
+    return data[:begin] + data[finish:]
+
+
 def _suppress_space_reclaim(data, outer):
     if outer:
         start = b"rm /usr/prog/PROGRAM/control/*.tar.xz*\n"
@@ -2380,6 +2409,7 @@ def _build_reduced_plaintext(profile, firmware_data, shell="sh",
         raise ToolError("generated control archive is not GNU tar")
     transformed_installer = _suppress_update_other(
         profile["outer"]["./runFirmwareExe.sh"]["_data"])
+    transformed_installer = _neutralize_machine_check(transformed_installer)
     transformed_installer = _suppress_space_reclaim(
         transformed_installer, True)
     _check_shell_syntax(transformed_installer, shell)
