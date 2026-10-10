@@ -2781,8 +2781,6 @@ def package_update(template, firmware_inputs, output,
     md5sum_path = _program_path("md5sum", "md5sum")
     profile = _canonical_template_profile(
         template_model["payload"], md5sum_path)
-    if not output.name.startswith(profile["device"] + "-"):
-        raise ToolError("output model does not match canonical template")
     selected_boards = tuple(firmware_inputs)
     plaintext, evidence = _build_reduced_plaintext(
         profile, firmware_data, shell_path, md5sum_path)
