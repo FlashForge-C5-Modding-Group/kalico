@@ -251,6 +251,13 @@ class Creator5Toolchanger:
         self.quiet_mode_switch = Creator5MiscSwitch(
             self.printer, self.gcode, 'quiet_mode',
             config.getboolean('quiet_mode_default', False))
+        # Whether M191 (chamber heat-up) blocks until the chamber actually
+        # reaches target, or just requests the target and lets the print
+        # start heating in the background (M141-like). See M191 in
+        # printer.macro.cfg.
+        self.chamber_wait_switch = Creator5MiscSwitch(
+            self.printer, self.gcode, 'chamber_wait',
+            config.getboolean('chamber_wait_default', True))
         for name, handler in (
             ('C5_TOOL_STATUS', self.cmd_status),
             ('C5_TOOL_SELECT', self.cmd_select),

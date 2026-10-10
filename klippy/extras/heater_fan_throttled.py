@@ -24,6 +24,8 @@ class PrinterHeaterFanThrottled:
             "near_target_speed", 0.5, minval=0., maxval=1.)
         self.near_target_delta = config.getfloat(
             "near_target_delta", 1.5, above=0.)
+        self.near_target_power = config.getfloat(
+            "near_target_power", 0.3, minval=0., maxval=1.)
         self.last_speed = 0.
     def handle_ready(self):
         pheaters = self.printer.lookup_object('heaters')
@@ -43,8 +45,19 @@ class PrinterHeaterFanThrottled:
                 if current_temp > self.heater_temp:
                     speed = max(speed, self.fan_speed)
                 continue
-            if target_temp - current_temp <= self.near_target_delta:
-                # Close enough to target that full airflow would mostly
+            # Temperature proximity alone is noisy and can grace within
+            # near_target_delta while the heater is still working hard to
+            # climb (a PID derivative kick on a fast rise, or just normal
+            # hunting) -- that's still "actively trying to get to temp"
+            # and dropping airflow then only slows it down further.  Only
+            # throttle once the heater's own output confirms it has
+            # actually backed off, not just because the thermometer
+            # happened to read close for a moment.
+            near_target = (target_temp - current_temp <= self.near_target_delta
+                          and heater.last_pwm_value <= self.near_target_power)
+            if near_target:
+                # Close enough to target, and the heater has backed off
+                # its own power to hold it -- full airflow would mostly
                 # just overshoot/hunt -- maintain with less air instead.
                 speed = max(speed, self.near_target_speed)
             else:

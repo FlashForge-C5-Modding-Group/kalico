@@ -22,6 +22,16 @@ import subprocess
 import termios
 
 
+class BeeperPortMissing(Exception):
+    # Raised (instead of printer.command_error) when the tunnel's beep
+    # serial port doesn't exist: that means this gadget was deliberately
+    # set up without the 5th port (some boards' USB controllers can't
+    # sustain 5 active gser functions under sustained traffic -- see
+    # pi/c5-tunnel-gadget.sh), not that something is actually broken. It
+    # is always treated as a silent skip, regardless of OPTIONAL=.
+    pass
+
+
 class Creator5RemoteBeeper:
     def __init__(self, config):
         self.printer = config.get_printer()
@@ -34,6 +44,7 @@ class Creator5RemoteBeeper:
         self.local_command = shutil.which(self.command)
         self.reactor = self.printer.get_reactor()
         self._pwm_configured = False
+        self._remote_port_missing = False
         aio = self.printer.load_object(config, 'aio_executor')
         self.executor = aio.allocate_executor('creator5_remote_beeper')
         self.gcode.register_command('C5_BUZZER', self.cmd_C5_BUZZER,
@@ -101,6 +112,9 @@ class Creator5RemoteBeeper:
     def _open_serial(self):
         try:
             fd = os.open(self.serial, os.O_RDWR | os.O_NOCTTY)
+        except FileNotFoundError:
+            raise BeeperPortMissing(
+                'tunnel serial %s not present' % (self.serial,))
         except OSError as exc:
             raise self.printer.command_error(
                 'Creator 5 buzzer: cannot open tunnel serial %s: %s'
@@ -175,6 +189,8 @@ class Creator5RemoteBeeper:
             self._send_remote(duration_ms, frequency, level)
 
     def cmd_C5_BUZZER(self, gcmd):
+        if self._remote_port_missing:
+            return
         duration_ms = gcmd.get_int('DURATION', 5000, minval=1,
                                    maxval=30000)
         frequency = gcmd.get_int('FREQUENCY', 2500, minval=20, maxval=20000)
@@ -182,6 +198,11 @@ class Creator5RemoteBeeper:
         optional = gcmd.get_int('OPTIONAL', 0, minval=0, maxval=1)
         try:
             self.executor.submit(self._beep, duration_ms, frequency, level)
+        except BeeperPortMissing as exc:
+            self._remote_port_missing = True
+            gcmd.respond_info(
+                'Creator 5 buzzer: %s; beep disabled for this session'
+                % (exc,))
         except self.printer.command_error as exc:
             if not optional:
                 raise
