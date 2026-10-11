@@ -265,6 +265,16 @@ class AfcToolchanger(afcUnit):
 
         self.afc.function.log_toolhead_pos("After toolswap: ")
         lane.extruder_obj.estats.tool_selected.increase_count()
+        # AFC.py's own CHANGE_TOOL path advances current_toolchange for the
+        # Fluidd/Mainsail "current/total" display, but a physical
+        # toolchanger never goes through that path -- it always comes
+        # through here, so advance it the same way here too. Without
+        # this, the live counter stays stuck at 0 for every print even
+        # though number_of_toolchanges (the total) is read correctly
+        # from the sliced file's metadata.
+        if (not self.afc.error_state and self.afc.number_of_toolchanges != 0
+                and self.afc.current_toolchange != self.afc.number_of_toolchanges):
+            self.afc.current_toolchange += 1
 
     cmd_AFC_SET_TOOLHEAD_LED_help = "Turns on leds for toolhead specified by mapping, does not affect status led if status_led_idx variable is provided"
     cmd_AFC_SET_TOOLHEAD_LED_options = {
