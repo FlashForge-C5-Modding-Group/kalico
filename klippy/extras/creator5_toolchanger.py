@@ -267,6 +267,7 @@ class Creator5Toolchanger:
             ('C5_TOOL_PURGE', self.cmd_purge),
             ('C5_MOVE_TO_PURGE_BUCKET', self.cmd_move_to_purge_bucket),
             ('C5_CHECK_BUILD_PLATE', self.cmd_check_build_plate),
+            ('C5_OFFSET_WIZARD', self.cmd_offset_wizard),
             ('C5_BED_SOAK', self.cmd_bed_soak),
             ('C5_LOWER_BED', self.cmd_lower_bed),
             ('C5_FLOW_STROKES', self.cmd_flow_strokes),
@@ -1433,6 +1434,9 @@ class Creator5Toolchanger:
                       'BUILDPLATE_REMOVED=1')
 
     def cmd_calibrate_all_offsets(self, gcmd):
+        if not gcmd.get_command_parameters():
+            self._offset_wizard_step(gcmd, 'plate', 'ALL')
+            return
         if not gcmd.get_int('BUILDPLATE_REMOVED', 0, minval=0, maxval=1):
             raise gcmd.error('Remove the build plate and pass BUILDPLATE_REMOVED=1')
         save = gcmd.get_int('SAVE', 1, minval=0, maxval=1)
@@ -1474,6 +1478,9 @@ class Creator5Toolchanger:
             raise gcmd.error('Active hotend does not match the attached tool')
 
     def cmd_offset_calibrate(self, gcmd):
+        if not gcmd.get_command_parameters():
+            self._offset_wizard_step(gcmd, 'tool', '')
+            return
         if not gcmd.get_int('BUILDPLATE_REMOVED', 0, minval=0, maxval=1):
             raise gcmd.error('Remove the build plate and pass BUILDPLATE_REMOVED=1')
         tool = gcmd.get_int('T', minval=0, maxval=3)
@@ -1729,6 +1736,88 @@ class Creator5Toolchanger:
                     if state_saved and not complete:
                         self._run('RESTORE_GCODE_STATE NAME=C5_HOLDER_CALIBRATE MOVE=0')
         self._with_motion(gcmd, calibrate)
+
+    # Fluidd/Mainsail prompt flow for offset calibration without arguments:
+    # tool, then build plate removal, then (single tool) the levelboard
+    # reference. Each answer is passed to the next step as a parameter.
+    def _prompt(self, title, text, buttons=(), footer=()):
+        lines = ['action:prompt_end', 'action:prompt_begin %s' % title]
+        lines += ['action:prompt_text %s' % t for t in text]
+        if buttons:
+            lines.append('action:prompt_button_group_start')
+            lines += ['action:prompt_button %s' % b for b in buttons]
+            lines.append('action:prompt_button_group_end')
+        lines += ['action:prompt_footer_button %s' % b for b in footer]
+        lines.append('action:prompt_show')
+        for line in lines:
+            self.gcode.respond_raw('// ' + line)
+
+    def _offset_wizard_step(self, gcmd, step, tool, levelboard=1):
+        cancel = 'Cancel|C5_OFFSET_WIZARD STEP=cancel|error'
+        if step == 'tool':
+            self._prompt('Tool offset calibration',
+                         ['Which tools should be calibrated?'],
+                         ['All tools|C5_OFFSET_WIZARD STEP=plate TOOL=ALL|primary']
+                         + ['T%d|C5_OFFSET_WIZARD STEP=plate TOOL=%d|secondary'
+                            % (t, t) for t in range(4)],
+                         [cancel])
+            return
+        if tool != 'ALL' and tool not in ('0', '1', '2', '3'):
+            raise gcmd.error('TOOL must be ALL or 0..3')
+        if step == 'home':
+            self.gcode.respond_raw('// action:prompt_end')
+            self._run('G28')
+            step = 'plate'
+        if step == 'plate':
+            homed = self.printer.lookup_object('toolhead').get_status(
+                self.printer.get_reactor().monotonic())['homed_axes']
+            if tool == 'ALL' and not all(a in homed for a in 'xyz'):
+                self._prompt('Home first',
+                             ['All-tool calibration needs the printer homed. '
+                              'Keep the build plate installed while it homes.'],
+                             footer=[cancel, 'Home now|C5_OFFSET_WIZARD '
+                                     'STEP=home TOOL=ALL|primary'])
+                return
+            label = 'all tools' if tool == 'ALL' else 'T' + tool
+            nxt = ('STEP=run TOOL=ALL LEVELBOARD=1' if tool == 'ALL'
+                   else 'STEP=probe TOOL=%s' % tool)
+            self._prompt('Remove the build plate',
+                         ['Calibrating %s. Remove the build plate now, then '
+                          'confirm. The probe checks that it is really gone '
+                          'before touching anything.' % label],
+                         footer=[cancel, 'Plate removed|C5_OFFSET_WIZARD %s|primary'
+                                 % nxt])
+            return
+        if step == 'probe':
+            self._prompt('Probe offset',
+                         ['Also recalibrate the probe (levelboard reference)? '
+                          'Choose No to reuse the saved reference.'],
+                         footer=['No|C5_OFFSET_WIZARD STEP=run TOOL=%s LEVELBOARD=0'
+                                 % tool,
+                                 'Yes|C5_OFFSET_WIZARD STEP=run TOOL=%s '
+                                 'LEVELBOARD=1|primary' % tool])
+            return
+        if step == 'run':
+            self.gcode.respond_raw('// action:prompt_end')
+            if tool == 'ALL':
+                self._run('C5_CALIBRATE_ALL_OFFSETS SAVE=1 BUILDPLATE_REMOVED=1')
+            else:
+                self._run('C5_TOOL_OFFSET_CALIBRATE T=%s Z=1 SAVE=1 '
+                          'LEVELBOARD=%d BUILDPLATE_REMOVED=1'
+                          % (tool, levelboard))
+                self._run('C5_SAVE_OFFSETS_JSON')
+            return
+        raise gcmd.error('Unknown STEP %s' % step)
+
+    def cmd_offset_wizard(self, gcmd):
+        step = gcmd.get('STEP', 'tool').lower()
+        if step == 'cancel':
+            self.gcode.respond_raw('// action:prompt_end')
+            gcmd.respond_info('Tool offset calibration cancelled')
+            return
+        self._offset_wizard_step(gcmd, step, gcmd.get('TOOL', '').upper(),
+                                 gcmd.get_int('LEVELBOARD', 1, minval=0,
+                                              maxval=1))
 
     def cmd_check_build_plate(self, gcmd):
         _, _, attached = self._preflight(gcmd)
