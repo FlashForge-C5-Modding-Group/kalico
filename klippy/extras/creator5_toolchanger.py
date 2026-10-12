@@ -266,6 +266,7 @@ class Creator5Toolchanger:
             ('C5_WHEEL_CLOG', self.cmd_wheel_runout),
             ('C5_TOOL_PURGE', self.cmd_purge),
             ('C5_MOVE_TO_PURGE_BUCKET', self.cmd_move_to_purge_bucket),
+            ('C5_CHECK_BUILD_PLATE', self.cmd_check_build_plate),
             ('C5_BED_SOAK', self.cmd_bed_soak),
             ('C5_LOWER_BED', self.cmd_lower_bed),
             ('C5_FLOW_STROKES', self.cmd_flow_strokes),
@@ -1294,7 +1295,7 @@ class Creator5Toolchanger:
             raise gcmd.error('Stock calibration pin is not repeatable within 0.1 mm')
         return sum(values) / len(values)
 
-    def _check_plate_removed(self, gcmd):
+    def _measure_plate_pins(self, gcmd):
         # Stock checkPlatformRemove(): compare the regular pin's contact
         # height at X43/Y226 with the cylinder position from test.json.
         if not os.path.isfile(self.test_json_path):
@@ -1310,6 +1311,10 @@ class Creator5Toolchanger:
         first = self._probe_stock_pin(gcmd, self.plate_check_x,
                                       self.plate_check_y)
         second = self._probe_stock_pin(gcmd, cylinder_x, cylinder_y)
+        return first, second
+
+    def _check_plate_removed(self, gcmd):
+        first, second = self._measure_plate_pins(gcmd)
         if abs(first - second) < self.plate_check_min_delta:
             raise gcmd.error('Build plate may still be installed; ordinary '
                              'calibration pin heights differ by less than '
@@ -1317,6 +1322,17 @@ class Creator5Toolchanger:
         gcmd.respond_info('Stock calibration pin Z=%.4f / %.4f; plate '
                           'removal verified' % (first, second))
         return first
+
+    def _check_plate_present(self, gcmd):
+        # Inverse of _check_plate_removed: with the plate installed both
+        # pins read within plate_check_min_delta of each other.
+        first, second = self._measure_plate_pins(gcmd)
+        if abs(first - second) >= self.plate_check_min_delta:
+            raise gcmd.error('Build plate not detected; install the build '
+                             'plate and restart the print (calibration pin '
+                             'heights differ by %.2f mm)' % abs(first - second))
+        gcmd.respond_info('Stock calibration pin Z=%.4f / %.4f; build '
+                          'plate detected' % (first, second))
 
     def _probe_fixture_z(self, gcmd, x, y, target=None):
         self._move(z=self.safe_z, feed=1200)
@@ -1713,6 +1729,12 @@ class Creator5Toolchanger:
                     if state_saved and not complete:
                         self._run('RESTORE_GCODE_STATE NAME=C5_HOLDER_CALIBRATE MOVE=0')
         self._with_motion(gcmd, calibrate)
+
+    def cmd_check_build_plate(self, gcmd):
+        _, _, attached = self._preflight(gcmd)
+        if attached is not None:
+            raise gcmd.error('Dock T%d before the build plate check' % attached)
+        self._with_motion(gcmd, lambda: self._check_plate_present(gcmd))
 
     def cmd_move_to_purge_bucket(self, gcmd):
         # Called before heating to the full priming temperature so any ooze
