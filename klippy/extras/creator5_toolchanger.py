@@ -131,6 +131,8 @@ class Creator5Toolchanger:
         self.plate_check_y = config.getfloat('plate_check_y', 226.)
         self.plate_check_min_delta = config.getfloat(
             'plate_check_min_delta', .8, above=0.)
+        self.plate_check_travel_speed = config.getfloat(
+            'plate_check_travel_speed', 100., above=0.)
         self._stock_pin_approach_z = None
         self._offset_batch_active = False
         self.safe_z = config.getfloat('safe_z', 10., above=0.)
@@ -1269,7 +1271,7 @@ class Creator5Toolchanger:
             'SAMPLE_RETRACT_DIST', probe.sample_retract_dist, above=0.)
         lift_speed = probe.get_lift_speed(gcmd)
         self._raise_z()
-        self._move(x=x, y=y, feed=2400)
+        self._move(x=x, y=y, feed=self.plate_check_travel_speed * 60.)
         probe.multi_probe_begin(always_restore_toolhead=True)
         try:
             values = []
