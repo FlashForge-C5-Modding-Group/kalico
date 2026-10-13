@@ -1920,9 +1920,12 @@ class Creator5Toolchanger:
     def cmd_extruder_rotation_calibrate(self, gcmd):
         cancel = 'Cancel|C5_EXTRUDER_ROTATION_CALIBRATE CANCEL=1|error'
         if gcmd.get_int('CANCEL', 0, minval=0, maxval=1):
+            pending = self.rotation_pending
             self.rotation_pending = None
             self.gcode.respond_raw('// action:prompt_end')
             gcmd.respond_info('Extruder rotation calibration cancelled')
+            if pending is not None:
+                self._end_rotation(pending['tool'], pending['temp'])
             return
         tool = gcmd.get_int('TOOL', None, minval=0, maxval=3)
         if tool is None:
@@ -1942,8 +1945,13 @@ class Creator5Toolchanger:
                 raise gcmd.error('Start with C5_EXTRUDER_ROTATION_CALIBRATE '
                                  'TOOL=%d' % tool)
             self.gcode.respond_raw('// action:prompt_end')
-            pending['pulses'] = self._measure_rotation(
-                gcmd, tool, pending['length'], pending['speed'])
+            try:
+                pending['pulses'] = self._measure_rotation(
+                    gcmd, tool, pending['length'], pending['speed'])
+            except Exception:
+                self.rotation_pending = None
+                self._rotation_heater_off(tool)
+                raise
             self._prompt('Extruder Rotation Calibration',
                          ['Measure from the inlet to the mark in mm, then run '
                           'C5_EXTRUDER_ROTATION_CALIBRATE TOOL=%d '
@@ -1962,19 +1970,43 @@ class Creator5Toolchanger:
                   or self.wheel_mm_per_pulse is None)
         mark = gcmd.get_float('MARK', length + 20., above=length)
         self.rotation_pending = None
-        self._prepare_rotation(gcmd, tool, temp)
+        try:
+            self._prepare_rotation(gcmd, tool, temp)
+        except Exception:
+            self._rotation_heater_off(tool)
+            raise
         if manual:
             self.rotation_pending = {'tool': tool, 'length': length,
-                                     'speed': speed, 'mark': mark}
+                                     'speed': speed, 'mark': mark,
+                                     'temp': temp}
             self._prompt('Extruder Rotation Calibration',
                          ['Mark the filament %.0f mm above where it enters '
                           'T%d, then press Extrude.' % (mark, tool)],
                          ['Extrude|C5_EXTRUDER_ROTATION_CALIBRATE TOOL=%d '
                           'MARKED=1|primary' % tool], [cancel])
             return
-        pulses = self._measure_rotation(gcmd, tool, length, speed)
-        self._apply_rotation(gcmd, tool, length,
-                             pulses * self.wheel_mm_per_pulse, pulses)
+        try:
+            pulses = self._measure_rotation(gcmd, tool, length, speed)
+        except Exception:
+            self._rotation_heater_off(tool)
+            raise
+        try:
+            self._apply_rotation(gcmd, tool, length,
+                                 pulses * self.wheel_mm_per_pulse, pulses)
+        finally:
+            self._end_rotation(tool, temp)
+
+    def _end_rotation(self, tool, temp):
+        try:
+            self._run('C5_COOL_FOR_DOCK HOTEND=%.1f' % temp)
+        finally:
+            self._rotation_heater_off(tool)
+        self._run('AFC_UNSELECT_TOOL')
+
+    def _rotation_heater_off(self, tool):
+        extruder = 'extruder' if tool == 0 else 'extruder%d' % tool
+        heater = self.printer.lookup_object(extruder).get_heater()
+        self.printer.lookup_object('heaters').set_temperature(heater, 0.)
 
     def _start_rotation_timeout(self, pending):
         reactor = self.printer.get_reactor()
@@ -1985,9 +2017,7 @@ class Creator5Toolchanger:
                 return reactor.NEVER
             self.rotation_pending = None
             tool = pending['tool']
-            extruder = 'extruder' if tool == 0 else 'extruder%d' % tool
-            heater = self.printer.lookup_object(extruder).get_heater()
-            self.printer.lookup_object('heaters').set_temperature(heater, 0.)
+            self._rotation_heater_off(tool)
             self.gcode.respond_raw('// action:prompt_end')
             self.gcode.respond_raw(
                 '!! T%d extruder rotation calibration timed out waiting for '
@@ -2008,6 +2038,10 @@ class Creator5Toolchanger:
             if attached != tool:
                 raise gcmd.error('T%d was not picked up' % tool)
         extruder = 'extruder' if tool == 0 else 'extruder%d' % tool
+        bed = self.printer.lookup_object('heater_bed').get_status(
+            self.printer.get_reactor().monotonic())['target']
+        self._run('C5_AUTO_NOZZLE_Z T=%d HOTEND=%.1f BED=%.1f '
+                  'FIRST_LAYER_HEIGHT=0.2' % (tool, temp, bed))
         start = self.printer.lookup_object(
             'filament_switch_sensor %s_tool_start' % extruder, None)
         if start is not None and not start.get_status(None).get(
@@ -2083,8 +2117,11 @@ class Creator5Toolchanger:
         self.configfile.set(self.section, 'wheel_mm_per_pulse',
                             '%.6f' % self.wheel_mm_per_pulse)
         gcmd.respond_info('Wheel: %.6f mm per pulse' % self.wheel_mm_per_pulse)
-        self._apply_rotation(gcmd, tool, pending['length'], actual,
-                             pending['pulses'], all_tools=True)
+        try:
+            self._apply_rotation(gcmd, tool, pending['length'], actual,
+                                 pending['pulses'], all_tools=True)
+        finally:
+            self._end_rotation(tool, pending['temp'])
 
     def _apply_rotation(self, gcmd, tool, requested, measured, pulses,
                         all_tools=False):
