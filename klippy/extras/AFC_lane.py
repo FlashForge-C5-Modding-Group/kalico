@@ -1040,9 +1040,10 @@ class AFCLane:
             # Set LED to not ready
             self.unit_obj.lane_not_ready(self)
 
-    def _perform_creator5_infinite_runout(self):
+    def _perform_creator5_infinite_runout(self, replacement=None, target_temp=None):
         """Switch complete heads on runout, without AFC filament feed moves."""
-        replacement = self.afc.lanes.get(self.runout_lane)
+        if replacement is None:
+            replacement = self.afc.lanes.get(self.runout_lane)
         if (replacement is None or replacement is self
                 or replacement.extruder_obj.creator5_tool_index is None):
             self.afc.error.AFC_error(
@@ -1062,7 +1063,8 @@ class AFCLane:
         self.afc.error.pause_resume.send_pause_command()
         try:
             source_heater = self.extruder_obj.toolhead_extruder.get_heater()
-            target_temp = source_heater.target_temp
+            if target_temp is None:
+                target_temp = source_heater.target_temp
             if target_temp <= source_heater.min_extrude_temp:
                 raise RuntimeError("source hotend has no printable target temperature")
             target_heater = replacement.extruder_obj.toolhead_extruder.get_heater()
@@ -1080,7 +1082,7 @@ class AFCLane:
             replacement.set_loaded()
             replacement.set_tool_loaded(normal_toolchange=True)
             self.afc.save_vars()
-            self.afc.restore_pos(move_z_first=False)
+            self.afc.restore_pos(move_z_first=False, keep_offsets=True)
         except Exception as exc:
             self.afc.error.AFC_error(
                 "Creator 5 infinite-spool change failed; print remains paused: %s"
@@ -1753,6 +1755,13 @@ class AFCLane:
                     self.set_tool_unloaded()
                     self.set_unloaded()
                     self.afc.save_vars()
+                tool = self.extruder_obj.creator5_tool_index
+                if tool is not None and self.afc.function.is_paused():
+                    try:
+                        self.gcode.run_script_from_command(
+                            "C5_FILAMENT_RUNOUT TOOL=%d" % tool)
+                    except Exception as exc:
+                        self.logger.error("C5_FILAMENT_RUNOUT failed: %s" % exc)
 
     def handle_hub_runout(self, sensor=None):
         """

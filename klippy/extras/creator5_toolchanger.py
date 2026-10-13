@@ -266,6 +266,7 @@ class Creator5Toolchanger:
             ('C5_TOOL_DOCK', self.cmd_dock),
             ('C5_WHEEL_RUNOUT', self.cmd_wheel_runout),
             ('C5_WHEEL_CLOG', self.cmd_wheel_runout),
+            ('C5_RUNOUT_SWITCH', self.cmd_runout_switch),
             ('C5_TOOL_PURGE', self.cmd_purge),
             ('C5_MOVE_TO_PURGE_BUCKET', self.cmd_move_to_purge_bucket),
             ('C5_CHECK_BUILD_PLATE', self.cmd_check_build_plate),
@@ -1110,6 +1111,31 @@ class Creator5Toolchanger:
             'E0163: Paused. T%d clog detected: filament is present but the '
             'wheel stopped moving. Clear the filament path before resuming.'
             % tool)
+
+    def cmd_runout_switch(self, gcmd):
+        """Continue a print paused by TOOL's runout on tool TO."""
+        tool = gcmd.get_int('TOOL', minval=0, maxval=3)
+        to = gcmd.get_int('TO', minval=0, maxval=3)
+        temp = gcmd.get_float('TEMP', None, above=0.)
+        if to == tool:
+            raise gcmd.error('TO must be a different tool than TOOL')
+        afc = self.printer.lookup_object('AFC')
+        if not afc.function.is_paused():
+            raise gcmd.error('The print is not paused')
+        source = 'extruder' if tool == 0 else 'extruder%d' % tool
+        target = 'extruder' if to == 0 else 'extruder%d' % to
+        lane = afc.lanes.get(source)
+        replacement = afc.lanes.get(target)
+        if lane is None or replacement is None:
+            raise gcmd.error('No AFC lane for T%d or T%d' % (tool, to))
+        # Keeps the position AFC saved when the runout paused the print.
+        afc.error.reset_failure()
+        lane._perform_creator5_infinite_runout(replacement, target_temp=temp)
+        if afc.error_state:
+            return
+        # PAUSE marked the print paused; the switch resumed it directly.
+        self.printer.lookup_object('pause_resume').is_paused = False
+        self._run('SET_HEATER_TEMPERATURE HEATER=%s TARGET=0' % source)
 
     def _sync_clog_sensors(self, tool=None):
         # firmwareExe disables all four wheels, then resets and enables only

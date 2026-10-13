@@ -248,7 +248,6 @@ class MCU_C5_TMC_uart:
         self.mcu = mcu
         self.mutex = lookup_tmc_uart_mutex(mcu)
         self.cmd_queue = mcu.alloc_command_queue()
-        self.instances = set()
         self.send_cmd = None
         mcu.register_config_callback(self.build_config)
 
@@ -278,11 +277,6 @@ class MCU_C5_TMC_uart:
                 "Creator 5 eBoard TMC must use RX PB11, TX PB10, address 0"
                 " and no select_pins"
             )
-        if addr in self.instances:
-            raise self.mcu.get_printer().config_error(
-                "Creator 5 eBoard has only one shared extruder TMC driver"
-            )
-        self.instances.add(addr)
         return None
 
     def _encode(self, addr, reg, val=None):

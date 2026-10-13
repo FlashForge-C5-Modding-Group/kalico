@@ -1167,13 +1167,19 @@ class afc:
                 f"in toolchange: {self.in_toolchange}, POS: "
             )
 
-    def restore_pos(self, move_z_first=True):
+    def restore_pos(self, move_z_first=True, keep_offsets=False):
         """
         restore_pos function restores the previous saved position, speed and coord type. The resume uses
         the z_hop value to lift, move to previous x,y coords, then lower to saved z position.
 
         :param move_z_first: Enable to move z before moving x,y
+        :param keep_offsets: Keep the current gcode offsets (a different tool was picked up) and
+                             return to the saved position in gcode coordinates
         """
+        delta = [0., 0., 0.]
+        if keep_offsets:
+            delta = [self.gcode_move.homing_position[i] - self.homing_position[i] for i in range(3)]
+        target = [self.last_gcode_position[i] + delta[i] for i in range(3)]
         # Only rounded for the log message below, restore logic below uses full precision
         msg = f"Restoring Position {round_floats(self.last_toolhead_position)}"
         msg += f" Base position: {round_floats(self.base_position)}"
@@ -1192,16 +1198,19 @@ class afc:
 
         # Move toolhead to previous z location with z-hop added
         if move_z_first:
-            newpos[2] = self.move_z_pos(self.last_gcode_position[2] + self.z_hop, "restore_pos")
+            newpos[2] = self.move_z_pos(target[2] + self.z_hop, "restore_pos")
 
         # Move to previous x,y location
-        newpos[:2] = self.last_gcode_position[:2]
+        newpos[:2] = target[:2]
         self.gcode_move.move_with_transform(newpos, self._get_resume_speed() )
         self.function.log_toolhead_pos("Resume prev xy: ")
 
         # Update GCODE STATE variables
         self.gcode_move.base_position       = list(self.base_position)
         self.gcode_move.homing_position     = list(self.homing_position)
+        for i in range(3):
+            self.gcode_move.base_position[i]   += delta[i]
+            self.gcode_move.homing_position[i] += delta[i]
 
         # Restore absolute coords
         self.gcode_move.absolute_coord      = self.absolute_coord
@@ -1213,7 +1222,7 @@ class afc:
         # Restore the relative E position
         e_diff = self.gcode_move.last_position[3] - self.last_gcode_position[3]
         self.gcode_move.base_position[3] += e_diff
-        self.gcode_move.last_position[:3] = self.last_gcode_position[:3]
+        self.gcode_move.last_position[:3] = target
 
         # Return to previous xyz
         self.gcode_move.move_with_transform(self.gcode_move.last_position,
@@ -2403,7 +2412,7 @@ class afc:
                     # Creator 5 has already raised Z for clear tool travel.
                     # Keep that clearance for the XY return, then descend at
                     # the saved print position instead of lowering first.
-                    self.restore_pos(move_z_first=False)
+                    self.restore_pos(move_z_first=False, keep_offsets=True)
             finally:
                 self.in_toolchange = was_changing
                 self.afcDeltaTime.log_total_time("Total change time:")
