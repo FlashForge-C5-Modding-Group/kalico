@@ -204,6 +204,17 @@ class Creator5Toolchanger:
         self.purge_z = config.getfloat('purge_z', 8.0, minval=5.)
         self.purge_length = config.getfloat('purge_length', 12., minval=0.)
         self.purge_speed = config.getfloat('purge_speed', 3., above=0.)
+        self.wheel_mm_per_pulse = config.getfloat('wheel_mm_per_pulse', None,
+                                                  above=0.)
+        self.rotation_cal_length = config.getfloat(
+            'rotation_calibration_length', 100., above=10., maxval=300.)
+        self.rotation_cal_speed = config.getfloat(
+            'rotation_calibration_speed', 3., above=0., maxval=10.)
+        self.rotation_cal_temp = config.getfloat(
+            'rotation_calibration_temp', 245., minval=170., maxval=320.)
+        self.rotation_measure_timeout = config.getfloat(
+            'rotation_calibration_timeout', 30., above=0.)
+        self.rotation_pending = None
         # Keep the nozzle high over the bucket during the flow test.
         self.flow_test_z = config.getfloat('flow_test_z', 8.,
                                            minval=5., maxval=15.)
@@ -274,6 +285,8 @@ class Creator5Toolchanger:
             ('C5_BED_SOAK', self.cmd_bed_soak),
             ('C5_LOWER_BED', self.cmd_lower_bed),
             ('C5_FLOW_STROKES', self.cmd_flow_strokes),
+            ('C5_EXTRUDER_ROTATION_CALIBRATE',
+             self.cmd_extruder_rotation_calibrate),
             ('C5_MISC_FLOW_ON', self.cmd_flow_on),
             ('C5_MISC_FLOW_OFF', self.cmd_flow_off),
             ('C5_COOL_FOR_DOCK', self.cmd_cool_for_dock),
@@ -1903,6 +1916,200 @@ class Creator5Toolchanger:
         gcmd.respond_info('T%d purging %.1f mm at X%.1f Y%.1f before cooldown'
                           % (attached, length, self.purge_x, self.purge_y))
         self._with_motion(gcmd, purge)
+
+    def cmd_extruder_rotation_calibrate(self, gcmd):
+        cancel = 'Cancel|C5_EXTRUDER_ROTATION_CALIBRATE CANCEL=1|error'
+        if gcmd.get_int('CANCEL', 0, minval=0, maxval=1):
+            self.rotation_pending = None
+            self.gcode.respond_raw('// action:prompt_end')
+            gcmd.respond_info('Extruder rotation calibration cancelled')
+            return
+        tool = gcmd.get_int('TOOL', None, minval=0, maxval=3)
+        if tool is None:
+            self._prompt('Extruder Rotation Calibration',
+                         ['Which tool should be calibrated?'],
+                         ['T%d|C5_EXTRUDER_ROTATION_CALIBRATE TOOL=%d|primary'
+                          % (t, t) for t in range(4)],
+                         [cancel])
+            return
+        remaining = gcmd.get_float('REMAINING', None, minval=0.)
+        if remaining is not None:
+            self._finish_manual_rotation(gcmd, tool, remaining)
+            return
+        if gcmd.get_int('MARKED', 0, minval=0, maxval=1):
+            pending = self.rotation_pending
+            if pending is None or pending['tool'] != tool:
+                raise gcmd.error('Start with C5_EXTRUDER_ROTATION_CALIBRATE '
+                                 'TOOL=%d' % tool)
+            self.gcode.respond_raw('// action:prompt_end')
+            pending['pulses'] = self._measure_rotation(
+                gcmd, tool, pending['length'], pending['speed'])
+            self._prompt('Extruder Rotation Calibration',
+                         ['Measure from the inlet to the mark in mm, then run '
+                          'C5_EXTRUDER_ROTATION_CALIBRATE TOOL=%d '
+                          'REMAINING=<mm> within %.0f seconds'
+                          % (tool, self.rotation_measure_timeout)],
+                         footer=[cancel])
+            self._start_rotation_timeout(pending)
+            return
+        length = gcmd.get_float('LENGTH', self.rotation_cal_length,
+                                above=10., maxval=300.)
+        speed = gcmd.get_float('SPEED', self.rotation_cal_speed,
+                               above=0., maxval=10.)
+        temp = gcmd.get_float('TEMP', self.rotation_cal_temp,
+                              minval=170., maxval=320.)
+        manual = (gcmd.get_int('MANUAL', 0, minval=0, maxval=1)
+                  or self.wheel_mm_per_pulse is None)
+        mark = gcmd.get_float('MARK', length + 20., above=length)
+        self.rotation_pending = None
+        self._prepare_rotation(gcmd, tool, temp)
+        if manual:
+            self.rotation_pending = {'tool': tool, 'length': length,
+                                     'speed': speed, 'mark': mark}
+            self._prompt('Extruder Rotation Calibration',
+                         ['Mark the filament %.0f mm above where it enters '
+                          'T%d, then press Extrude.' % (mark, tool)],
+                         ['Extrude|C5_EXTRUDER_ROTATION_CALIBRATE TOOL=%d '
+                          'MARKED=1|primary' % tool], [cancel])
+            return
+        pulses = self._measure_rotation(gcmd, tool, length, speed)
+        self._apply_rotation(gcmd, tool, length,
+                             pulses * self.wheel_mm_per_pulse, pulses)
+
+    def _start_rotation_timeout(self, pending):
+        reactor = self.printer.get_reactor()
+
+        def expire(eventtime):
+            reactor.unregister_timer(timer)
+            if self.rotation_pending is not pending:
+                return reactor.NEVER
+            self.rotation_pending = None
+            tool = pending['tool']
+            extruder = 'extruder' if tool == 0 else 'extruder%d' % tool
+            heater = self.printer.lookup_object(extruder).get_heater()
+            self.printer.lookup_object('heaters').set_temperature(heater, 0.)
+            self.gcode.respond_raw('// action:prompt_end')
+            self.gcode.respond_raw(
+                '!! T%d extruder rotation calibration timed out waiting for '
+                'REMAINING; heater turned off' % tool)
+            return reactor.NEVER
+        timer = reactor.register_timer(
+            expire, reactor.monotonic() + self.rotation_measure_timeout)
+
+    def _prepare_rotation(self, gcmd, tool, temp):
+        homed = self.printer.lookup_object('toolhead').get_status(
+            self.printer.get_reactor().monotonic()).get('homed_axes', '')
+        if any(axis not in homed for axis in 'xyz'):
+            self._run('G28')
+        _, _, attached = self._preflight(gcmd)
+        if attached != tool:
+            self._run('T%d' % tool)
+            _, _, attached = self._preflight(gcmd)
+            if attached != tool:
+                raise gcmd.error('T%d was not picked up' % tool)
+        extruder = 'extruder' if tool == 0 else 'extruder%d' % tool
+        start = self.printer.lookup_object(
+            'filament_switch_sensor %s_tool_start' % extruder, None)
+        if start is not None and not start.get_status(None).get(
+                'filament_detected', True):
+            raise gcmd.error('No filament loaded in T%d' % tool)
+        self.cmd_move_to_purge_bucket(gcmd)
+        self._run('SET_HEATER_TEMPERATURE HEATER=%s TARGET=%.0f'
+                  % (extruder, temp))
+        self._run('TEMPERATURE_WAIT SENSOR=%s MINIMUM=%.0f'
+                  % (extruder, temp - 2.))
+
+        def prime():
+            self._run('ACTIVATE_EXTRUDER EXTRUDER=%s' % extruder)
+            self._run('SAVE_GCODE_STATE NAME=C5_ROTATION_PREP')
+            try:
+                self._move(z=self.purge_z, feed=600, machine=False)
+                self._run('M83')
+                self._run('G1 E5 F%.0f' % (self.purge_speed * 60.))
+                self._run('M400')
+            finally:
+                self._run('RESTORE_GCODE_STATE NAME=C5_ROTATION_PREP MOVE=0')
+        self._with_motion(gcmd, prime)
+
+    def _measure_rotation(self, gcmd, tool, length, speed):
+        _, _, attached = self._preflight(gcmd)
+        if attached != tool:
+            raise gcmd.error('T%d is no longer attached' % tool)
+        extruder = 'extruder' if tool == 0 else 'extruder%d' % tool
+        if not self.printer.lookup_object(extruder).get_status(
+                self.printer.get_reactor().monotonic()).get('can_extrude'):
+            raise gcmd.error('T%d is not hot enough to extrude' % tool)
+        wheel = self.printer.lookup_object(
+            'filament_motion_sensor fm_ex%d' % tool)
+
+        def measure():
+            self._run('ACTIVATE_EXTRUDER EXTRUDER=%s' % extruder)
+            self._run('SAVE_GCODE_STATE NAME=C5_ROTATION_CAL')
+            try:
+                self._run('M83')
+                self._run('M400')
+                self._pause_ms(500)
+                start = wheel.pulse_count
+                self._run('G1 E%.3f F%.0f' % (length, speed * 60.))
+                self._run('M400')
+                self._pause_ms(500)
+                return wheel.pulse_count - start
+            finally:
+                try:
+                    self._raise_z()
+                finally:
+                    self._run('RESTORE_GCODE_STATE NAME=C5_ROTATION_CAL MOVE=0')
+        gcmd.respond_info('T%d extruding %.1f mm at %.1f mm/s'
+                          % (tool, length, speed))
+        pulses = self._with_motion(gcmd, measure)
+        if pulses < 10:
+            raise gcmd.error('T%d wheel saw only %d pulses; check that the '
+                             'filament is moving through the sensor'
+                             % (tool, pulses))
+        return pulses
+
+    def _finish_manual_rotation(self, gcmd, tool, remaining):
+        pending = self.rotation_pending
+        if (pending is None or pending['tool'] != tool
+                or 'pulses' not in pending):
+            raise gcmd.error('No measured T%d extrusion to finish' % tool)
+        actual = pending['mark'] - remaining
+        if actual <= 0.:
+            raise gcmd.error('REMAINING must be less than the %.1f mm mark'
+                             % pending['mark'])
+        self.gcode.respond_raw('// action:prompt_end')
+        self.rotation_pending = None
+        self.wheel_mm_per_pulse = actual / pending['pulses']
+        self.configfile.set(self.section, 'wheel_mm_per_pulse',
+                            '%.6f' % self.wheel_mm_per_pulse)
+        gcmd.respond_info('Wheel: %.6f mm per pulse' % self.wheel_mm_per_pulse)
+        self._apply_rotation(gcmd, tool, pending['length'], actual,
+                             pending['pulses'], all_tools=True)
+
+    def _apply_rotation(self, gcmd, tool, requested, measured, pulses,
+                        all_tools=False):
+        ratio = measured / requested
+        if not .7 <= ratio <= 1.3:
+            raise gcmd.error('T%d moved %.1f mm of %.1f mm requested; check '
+                             'for slipping or a wrong wheel_mm_per_pulse'
+                             % (tool, measured, requested))
+        extruder = 'extruder' if tool == 0 else 'extruder%d' % tool
+        stepper = self.printer.lookup_object(extruder).extruder_stepper.stepper
+        old = stepper.get_rotation_distance()[0]
+        new = old * ratio
+        lines = ['T%d requested %.1f mm, wheel measured %.1f mm (%d pulses, '
+                 '%.1f%%)' % (tool, requested, measured, pulses, ratio * 100.)]
+        for index in (range(4) if all_tools else (tool,)):
+            name = 'extruder' if index == 0 else 'extruder%d' % index
+            previous = self.printer.lookup_object(
+                name).extruder_stepper.stepper.get_rotation_distance()[0]
+            self._run('SET_EXTRUDER_ROTATION_DISTANCE EXTRUDER=%s '
+                      'DISTANCE=%.4f' % (name, new))
+            self.configfile.set(name, 'rotation_distance', '%.4f' % new)
+            lines.append('T%d rotation_distance %.4f -> %.4f'
+                         % (index, previous, new))
+        lines.append('Run SAVE_CONFIG to keep it')
+        gcmd.respond_info('\n'.join(lines))
 
     def cmd_flow_strokes(self, gcmd):
         """Run the stock alternating-speed eboard PA/flow measurement."""

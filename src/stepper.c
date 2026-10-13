@@ -38,7 +38,15 @@ struct stepper_move {
     uint8_t flags;
 };
 
-enum { MF_DIR=1<<0 };
+enum { MF_DIR=1<<0, MF_DIR_LEVEL=1<<1 };
+
+// The Creator 5 eBoard drives one extruder motor from four stepper oids
+// sharing a dir pin, so direction is written absolutely, not toggled.
+#if CONFIG_C5_EBOARD
+ #define HAVE_SHARED_DIR 1
+#else
+ #define HAVE_SHARED_DIR 0
+#endif
 
 struct stepper {
     struct timer time;
@@ -61,6 +69,15 @@ enum {
     SF_SINGLE_SCHED=1<<4, SF_OPTIMIZED_PATH=1<<5, SF_HAVE_ADD=1<<6
 };
 
+static inline void
+stepper_set_dir(struct stepper *s, uint_fast8_t level)
+{
+    if (HAVE_SHARED_DIR)
+        gpio_out_write(s->dir_pin, level);
+    else
+        gpio_out_toggle_noirq(s->dir_pin);
+}
+
 // Setup a stepper for the next move in its queue
 static uint_fast8_t
 stepper_load_next(struct stepper *s)
@@ -78,6 +95,7 @@ stepper_load_next(struct stepper *s)
     uint_fast16_t move_count = m->count;
     int_fast16_t move_add = m->add;
     uint_fast8_t need_dir_change = m->flags & MF_DIR;
+    uint_fast8_t dir_level = m->flags & MF_DIR_LEVEL;
     move_free(m);
 
     // Add all steps to s->position (stepper_get_position() can calc mid-move)
@@ -114,7 +132,7 @@ stepper_load_next(struct stepper *s)
             if (s->flags & SF_SINGLE_SCHED)
                 while (timer_is_before(timer_read_time(), min_next_time))
                     ;
-            gpio_out_toggle_noirq(s->dir_pin);
+            stepper_set_dir(s, dir_level);
             uint32_t curtime = timer_read_time();
             min_next_time = curtime + s->step_pulse_ticks;
             if (timer_is_before(s->time.waketime, min_next_time))
@@ -124,8 +142,8 @@ stepper_load_next(struct stepper *s)
     }
 
     // Set new direction (if needed)
-    if (need_dir_change)
-        gpio_out_toggle_noirq(s->dir_pin);
+    if (need_dir_change || HAVE_SHARED_DIR)
+        stepper_set_dir(s, dir_level);
     return SF_RESCHEDULE;
 }
 
@@ -274,6 +292,8 @@ command_queue_step(uint32_t *args)
         flags ^= SF_LAST_DIR;
         m->flags |= MF_DIR;
     }
+    if (HAVE_SHARED_DIR && flags & SF_LAST_DIR)
+        m->flags |= MF_DIR_LEVEL;
     if (s->count) {
         s->flags = flags;
         move_queue_push(&m->node, &s->mq);
