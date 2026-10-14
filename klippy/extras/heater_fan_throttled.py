@@ -26,6 +26,7 @@ class PrinterHeaterFanThrottled:
             "near_target_delta", 1.5, above=0.)
         self.near_target_power = config.getfloat(
             "near_target_power", 0.3, minval=0., maxval=1.)
+        self.run_while_cooling = config.getboolean("run_while_cooling", True)
         self.last_speed = 0.
     def handle_ready(self):
         pheaters = self.printer.lookup_object('heaters')
@@ -41,8 +42,9 @@ class PrinterHeaterFanThrottled:
             if not target_temp:
                 # Not actively heating. Still move air if the chamber is
                 # above heater_temp from a previous heat cycle (e.g.
-                # cooling down after a print) -- same as stock heater_fan.
-                if current_temp > self.heater_temp:
+                # cooling down after a print) -- same as stock heater_fan,
+                # unless run_while_cooling is off.
+                if self.run_while_cooling and current_temp > self.heater_temp:
                     speed = max(speed, self.fan_speed)
                 continue
             # Temperature proximity alone is noisy and can grace within
