@@ -1057,6 +1057,7 @@ class Creator5OffsetTests(unittest.TestCase):
         pa.pa_get_value.return_value = 9
         self.board.printer.lookup_object.side_effect = (
             lambda name, *args: {'extruder': heater, 'pa_adjust': pa}[name])
+        self.board.printer.lookup_objects.return_value = []
         command = GCmd()
         self.board.cmd_flow_strokes(command)
         self.assertEqual(pa.pa_get_value.call_count, 3)
@@ -1100,12 +1101,54 @@ class Creator5OffsetTests(unittest.TestCase):
         pa.pa_get_value.return_value = 0
         self.board.printer.lookup_object.side_effect = (
             lambda name, *args: {'extruder': heater, 'pa_adjust': pa}[name])
+        self.board.printer.lookup_objects.return_value = []
         command = GCmd()
         self.board.cmd_flow_strokes(command)
         self.assertEqual(pa.pa_get_value.call_count, 35)
         self.board._run.assert_any_call(
             'SET_PRESSURE_ADVANCE EXTRUDER=extruder ADVANCE=0.02000')
         self.assertIn('pressure advance unchanged', command.message)
+
+    def test_flow_strokes_pause_extruder_tmc_checks(self):
+        self.board.flow_test_z = 8.
+        self.board.flow_test_accel = 625.
+        self.board.flow_slow_speed = 4.5
+        self.board.flow_fast_speed = 22.875
+        self.board._preflight = lambda command: ([], [], 0)
+        self.board.cmd_verify_nozzle_z = mock.Mock()
+        self.board._with_motion = lambda command, operation: operation()
+        self.board._raise_z = mock.Mock()
+        self.board._move = mock.Mock()
+        self.board._move_to_prep_bucket = mock.Mock()
+        self.board._run = mock.Mock()
+        self.board._pause_ms = mock.Mock()
+        heater, pa = mock.Mock(), mock.Mock()
+        heater.get_status.return_value = {
+            'can_extrude': True, 'pressure_advance': .02}
+        pa.pa_get_value.return_value = 0
+        order = mock.Mock()
+        order.attach_mock(pa.pa_action, 'pa_action')
+        drivers = []
+        for name, running in (('tmc2209 extruder', True),
+                              ('tmc2209 extruder1', False),
+                              ('tmc2209 stepper_x', True)):
+            driver = mock.Mock()
+            echeck = driver.cmdhelper.echeck_helper
+            echeck.check_timer = object() if running else None
+            order.attach_mock(echeck.stop_checks, name + ' stop')
+            order.attach_mock(echeck.start_checks, name + ' start')
+            drivers.append((name, driver))
+        self.board.printer.lookup_object.side_effect = (
+            lambda name, *args: {'extruder': heater, 'pa_adjust': pa}[name])
+        self.board.printer.lookup_objects.return_value = drivers
+        self.board.cmd_flow_strokes(GCmd())
+        calls = [c[0] for c in order.mock_calls]
+        self.assertEqual(calls[0], 'tmc2209 extruder stop')
+        self.assertEqual(calls[1], 'pa_action')
+        self.assertEqual(calls[-2], 'pa_action')
+        self.assertEqual(calls[-1], 'tmc2209 extruder start')
+        self.assertNotIn('tmc2209 extruder1 stop', calls)
+        self.assertNotIn('tmc2209 stepper_x stop', calls)
 
     def test_cool_for_dock_uses_stock_minus_100_rule(self):
         self.board._preflight = lambda command: ([], [], 1)

@@ -755,6 +755,23 @@ class Creator5Toolchanger:
         reactor = self.printer.get_reactor()
         reactor.pause(reactor.monotonic() + milliseconds / 1000.)
 
+    def _pause_extruder_tmc_checks(self):
+        paused = []
+        for name, obj in self.printer.lookup_objects('tmc2209'):
+            if not name.startswith('tmc2209 extruder'):
+                continue
+            cmdhelper = getattr(obj, 'cmdhelper', None)
+            echeck = getattr(cmdhelper, 'echeck_helper', None)
+            if echeck is None or echeck.check_timer is None:
+                continue
+            echeck.stop_checks()
+            paused.append(echeck)
+        return paused
+
+    def _resume_tmc_checks(self, paused):
+        for echeck in paused:
+            echeck.start_checks()
+
     def _move(self, x=None, y=None, z=None, feed=4800, machine=True):
         values = [value for value in (x, y, z) if value is not None]
         if (not all(math.isfinite(value) for value in values)
@@ -2184,6 +2201,7 @@ class Creator5Toolchanger:
             self._run('SAVE_GCODE_STATE NAME=C5_FLOW_TEST')
             picks = []
             calibrated = False
+            paused = []
             try:
                 self._run('G90')
                 self._run('M83')
@@ -2192,6 +2210,8 @@ class Creator5Toolchanger:
                           % self.flow_test_accel)
                 self._move_to_prep_bucket()
                 self._move(z=self.flow_test_z, feed=1200, machine=False)
+                self._run('M400')
+                paused = self._pause_extruder_tmc_checks()
                 for repeat in range(5):
                     successful = []
                     for advance in candidates:
@@ -2241,7 +2261,11 @@ class Creator5Toolchanger:
                         self._run('SET_PRESSURE_ADVANCE EXTRUDER=%s '
                                   'ADVANCE=%.5f' % (extruder, old_pa))
                 finally:
-                    self._run('RESTORE_GCODE_STATE NAME=C5_FLOW_TEST MOVE=0')
+                    try:
+                        self._run('RESTORE_GCODE_STATE NAME=C5_FLOW_TEST '
+                                  'MOVE=0')
+                    finally:
+                        self._resume_tmc_checks(paused)
 
         self._with_motion(gcmd, measure)
 

@@ -51,7 +51,6 @@ class HdlmtHome:
     def __init__(self, config):
         self.printer = config.get_printer()
         self.stepper_name = config.get_name().split()[-1]
-        print(self.stepper_name)
         self.mcu_probe = HdHomeEndstopWrapper(config)
         gcode = self.printer.lookup_object('gcode')
         gcode.register_mux_command("HDHOME", "AXES",
