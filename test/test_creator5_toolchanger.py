@@ -1051,6 +1051,8 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board._move = mock.Mock()
         self.board._run = mock.Mock()
         self.board._pause_ms = mock.Mock()
+        self.board._lock_xy = mock.Mock(return_value=None)
+        self.board._unlock_xy = mock.Mock()
         heater, pa = mock.Mock(), mock.Mock()
         heater.get_status.return_value = {
             'can_extrude': True, 'pressure_advance': .02}
@@ -1095,6 +1097,8 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board._move = mock.Mock()
         self.board._run = mock.Mock()
         self.board._pause_ms = mock.Mock()
+        self.board._lock_xy = mock.Mock(return_value=None)
+        self.board._unlock_xy = mock.Mock()
         heater, pa = mock.Mock(), mock.Mock()
         heater.get_status.return_value = {
             'can_extrude': True, 'pressure_advance': .02}
@@ -1122,6 +1126,8 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board._move_to_prep_bucket = mock.Mock()
         self.board._run = mock.Mock()
         self.board._pause_ms = mock.Mock()
+        self.board._lock_xy = mock.Mock(return_value=None)
+        self.board._unlock_xy = mock.Mock()
         heater, pa = mock.Mock(), mock.Mock()
         heater.get_status.return_value = {
             'can_extrude': True, 'pressure_advance': .02}
@@ -1149,6 +1155,84 @@ class Creator5OffsetTests(unittest.TestCase):
         self.assertEqual(calls[-1], 'tmc2209 extruder start')
         self.assertNotIn('tmc2209 extruder1 stop', calls)
         self.assertNotIn('tmc2209 stepper_x stop', calls)
+
+    def test_flow_strokes_use_stock_xy_pattern_with_xy_locked(self):
+        self.board.flow_test_z = 8.
+        self.board.flow_test_accel = 5000.
+        self.board.flow_slow_speed = 18.
+        self.board.flow_fast_speed = 183.
+        self.board._preflight = lambda command: ([], [], 0)
+        self.board.cmd_verify_nozzle_z = mock.Mock()
+        self.board._with_motion = lambda command, operation: operation()
+        self.board._move = mock.Mock()
+        self.board._move_to_prep_bucket = mock.Mock()
+        self.board._pause_ms = mock.Mock()
+        order = mock.Mock()
+        self.board._run = order.run
+        self.board._raise_z = order.raise_z
+        self.board._lock_xy = order.lock
+        self.board._unlock_xy = order.unlock
+        order.lock.return_value = 'locked'
+        heater, pa = mock.Mock(), mock.Mock()
+        heater.get_status.return_value = {
+            'can_extrude': True, 'pressure_advance': .02}
+        pa.pa_get_value.return_value = 0
+        order.attach_mock(pa.pa_action, 'pa_action')
+        self.board.printer.lookup_object.side_effect = (
+            lambda name, *args: {'extruder': heater, 'pa_adjust': pa}[name])
+        self.board.printer.lookup_objects.return_value = []
+        self.board.cmd_flow_strokes(GCmd())
+        calls = order.mock_calls
+        names = [c[0] for c in calls]
+        self.assertLess(names.index('lock'), names.index('pa_action'))
+        self.assertEqual(names[-1], 'run')
+        self.assertLess(len(names) - 1 - names[::-1].index('pa_action'),
+                        names.index('unlock'))
+        self.assertLess(names.index('unlock'), names.index('raise_z'))
+        order.unlock.assert_called_once_with('locked')
+        runs = [c[1][0] for c in calls if c[0] == 'run']
+        self.assertIn('SET_VELOCITY_LIMIT ACCEL=5000 '
+                      'SQUARE_CORNER_VELOCITY=9', runs)
+        self.assertIn('G1 X40 Y50.0 F10980', runs)
+        self.assertIn('G1 X40 Y80.0 F10980', runs)
+        first = runs.index('G1 X40 Y50.0 F10980')
+        self.assertEqual(runs[first + 1:first + 7], [
+            'G1 X60.0 E1.13573 F1080', 'G1 X100.0 E2.27146 F10980',
+            'G1 X120.0 E1.13573 F1080', 'G1 X140.0 E1.13573 F1080',
+            'G1 X180.0 E2.27146 F10980', 'G1 X200.0 E1.13573 F1080'])
+        self.assertFalse(any(r.startswith('G1 E') for r in runs))
+
+    def test_lock_xy_holds_xy_steppers_and_restores_position(self):
+        stepper_a, stepper_b, stepper_z = mock.Mock(), mock.Mock(), mock.Mock()
+        stepper_a.is_active_axis.side_effect = lambda axis: axis in 'xy'
+        stepper_b.is_active_axis.side_effect = lambda axis: axis in 'xy'
+        stepper_z.is_active_axis.side_effect = lambda axis: axis == 'z'
+        stepper_a.set_trapq.return_value = 'trapq'
+        stepper_b.set_trapq.return_value = 'trapq'
+        toolhead, gcode_move = mock.Mock(), mock.Mock()
+        toolhead.get_kinematics.return_value.get_steppers.return_value = [
+            stepper_a, stepper_b, stepper_z]
+        toolhead.get_status.return_value = {'square_corner_velocity': 5.}
+        toolhead.get_position.return_value = [276.5, 257., 8., 0.]
+        self.board.printer.lookup_object.side_effect = (
+            lambda name, *args: {'toolhead': toolhead,
+                                 'gcode_move': gcode_move}[name])
+        self.board._run = mock.Mock()
+        locked = self.board._lock_xy()
+        stepper_a.set_trapq.assert_called_once_with(None)
+        stepper_b.set_trapq.assert_called_once_with(None)
+        stepper_z.set_trapq.assert_not_called()
+        # Planned XY moved during the test; Z and E are kept on unlock.
+        toolhead.get_position.return_value = [200., 80., 8.5, 12.]
+        self.board._unlock_xy(locked)
+        stepper_a.set_trapq.assert_called_with('trapq')
+        stepper_b.set_trapq.assert_called_with('trapq')
+        toolhead.set_position.assert_called_once_with([276.5, 257., 8.5, 12.])
+        gcode_move.reset_last_position.assert_called_once_with()
+        self.board._run.assert_any_call('M400')
+        self.board._run.assert_any_call(
+            'SET_VELOCITY_LIMIT SQUARE_CORNER_VELOCITY=5.000')
+        self.board._unlock_xy(None)
 
     def test_cool_for_dock_uses_stock_minus_100_rule(self):
         self.board._preflight = lambda command: ([], [], 1)

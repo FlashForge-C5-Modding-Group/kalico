@@ -223,11 +223,11 @@ class Creator5Toolchanger:
         self.flow_sweep_x = config.getfloat('flow_sweep_x', 4.5,
                                             minval=4., maxval=12.)
         self._validate_purge_envelope(config.error)
-        self.flow_test_accel = config.getfloat('flow_test_accel', 625.,
+        self.flow_test_accel = config.getfloat('flow_test_accel', 5000.,
                                                above=0., maxval=5000.)
-        self.flow_slow_speed = config.getfloat('flow_slow_speed', 4.5,
+        self.flow_slow_speed = config.getfloat('flow_slow_speed', 18.,
                                                above=0.)
-        self.flow_fast_speed = config.getfloat('flow_fast_speed', 22.875,
+        self.flow_fast_speed = config.getfloat('flow_fast_speed', 183.,
                                                above=self.flow_slow_speed)
         self.flow_verdict_settle_ms = config.getint(
             'flow_verdict_settle_ms', 50, minval=0, maxval=500)
@@ -771,6 +771,33 @@ class Creator5Toolchanger:
     def _resume_tmc_checks(self, paused):
         for echeck in paused:
             echeck.start_checks()
+
+    # Detach the XY steppers from the toolhead so XY moves are planned
+    # (and pressure advance applies) but no XY steps are sent. The drivers
+    # stay enabled and hold the carriage in place.
+    def _lock_xy(self):
+        toolhead = self.printer.lookup_object('toolhead')
+        toolhead.flush_step_generation()
+        steppers = [s for s in toolhead.get_kinematics().get_steppers()
+                    if s.is_active_axis('x') or s.is_active_axis('y')]
+        trapqs = [s.set_trapq(None) for s in steppers]
+        eventtime = self.printer.get_reactor().monotonic()
+        scv = toolhead.get_status(eventtime)['square_corner_velocity']
+        return steppers, trapqs, toolhead.get_position(), scv
+
+    def _unlock_xy(self, locked):
+        if locked is None:
+            return
+        steppers, trapqs, position, scv = locked
+        self._run('M400')
+        toolhead = self.printer.lookup_object('toolhead')
+        toolhead.flush_step_generation()
+        for stepper, trapq in zip(steppers, trapqs):
+            stepper.set_trapq(trapq)
+        current = toolhead.get_position()
+        toolhead.set_position([position[0], position[1]] + current[2:])
+        self.printer.lookup_object('gcode_move').reset_last_position()
+        self._run('SET_VELOCITY_LIMIT SQUARE_CORNER_VELOCITY=%.3f' % scv)
 
     def _move(self, x=None, y=None, z=None, feed=4800, machine=True):
         values = [value for value in (x, y, z) if value is not None]
@@ -2187,14 +2214,15 @@ class Creator5Toolchanger:
         candidates = (.0100, .0200, .0150, .0350, .0250, .0300, .0400)
         minimum_candidate = min(candidates)
         # The eboard classifies the *motor-current waveform*, not a bead on
-        # the plate.  Keep the touchscreen's 1.13573/2.27146 mm extrusion
-        # pulses and their approximate durations; the toolhead itself stays
-        # put at the bucket position for the whole test -- only E moves.
+        # the plate.  Klipper only applies pressure advance to moves with
+        # XY motion, so like the stock firmware the strokes are XY moves,
+        # run with the XY steppers detached (held, not stepping) while the
+        # nozzle stays over the bucket.
         slow_feed = self.flow_slow_speed * 60.
         fast_feed = self.flow_fast_speed * 60.
-        segments = ((slow_feed, 1.13573), (fast_feed, 2.27146),
-                    (slow_feed, 1.13573), (slow_feed, 1.13573),
-                    (fast_feed, 2.27146), (slow_feed, 1.13573))
+        segments = ((60., slow_feed, 1.13573), (100., fast_feed, 2.27146),
+                    (120., slow_feed, 1.13573), (140., slow_feed, 1.13573),
+                    (180., fast_feed, 2.27146), (200., slow_feed, 1.13573))
 
         def measure():
             self._run('ACTIVATE_EXTRUDER EXTRUDER=%s' % extruder)
@@ -2202,26 +2230,30 @@ class Creator5Toolchanger:
             picks = []
             calibrated = False
             paused = []
+            locked = None
             try:
                 self._run('G90')
                 self._run('M83')
                 self._run('G92 E0')
-                self._run('SET_VELOCITY_LIMIT ACCEL=%.0f'
-                          % self.flow_test_accel)
                 self._move_to_prep_bucket()
                 self._move(z=self.flow_test_z, feed=1200, machine=False)
                 self._run('M400')
                 paused = self._pause_extruder_tmc_checks()
+                locked = self._lock_xy()
+                self._run('SET_VELOCITY_LIMIT ACCEL=%.0f '
+                          'SQUARE_CORNER_VELOCITY=9' % self.flow_test_accel)
                 for repeat in range(5):
                     successful = []
-                    for advance in candidates:
+                    for index, advance in enumerate(candidates):
                         self._run('SET_PRESSURE_ADVANCE EXTRUDER=%s '
                                   'ADVANCE=%.4f' % (extruder, advance))
+                        self._run('G1 X40 Y%.1f F%.0f'
+                                  % (50. + 5. * index, fast_feed))
                         pa.pa_action(11, 666)
                         try:
-                            for feed, amount in segments:
-                                self._run('G1 E%.5f F%.0f' %
-                                          (amount, feed))
+                            for x, feed, amount in segments:
+                                self._run('G1 X%.1f E%.5f F%.0f'
+                                          % (x, amount, feed))
                         finally:
                             self._run('M400')
                             pa.pa_action(0, 666)
@@ -2256,6 +2288,7 @@ class Creator5Toolchanger:
             finally:
                 try:
                     pa.pa_action(0, 666)
+                    self._unlock_xy(locked)
                     self._raise_z()
                     if not calibrated:
                         self._run('SET_PRESSURE_ADVANCE EXTRUDER=%s '
