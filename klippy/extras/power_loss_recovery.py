@@ -171,7 +171,18 @@ class PowerLossRecovery:
 
         gcmd.respond_info('Recovering print %s at byte %d/%d'
                           % (filename, file_position, actual_size))
-        self.gcode.run_script_from_command('G28')
+        # Never home Z with the part on the bed: Z homes on the probe,
+        # wherever the nozzle is, i.e. into the print. The bed stays where it
+        # stopped, so take Z from the snapshot, back the bed off the part,
+        # then home only X and Y.
+        x, y, z, e = state['position']
+        self.gcode.run_script_from_command(
+            'SET_KINEMATIC_POSITION Z=%.3f SET_HOMED=z' % z)
+        self.gcode.run_script_from_command('G91')
+        self.gcode.run_script_from_command(
+            'G1 Z%.3f F600' % self.min_z_clearance)
+        self.gcode.run_script_from_command('G90')
+        self.gcode.run_script_from_command('G28 X Y')
         tool = state.get('tool')
         if tool is not None:
             heater = 'extruder' if tool == 0 else 'extruder%d' % tool
@@ -189,7 +200,6 @@ class PowerLossRecovery:
                     'TEMPERATURE_WAIT SENSOR=%s MINIMUM=%.1f'
                     % (name, target - 2.))
         toolhead = self.printer.lookup_object('toolhead')
-        x, y, z, e = state['position']
         cur_z = toolhead.get_position()[2]
         safe_z = max(z + self.min_z_clearance, cur_z)
         self.gcode.run_script_from_command('G90')
