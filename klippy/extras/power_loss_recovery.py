@@ -16,6 +16,7 @@
 import json
 import logging
 import os
+import threading
 import time
 
 class PowerLossRecovery:
@@ -30,8 +31,23 @@ class PowerLossRecovery:
         self.toolchanger_name = config.get('toolchanger', 'creator5_toolchanger')
         self.pending = None
         self._last_state = 'standby'
+        # State files are written (with fsync) by a background thread: an
+        # fsync on the printer's eMMC can block for hundreds of ms, and on the
+        # reactor thread that starves step generation ("Stepper too far in
+        # past"). Only the newest state matters, so a newer one replaces an
+        # unwritten older one.
+        self._write_lock = threading.Lock()
+        self._file_lock = threading.Lock()
+        self._write_wanted = threading.Event()
+        self._write_queued = None
+        self._stopping = False
+        self._writer = threading.Thread(target=self._writer_loop,
+                                        name='power_loss_recovery', daemon=True)
+        self._writer.start()
         self._timer = self.reactor.register_timer(self._poll)
         self.printer.register_event_handler('klippy:ready', self._handle_ready)
+        self.printer.register_event_handler('klippy:disconnect',
+                                            self._flush_writes)
         self.gcode.register_command(
             'RECOVER_PRINT', self.cmd_RECOVER_PRINT,
             desc='Resume the print interrupted at the last abnormal '
@@ -72,6 +88,34 @@ class PowerLossRecovery:
             return None
 
     def _write_state(self, state):
+        with self._write_lock:
+            self._write_queued = state
+        self._write_wanted.set()
+
+    def _writer_loop(self):
+        while not self._stopping:
+            self._write_wanted.wait()
+            self._write_wanted.clear()
+            with self._write_lock:
+                state, self._write_queued = self._write_queued, None
+            if state is not None:
+                self._write_state_now(state)
+
+    def _flush_writes(self):
+        # Shutdown/restart: write whatever is still queued, then stop the
+        # writer (a restart creates a new instance with its own).
+        with self._write_lock:
+            state, self._write_queued = self._write_queued, None
+            self._stopping = True
+        if state is not None:
+            self._write_state_now(state)
+        self._write_wanted.set()
+
+    def _write_state_now(self, state):
+        with self._file_lock:
+            self._write_file(state)
+
+    def _write_file(self, state):
         tmp_path = self.state_path + '.tmp'
         try:
             with open(tmp_path, 'w') as f:
