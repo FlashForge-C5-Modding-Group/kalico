@@ -755,6 +755,20 @@ class Creator5Toolchanger:
         reactor = self.printer.get_reactor()
         reactor.pause(reactor.monotonic() + milliseconds / 1000.)
 
+    def _enable_extruder_driver(self, extruder):
+        # Enabling the extruder motor re-initialises every TMC register over
+        # the UART (each write verified with an IFCNT read) and restarts the
+        # driver checks. In eboard PA mode the eboard polls SG_RESULT on the
+        # same UART and the replies collide ("Unable to read tmc uart
+        # 'extruder' register IFCNT"), so enable it before PA mode starts.
+        stepper_enable = self.printer.lookup_object('stepper_enable')
+        known = stepper_enable.get_steppers()
+        names = [n for n in dict.fromkeys(('extruder', extruder)) if n in known]
+        if stepper_enable.set_motors_enable(names, True):
+            self._run('M400')
+            # The re-init runs from a reactor callback; let it finish.
+            self._pause_ms(1000)
+
     def _pause_extruder_tmc_checks(self):
         paused = []
         for name, obj in self.printer.lookup_objects('tmc2209'):
@@ -2238,6 +2252,7 @@ class Creator5Toolchanger:
                 self._move_to_prep_bucket()
                 self._move(z=self.flow_test_z, feed=1200, machine=False)
                 self._run('M400')
+                self._enable_extruder_driver(extruder)
                 paused = self._pause_extruder_tmc_checks()
                 locked = self._lock_xy()
                 self._run('SET_VELOCITY_LIMIT ACCEL=%.0f '

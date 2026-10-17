@@ -28,6 +28,8 @@ class PowerLossRecovery:
             config.get('state_path', '~/printer_data/power_loss_recovery.json'))
         self.save_interval = config.getfloat('save_interval', 10., above=0.)
         self.min_z_clearance = config.getfloat('min_z_clearance', 5., above=0.)
+        # Seconds to wait after the Z lift before homing X and Y on resume.
+        self.home_delay = config.getfloat('home_delay', 5., minval=0.)
         self.toolchanger_name = config.get('toolchanger', 'creator5_toolchanger')
         # While a resume is pending the bed is held at the print's temperature
         # so the part stays stuck down and doesn't warp; idle_timeout turning
@@ -218,7 +220,10 @@ class PowerLossRecovery:
             'file_position': file_position,
             'file_size': sd_status.get('file_size', 0),
             'tool': tool,
+            # Toolhead coordinates (G-code offsets included), and the same
+            # point in G-code coordinates (what the file's E values count in).
             'position': [pos.x, pos.y, pos.z, pos.e],
+            'gcode_position': list(gm_status['gcode_position'][:4]),
             'speed_factor': gm_status['speed_factor'],
             'extrude_factor': gm_status['extrude_factor'],
             'absolute_coord': gm_status['absolute_coordinates'],
@@ -268,6 +273,10 @@ class PowerLossRecovery:
         self.gcode.run_script_from_command(
             'G1 Z%.3f F600' % self.min_z_clearance)
         self.gcode.run_script_from_command('G90')
+        # The MCUs have only just booted; homing straight away left Y
+        # slightly off. Let everything settle after the lift first.
+        if self.home_delay > 0.:
+            self.gcode.run_script_from_command('G4 P%d' % (self.home_delay * 1000.))
         self.gcode.run_script_from_command('G28 X Y')
         tool = state.get('tool')
         if tool is not None:
@@ -288,11 +297,22 @@ class PowerLossRecovery:
         toolhead = self.printer.lookup_object('toolhead')
         cur_z = toolhead.get_position()[2]
         safe_z = max(z + self.min_z_clearance, cur_z)
+        # x, y, z are toolhead coordinates, but G1 adds the G-code offsets
+        # the tool select just applied: take them off so the nozzle goes
+        # back to exactly where it was.
+        gm_status = self.printer.lookup_object('gcode_move').get_status(
+            self.reactor.monotonic())
+        off = [gm_status['position'][i] - gm_status['gcode_position'][i]
+               for i in range(3)]
         self.gcode.run_script_from_command('G90')
-        self.gcode.run_script_from_command('G1 Z%.3f F600' % safe_z)
-        self.gcode.run_script_from_command('G1 X%.3f Y%.3f F6000' % (x, y))
-        self.gcode.run_script_from_command('G1 Z%.3f F600' % z)
-        self.gcode.run_script_from_command('G92 E%.5f' % e)
+        self.gcode.run_script_from_command('G1 Z%.3f F600' % (safe_z - off[2]))
+        self.gcode.run_script_from_command(
+            'G1 X%.3f Y%.3f F6000' % (x - off[0], y - off[1]))
+        self.gcode.run_script_from_command('G1 Z%.3f F600' % (z - off[2]))
+        # The file's E values are in G-code coordinates (after its own G92).
+        gcode_e = state.get('gcode_position', [None] * 4)[3]
+        self.gcode.run_script_from_command(
+            'G92 E%.5f' % (e if gcode_e is None else gcode_e))
         if not state.get('absolute_coord', True):
             self.gcode.run_script_from_command('G91')
         if state.get('absolute_extrude', True):
