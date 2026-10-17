@@ -40,6 +40,10 @@ class PowerLossRecovery:
         self._bed_timer = None
         self.pending = None
         self._last_state = 'standby'
+        # Saving starts at the print's first layer (layer info from the
+        # slicer, or POWER_LOSS_RECOVERY_ARM from the print start macro).
+        self._armed = False
+        self._arm_next_print = False  # a resumed print is past its first layer
         # State files are written (with fsync) by a background thread: an
         # fsync on the printer's eMMC can block for hundreds of ms, and on the
         # reactor thread that starves step generation ("Stepper too far in
@@ -66,6 +70,9 @@ class PowerLossRecovery:
             'CLEAR_POWER_LOSS_RECOVERY', self.cmd_CLEAR_POWER_LOSS_RECOVERY,
             desc='Discard any pending power-loss-recovery state without '
                  'resuming')
+        self.gcode.register_command(
+            'POWER_LOSS_RECOVERY_ARM', self.cmd_POWER_LOSS_RECOVERY_ARM,
+            desc=self.cmd_POWER_LOSS_RECOVERY_ARM_help)
 
     def _handle_ready(self):
         self.pending = self._load_state()
@@ -171,12 +178,25 @@ class PowerLossRecovery:
         status = print_stats.get_status(eventtime)
         state = status['state']
         if state == 'printing':
+            if self._last_state not in ('printing', 'paused'):
+                # A print just started. Saving waits for its first layer:
+                # homing, heating and purging are not worth resuming into.
+                # Until then no older recovery state may be offered either.
+                self._armed = self._arm_next_print
+                self._arm_next_print = False
+                if not self._armed:
+                    self._write_state({'in_progress': False})
             if self.pending is not None:
                 # A new print replaces the interrupted one (its snapshots
                 # overwrite the saved state), so stop offering and holding it.
                 self.pending = None
                 self._stop_holding_bed()
-            self._snapshot(eventtime, status)
+            if not self._armed:
+                layer = (status.get('info') or {}).get('current_layer')
+                if layer is not None and layer >= 1:
+                    self._armed = True
+            if self._armed:
+                self._snapshot(eventtime, status)
         elif self._last_state in ('printing', 'paused') and state in (
                 'complete', 'cancelled', 'error', 'standby'):
             # A clean end to the previous print (even an error/cancel is a
@@ -184,8 +204,21 @@ class PowerLossRecovery:
             # flag so the next startup does not offer a stale resume.
             self._write_state({'in_progress': False})
             self.pending = None
+            self._armed = False
         self._last_state = state
         return eventtime + self.save_interval
+
+    cmd_POWER_LOSS_RECOVERY_ARM_help = ('Start saving recovery state now (the end of '
+                                        'the print start macro, before the first layer)')
+    def cmd_POWER_LOSS_RECOVERY_ARM(self, gcmd):
+        if self._armed:
+            return
+        self._armed = True
+        if self._last_state not in ('printing', 'paused'):
+            # the poll has not seen this print start yet; keep it armed then
+            self._arm_next_print = True
+        # first snapshot right away rather than up to save_interval later
+        self.reactor.update_timer(self._timer, self.reactor.NOW)
 
     def _snapshot(self, eventtime, print_stats_status):
         virtual_sdcard = self.printer.lookup_object('virtual_sdcard', None)
@@ -327,6 +360,7 @@ class PowerLossRecovery:
         self.gcode.run_script_from_command('M106 S%d' % round(fan_speed * 255))
         self.gcode.run_script_from_command('M23 %s' % filename)
         self.gcode.run_script_from_command('M26 S%d' % file_position)
+        self._arm_next_print = True
         self.gcode.run_script_from_command('M24')
         self._write_state({'in_progress': False})
         self.pending = None
