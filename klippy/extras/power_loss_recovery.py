@@ -29,6 +29,13 @@ class PowerLossRecovery:
         self.save_interval = config.getfloat('save_interval', 10., above=0.)
         self.min_z_clearance = config.getfloat('min_z_clearance', 5., above=0.)
         self.toolchanger_name = config.get('toolchanger', 'creator5_toolchanger')
+        # While a resume is pending the bed is held at the print's temperature
+        # so the part stays stuck down and doesn't warp; idle_timeout turning
+        # it off is undone. Declining the resume turns the heaters off.
+        self.keep_bed_hot = config.getboolean('keep_bed_hot', True)
+        self.bed_heater_name = config.get('bed_heater', 'heater_bed')
+        self._bed_target = None
+        self._bed_timer = None
         self.pending = None
         self._last_state = 'standby'
         # State files are written (with fsync) by a background thread: an
@@ -45,6 +52,7 @@ class PowerLossRecovery:
                                         name='power_loss_recovery', daemon=True)
         self._writer.start()
         self._timer = self.reactor.register_timer(self._poll)
+        self._bed_timer = self.reactor.register_timer(self._hold_bed)
         self.printer.register_event_handler('klippy:ready', self._handle_ready)
         self.printer.register_event_handler('klippy:disconnect',
                                             self._flush_writes)
@@ -66,13 +74,40 @@ class PowerLossRecovery:
                 'CLEAR_POWER_LOSS_RECOVERY to discard',
                 self.pending.get('filename'), self.pending.get('file_position', 0),
                 self.pending.get('file_size', 0))
+            target = self.pending.get('heater_targets', {}).get(self.bed_heater_name, 0.)
+            if self.keep_bed_hot and target > 0.:
+                logging.info('power_loss_recovery: holding %s at %.1f until the '
+                             'print is resumed or discarded',
+                             self.bed_heater_name, target)
+                self._bed_target = target
+                self.reactor.update_timer(self._bed_timer, self.reactor.NOW)
         else:
             self.pending = None
         self.reactor.update_timer(self._timer, self.reactor.NOW)
 
+    def _hold_bed(self, eventtime):
+        if self._bed_target is None or self.pending is None:
+            return self.reactor.NEVER
+        heaters = self.printer.lookup_object('heaters', None)
+        try:
+            heater = heaters.lookup_heater(self.bed_heater_name)
+        except Exception:
+            logging.warning('power_loss_recovery: no heater %s to hold',
+                            self.bed_heater_name)
+            self._bed_target = None
+            return self.reactor.NEVER
+        if heater.get_status(eventtime)['target'] < self._bed_target - 0.5:
+            heater.set_temp(self._bed_target)
+        return eventtime + 15.
+
+    def _stop_holding_bed(self):
+        self._bed_target = None
+        self.reactor.update_timer(self._bed_timer, self.reactor.NEVER)
+
     def get_status(self, eventtime=None):
         available = self.pending is not None and self.pending.get('in_progress')
-        status = {'recovery_available': available}
+        status = {'recovery_available': available,
+                  'holding_bed': self._bed_target}
         if available:
             status['filename'] = self.pending.get('filename')
             status['file_position'] = self.pending.get('file_position')
@@ -134,6 +169,11 @@ class PowerLossRecovery:
         status = print_stats.get_status(eventtime)
         state = status['state']
         if state == 'printing':
+            if self.pending is not None:
+                # A new print replaces the interrupted one (its snapshots
+                # overwrite the saved state), so stop offering and holding it.
+                self.pending = None
+                self._stop_holding_bed()
             self._snapshot(eventtime, status)
         elif self._last_state in ('printing', 'paused') and state in (
                 'complete', 'cancelled', 'error', 'standby'):
@@ -215,6 +255,8 @@ class PowerLossRecovery:
 
         gcmd.respond_info('Recovering print %s at byte %d/%d'
                           % (filename, file_position, actual_size))
+        # The resume below sets every heater itself.
+        self._stop_holding_bed()
         # Never home Z with the part on the bed: Z homes on the probe,
         # wherever the nozzle is, i.e. into the print. The bed stays where it
         # stopped, so take Z from the snapshot, back the bed off the part,
@@ -271,9 +313,16 @@ class PowerLossRecovery:
 
     cmd_CLEAR_POWER_LOSS_RECOVERY_help = 'Discard any pending power-loss-recovery state'
     def cmd_CLEAR_POWER_LOSS_RECOVERY(self, gcmd):
+        holding = self._bed_target is not None
         self._write_state({'in_progress': False})
         self.pending = None
-        gcmd.respond_info('Power-loss-recovery state cleared')
+        self._stop_holding_bed()
+        if holding:
+            # The bed was only kept hot for the resume that was just declined.
+            self.printer.lookup_object('heaters').turn_off_all_heaters()
+            gcmd.respond_info('Power-loss-recovery state cleared; heaters off')
+        else:
+            gcmd.respond_info('Power-loss-recovery state cleared')
 
 
 def load_config(config):
