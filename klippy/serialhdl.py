@@ -368,9 +368,19 @@ class SerialReader:
     def register_response(self, callback, name, oid=None):
         with self.lock:
             if callback is None:
-                del self.handlers[name, oid]
+                # A request from an earlier, timed-out connection attempt can
+                # finish after a new attempt has reset the handlers; a missing
+                # entry must not turn the retry into an unhandled exception.
+                self.handlers.pop((name, oid), None)
             else:
                 self.handlers[name, oid] = callback
+
+    def unregister_response(self, callback, name, oid=None):
+        # Only if still this callback's: a stale request from a timed-out
+        # connection attempt must not remove a newer attempt's handler.
+        with self.lock:
+            if self.handlers.get((name, oid)) == callback:
+                del self.handlers[name, oid]
 
     def _check_noncritical_disconnected(self):
         if self.mcu is not None and self.mcu.non_critical_disconnected:
@@ -500,10 +510,12 @@ class SerialRetryCommand:
             )
             params = self.last_params
             if params is not None:
-                self.serial.register_response(None, self.name, self.oid)
+                self.serial.unregister_response(
+                    self.handle_callback, self.name, self.oid)
                 return params
             if retries <= 0:
-                self.serial.register_response(None, self.name, self.oid)
+                self.serial.unregister_response(
+                    self.handle_callback, self.name, self.oid)
                 raise error("Unable to obtain '%s' response" % (self.name,))
             reactor = self.serial.reactor
             reactor.pause(reactor.monotonic() + retry_delay)

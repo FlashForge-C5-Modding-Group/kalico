@@ -133,6 +133,8 @@ class Creator5Toolchanger:
             'plate_check_min_delta', .8, above=0.)
         self.plate_check_travel_speed = config.getfloat(
             'plate_check_travel_speed', 100., above=0.)
+        # Result of the last C5_CHECK_BUILD_PLATE (None until one runs).
+        self.build_plate_detected = None
         self._stock_pin_approach_z = None
         self._offset_batch_active = False
         self.safe_z = config.getfloat('safe_z', 10., above=0.)
@@ -233,6 +235,9 @@ class Creator5Toolchanger:
             'flow_verdict_settle_ms', 50, minval=0, maxval=500)
         self.bed_soak_minutes = config.getfloat(
             'bed_soak_minutes', 10., minval=0., maxval=180.)
+        # No soak below this bed target (C).
+        self.bed_soak_min_temp = config.getfloat(
+            'bed_soak_min_temp', 45., minval=0.)
         self.door_buttons = config.getlist('door_buttons', [])
         self.dock_buttons = config.getlist('dock_buttons',
             ['extruder_pos%d' % (i + 1) for i in range(4)])
@@ -359,6 +364,15 @@ class Creator5Toolchanger:
         minutes = gcmd.get_float('MINUTES', self.bed_soak_minutes,
                                  minval=0., maxval=180.)
         if not minutes:
+            return
+        # A cool bed (PLA and the like) barely warps; soaking it only costs time.
+        heaters = self.printer.lookup_object('heaters')
+        bed_target = heaters.lookup_heater('heater_bed').get_status(
+            self.printer.get_reactor().monotonic())['target']
+        if bed_target < self.bed_soak_min_temp:
+            gcmd.respond_info('Creator 5 bed soak skipped: bed target %.0f C '
+                              'is below %.0f C' % (bed_target,
+                                                   self.bed_soak_min_temp))
             return
         self.printer.lookup_object('toolhead').wait_moves()
         reactor = self.printer.get_reactor()
@@ -1423,14 +1437,20 @@ class Creator5Toolchanger:
                           'removal verified' % (first, second))
         return first
 
-    def _check_plate_present(self, gcmd):
+    def _check_plate_present(self, gcmd, raise_error=True):
         # Inverse of _check_plate_removed: with the plate installed both
         # pins read within plate_check_min_delta of each other.
         first, second = self._measure_plate_pins(gcmd)
         if abs(first - second) >= self.plate_check_min_delta:
-            raise gcmd.error('Build plate not detected; install the build '
-                             'plate and restart the print (calibration pin '
-                             'heights differ by %.2f mm)' % abs(first - second))
+            msg = ('Build plate not detected; install the build plate and '
+                   'restart the print (calibration pin heights differ by '
+                   '%.2f mm)' % abs(first - second))
+            self.build_plate_detected = False
+            if raise_error:
+                raise gcmd.error(msg)
+            gcmd.respond_info(msg)
+            return
+        self.build_plate_detected = True
         gcmd.respond_info('Stock calibration pin Z=%.4f / %.4f; build '
                           'plate detected' % (first, second))
 
@@ -1919,10 +1939,16 @@ class Creator5Toolchanger:
                                               maxval=1))
 
     def cmd_check_build_plate(self, gcmd):
+        # ERROR=0 (print start): report a missing plate in the status
+        # (build_plate_detected) instead of raising, so the print can be
+        # cancelled rather than end in an error.
+        raise_error = gcmd.get_int('ERROR', 1, minval=0, maxval=1)
         _, _, attached = self._preflight(gcmd)
         if attached is not None:
             raise gcmd.error('Dock T%d before the build plate check' % attached)
-        self._with_motion(gcmd, lambda: self._check_plate_present(gcmd))
+        self.build_plate_detected = None
+        self._with_motion(gcmd, lambda: self._check_plate_present(
+            gcmd, raise_error=bool(raise_error)))
 
     def cmd_move_to_purge_bucket(self, gcmd):
         # Called before heating to the full priming temperature so any ooze
@@ -2391,6 +2417,7 @@ class Creator5Toolchanger:
                 self._ui_sensor_cache = (eventtime, active_tool, sensor_error)
         return {'active_tool': active_tool, 'sensor_error': sensor_error,
                 'busy': self.busy,
+                'build_plate_detected': self.build_plate_detected,
                 'dock_positions': [list(p) for p in self.docks],
                 'tool_measurements': [list(p) for p in self.measurements]}
 
