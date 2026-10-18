@@ -1234,6 +1234,72 @@ class Creator5OffsetTests(unittest.TestCase):
             'SET_VELOCITY_LIMIT SQUARE_CORNER_VELOCITY=5.000')
         self.board._unlock_xy(None)
 
+    def test_cool_for_dock_rejects_invalid_hotend_before_side_effects(self):
+        # GCmd intentionally ignores get_float bounds: the command must
+        # reject these values before preflight or any machine state changes.
+        for hotend in (24., 149.9,
+                       float('nan'), float('inf'), float('-inf')):
+            with self.subTest(hotend=hotend):
+                self.board._preflight = mock.Mock(return_value=([], [], 1))
+                self.board.cmd_verify_nozzle_z = mock.Mock()
+                self.board._raise_z = mock.Mock()
+                self.board._move = mock.Mock()
+                self.board._run = mock.Mock()
+                self.board.prep_approach_x = self.board.prep_approach_y = 250.
+                self.board.cooldown_x, self.board.cooldown_y = 266.5, 13.8
+                self.board.cooldown_wipe_z = 2.
+                self.board.cooldown_lift_z = 10.
+                self.board.cooldown_fan_speed = .6
+                self.board.printer.reset_mock()
+                heater = mock.Mock()
+                # Let an erroneously accepted value finish normally, rather
+                # than masking missing validation with a cooldown timeout.
+                heater.get_status.return_value = {'temperature': 0.}
+                self.board.printer.lookup_object.return_value = heater
+                reactor = self.board.printer.get_reactor.return_value
+                reactor.monotonic.return_value = 0.
+
+                with self.assertRaises(RuntimeError):
+                    self.board.cmd_cool_for_dock(GCmd(HOTEND=hotend))
+
+                self.board._preflight.assert_not_called()
+                self.board.cmd_verify_nozzle_z.assert_not_called()
+                self.board._raise_z.assert_not_called()
+                self.board._move.assert_not_called()
+                self.board._run.assert_not_called()
+                self.assertEqual(self.board.printer.mock_calls, [])
+
+    def test_cool_for_dock_accepts_minimum_and_calibration_temperatures(self):
+        # Rotation calibration permits 320 C; cooldown must not impose the
+        # loading macro's 300 C upper limit on that existing caller.
+        for hotend, target in ((150., 50.), (320., 220.)):
+            with self.subTest(hotend=hotend):
+                self.board._preflight = mock.Mock(return_value=([], [], 1))
+                self.board.cmd_verify_nozzle_z = mock.Mock()
+                self.board._raise_z = mock.Mock()
+                self.board._move = mock.Mock()
+                self.board._run = mock.Mock()
+                self.board.prep_approach_x = self.board.prep_approach_y = 250.
+                self.board.cooldown_x, self.board.cooldown_y = 266.5, 13.8
+                self.board.cooldown_wipe_z = 2.
+                self.board.cooldown_lift_z = 10.
+                self.board.cooldown_fan_speed = .6
+                heater = mock.Mock()
+                heater.get_status.return_value = {'temperature': target}
+                self.board.printer.lookup_object.return_value = heater
+                reactor = self.board.printer.get_reactor.return_value
+                reactor.monotonic.return_value = 0.
+
+                self.board.cmd_cool_for_dock(GCmd(HOTEND=hotend))
+
+                self.board._run.assert_any_call(
+                    'SET_HEATER_TEMPERATURE HEATER=extruder1 TARGET=%.1f'
+                    % target)
+                self.board._move.assert_any_call(
+                    z=2., feed=600, machine=False)
+                self.board._move.assert_any_call(
+                    z=10., feed=600, machine=False)
+
     def test_cool_for_dock_uses_stock_minus_100_rule(self):
         self.board._preflight = lambda command: ([], [], 1)
         self.board.cmd_verify_nozzle_z = mock.Mock()
