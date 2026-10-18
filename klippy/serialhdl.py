@@ -3,6 +3,7 @@
 # Copyright (C) 2016-2021  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
+import functools
 import logging
 import os
 import threading
@@ -36,6 +37,10 @@ class SerialReader:
         # Threading
         self.lock = threading.Lock()
         self.background_thread = None
+        # Separate from the response-handler lock, which shutdown already holds.
+        self._timing_lock = threading.Lock()
+        self._timing_enabled = False
+        self._timing_debug_history = None
         # Message handlers
         self.handlers = {}
         self.register_response(self._handle_unknown_init, "#unknown")
@@ -95,6 +100,9 @@ class SerialReader:
                 identify_data += msgdata
 
     def _start_session(self, serial_dev, serial_fd_type=b"u", client_id=0):
+        with self._timing_lock:
+            self._timing_enabled = False
+            self._timing_debug_history = None
         self.serial_dev = serial_dev
         self.serialqueue = self.ffi_main.gc(
             self.ffi_lib.serialqueue_alloc(
@@ -317,6 +325,9 @@ class SerialReader:
         return True
 
     def connect_file(self, debugoutput, dictionary, pace=False):
+        with self._timing_lock:
+            self._timing_enabled = False
+            self._timing_debug_history = None
         self.serial_dev = debugoutput
         self.msgparser.process_identify(dictionary, decompress=False)
         self.serialqueue = self.ffi_main.gc(
@@ -336,7 +347,10 @@ class SerialReader:
             self.ffi_lib.serialqueue_exit(self.serialqueue)
             if self.background_thread is not None:
                 self.background_thread.join()
-            self.background_thread = self.serialqueue = None
+            with self._timing_lock:
+                self.background_thread = self.serialqueue = None
+                self._timing_enabled = False
+                self._timing_debug_history = None
         if self.serial_dev is not None:
             self.serial_dev.close()
             self.serial_dev = None
@@ -351,6 +365,114 @@ class SerialReader:
             self.serialqueue, self.stats_buf, len(self.stats_buf)
         )
         return str(self.ffi_main.string(self.stats_buf).decode())
+
+    def set_timing_diagnostics(self, enabled):
+        with self._timing_lock:
+            if self.serialqueue:
+                self.ffi_lib.serialqueue_set_timing_enabled(
+                    self.serialqueue, int(enabled)
+                )
+                self._timing_enabled = bool(enabled)
+                if enabled:
+                    self._timing_debug_history = None
+
+    def get_timing_diagnostics(self):
+        if not self.serialqueue:
+            return []
+        data = self.ffi_main.new("struct pull_queue_timing[128]")
+        count = self.ffi_lib.serialqueue_extract_timing(
+            self.serialqueue, data, len(data)
+        )
+        fields = (
+            "kind", "bytes", "eventtime", "conv_time", "est_freq",
+            "req_clock", "min_clock", "conv_clock", "send_seq", "receive_seq",
+            "ready_bytes", "upcoming_bytes", "need_ack_bytes",
+        )
+        return [
+            {field: getattr(data[i], field) for field in fields}
+            for i in range(count)
+        ]
+
+    def _timing_debug_records(self, data, count):
+        # Private history is immutable and never aliases C buffers or consumers.
+        return tuple(
+            (bytes(self.ffi_main.buffer(data[i].msg, data[i].len)),
+             data[i].sent_time, data[i].receive_time)
+            for i in range(max(0, count - 100), count)
+        )
+
+    def get_timing_debug_snapshot(self):
+        with self._timing_lock:
+            snapshot = {
+                "connected": bool(self.serialqueue), "sent": [], "received": []
+            }
+            if not self.serialqueue:
+                return snapshot
+            history = self._timing_debug_history
+            if history is None:
+                data = self.ffi_main.new("struct pull_queue_message[100]")
+                history = []
+                for sentq in (1, 0):
+                    count = self.ffi_lib.serialqueue_snapshot_old(
+                        self.serialqueue, sentq, data, len(data)
+                    )
+                    history.append(self._timing_debug_records(data, count))
+            for name, records in zip(("sent", "received"), history):
+                snapshot[name] = [
+                    {"data": raw, "sent_time": sent, "receive_time": received}
+                    for raw, sent, received in records
+                ]
+            return snapshot
+
+    def format_timing_debug_snapshot(self, snapshot):
+        # Decode only on explicit dump/termination, never during warning capture.
+        formatted = {"connected": snapshot["connected"]}
+        for name in ("sent", "received"):
+            records = formatted[name] = []
+            for record in snapshot[name]:
+                raw = record["data"]
+                item = {
+                    "data": raw.hex(),
+                    "sent_time": record["sent_time"],
+                    "receive_time": record["receive_time"],
+                }
+                try:
+                    data = list(raw)
+                    if self.msgparser.check_packet(data) != len(data) or not data:
+                        raise ValueError("invalid message block")
+                    item["decoded"] = self.msgparser.dump(data)
+                    if any(cmd.startswith("#unknown")
+                           for cmd in item["decoded"]):
+                        item["undecodable"] = "unknown message type"
+                except Exception as exc:
+                    item["undecodable"] = str(exc)
+                records.append(item)
+        return formatted
+
+    def dump_timing_debug(self):
+        snapshot = self.format_timing_debug_snapshot(
+            self.get_timing_debug_snapshot()
+        )
+        if not snapshot["connected"]:
+            return "Serial timing history unavailable: MCU disconnected"
+        out = [
+            "Dumping serial stats: %s" % self.stats(self.reactor.monotonic()),
+            "Sent fields: index, estimated wire completion (not measured MCU"
+            " arrival), message-build host time, bytes",
+        ]
+        for name, label in (("sent", "Sent"), ("received", "Receive:")):
+            out.append("Dumping %s queue %d messages"
+                       % (name, len(snapshot[name])))
+            for i, record in enumerate(snapshot[name]):
+                decoded = ", ".join(record.get("decoded", []))
+                if "undecodable" in record:
+                    decoded += " undecodable: " + record["undecodable"]
+                out.append(
+                    "%s %d %f %f %d: %s [hex=%s]"
+                    % (label, i, record["receive_time"], record["sent_time"],
+                       len(record["data"]) // 2, decoded, record["data"])
+                )
+        return "\n".join(out)
 
     def get_reactor(self):
         return self.reactor
@@ -434,12 +556,22 @@ class SerialReader:
         )
         sdata = self.ffi_main.new("struct pull_queue_message[1024]")
         rdata = self.ffi_main.new("struct pull_queue_message[1024]")
-        scount = self.ffi_lib.serialqueue_extract_old(
-            self.serialqueue, 1, sdata, len(sdata)
-        )
-        rcount = self.ffi_lib.serialqueue_extract_old(
-            self.serialqueue, 0, rdata, len(rdata)
-        )
+        with self._timing_lock:
+            scount = self.ffi_lib.serialqueue_extract_old(
+                self.serialqueue, 1, sdata, len(sdata)
+            )
+            rcount = self.ffi_lib.serialqueue_extract_old(
+                self.serialqueue, 0, rdata, len(rdata)
+            )
+            # Preserve the first consumed failure boundary for queued warning
+            # callbacks and later dumps. Reuse extracted buffers: default-off
+            # shutdown performs no additional snapshots or raw-history copies.
+            if (self._timing_enabled and self._timing_debug_history is None
+                    and (scount or rcount)):
+                self._timing_debug_history = (
+                    self._timing_debug_records(sdata, scount),
+                    self._timing_debug_records(rdata, rcount),
+                )
         out.append("Dumping send queue %d messages" % (scount,))
         for i in range(scount):
             msg = sdata[i]
@@ -478,6 +610,19 @@ class SerialReader:
     def handle_output(self, params):
         logging.info(
             "%s%s: %s", self.warn_prefix, params["#name"], params["#msg"]
+        )
+        if params["#msg"] == "Timer too close" and self.mcu is not None:
+            self.reactor.register_async_callback(
+                functools.partial(
+                    self._notify_timer_too_close,
+                    mcu_name=self.mcu.get_name(),
+                    receive_time=params["#receive_time"],
+                )
+            )
+
+    def _notify_timer_too_close(self, eventtime, mcu_name, receive_time):
+        self.mcu.get_printer().send_event(
+            "mcu:timer_too_close", mcu_name, receive_time
         )
 
     def handle_default(self, params):

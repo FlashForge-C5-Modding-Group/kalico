@@ -3,6 +3,9 @@
 # Copyright (C) 2025  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
+import collections
+import functools
+import json
 import logging
 
 from klippy import chelper
@@ -59,8 +62,147 @@ class PrinterMotionQueuing:
         self.do_kick_flush_timer = True
         self.last_flush_time = self.last_step_gen_time = 0.0
         self.need_flush_time = self.need_step_gen_time = 0.0
+        # Opt-in, bounded host timing capture; no records are created when off.
+        self._timing_enabled = False
+        self._timing_records = collections.deque(maxlen=128)
+        self._timing_expected_flush = None
+        self._timing_first_warning = self._timing_latest_warning = None
+        self._timing_terminal_pending = False
+        self._timing_print_active = False
         # Register handlers
         printer.register_event_handler("klippy:shutdown", self._handle_shutdown)
+        printer.register_event_handler(
+            "mcu:timer_too_close", self._handle_timer_too_close
+        )
+        printer.register_event_handler(
+            "print_stats:start_printing", self._handle_timing_print_start
+        )
+        printer.register_event_handler(
+            "print_stats:reset", self._handle_timing_print_reset
+        )
+        for event in (
+            "print_stats:complete_printing",
+            "print_stats:cancelled_printing",
+            "print_stats:error_printing",
+        ):
+            printer.register_event_handler(
+                event, functools.partial(self._handle_timing_terminal, event)
+            )
+        gcode = printer.lookup_object("gcode")
+        gcode.register_command(
+            "SET_MOTION_TIMING_DIAGNOSTICS",
+            self.cmd_SET_MOTION_TIMING_DIAGNOSTICS,
+            desc="Enable or disable bounded motion timing capture while idle",
+        )
+        gcode.register_command(
+            "DUMP_MOTION_TIMING_DIAGNOSTICS",
+            self.cmd_DUMP_MOTION_TIMING_DIAGNOSTICS,
+            when_not_ready=True,
+            desc="Write retained motion timing diagnostics to the printer log",
+        )
+
+    # Bounded timing capture
+    def cmd_SET_MOTION_TIMING_DIAGNOSTICS(self, gcmd):
+        enabled = gcmd.get_int("ENABLE", minval=0, maxval=1)
+        stats = self.printer.lookup_object("print_stats", None)
+        if stats is not None:
+            state = stats.get_status(self.reactor.monotonic())["state"]
+            if state in ("printing", "paused"):
+                raise gcmd.error(
+                    "Cannot change motion timing diagnostics during a print"
+                )
+        if enabled:
+            self._timing_records.clear()
+            self._timing_first_warning = self._timing_latest_warning = None
+        self._timing_expected_flush = None
+        for mcu in self.all_mcus:
+            mcu.set_timing_diagnostics(enabled)
+        self._timing_enabled = bool(enabled)
+
+    def _snapshot_timing(self, host_time):
+        return {
+            "host_time": host_time,
+            "python_ring": list(self._timing_records),
+            "serial": {
+                mcu.get_name(): mcu.get_timing_diagnostics()
+                for mcu in self.all_mcus
+            },
+            "raw_history": {
+                mcu.get_name(): mcu.get_timing_debug_snapshot()
+                for mcu in self.all_mcus
+            },
+        }
+
+    def _handle_timer_too_close(self, mcu_name, receive_time):
+        if not self._timing_enabled:
+            return
+        # Throttle copying history, never warning delivery or print counters.
+        host_time = self.reactor.monotonic()
+        latest = self._timing_latest_warning
+        if latest is not None and host_time - latest["host_time"] < 1.0:
+            return
+        snapshot = self._snapshot_timing(host_time)
+        if self._timing_first_warning is None:
+            self._timing_first_warning = snapshot
+        self._timing_latest_warning = snapshot
+
+    def _format_timing_warning(self, snapshot):
+        if snapshot is None:
+            return None
+        result = dict(snapshot)
+        result["raw_history"] = {
+            mcu.get_name(): mcu.format_timing_debug_snapshot(
+                snapshot["raw_history"][mcu.get_name()]
+            )
+            for mcu in self.all_mcus
+        }
+        return result
+
+    def _dump_timing_diagnostics(self, trigger, eventtime):
+        capture = {
+            "trigger": trigger,
+            "host_time": self.reactor.monotonic(),
+            "python_ring": list(self._timing_records),
+            "serial": {
+                mcu.get_name(): mcu.get_timing_diagnostics()
+                for mcu in self.all_mcus
+            },
+            "first_warning": self._format_timing_warning(
+                self._timing_first_warning
+            ),
+            "latest_warning": self._format_timing_warning(
+                self._timing_latest_warning
+            ),
+        }
+        logging.info("MOTION_TIMING_DIAGNOSTICS %s", json.dumps(capture))
+        for mcu in self.all_mcus:
+            logging.info("%s", mcu.dump_timing_debug())
+
+    def cmd_DUMP_MOTION_TIMING_DIAGNOSTICS(self, gcmd):
+        self._dump_timing_diagnostics("explicit", self.reactor.monotonic())
+        gcmd.respond_info("Motion timing diagnostics written to printer log")
+
+    def _handle_timing_print_start(self):
+        self._timing_print_active = True
+
+    def _handle_timing_print_reset(self):
+        # Reset cancels an active/paused print without a terminal stats event.
+        # A retained cancelled report is not evidence of a new cancellation.
+        if self._timing_print_active:
+            self._handle_timing_terminal("print_stats:cancelled_printing")
+
+    def _handle_timing_terminal(self, trigger, *args):
+        self._timing_print_active = False
+        if not self._timing_enabled or self._timing_terminal_pending:
+            return
+        self._timing_terminal_pending = True
+        self.reactor.register_callback(
+            functools.partial(self._dump_terminal_timing, trigger)
+        )
+
+    def _dump_terminal_timing(self, trigger, eventtime):
+        self._timing_terminal_pending = False
+        self._dump_timing_diagnostics(trigger, eventtime)
 
     # C trapq tracking
     def allocate_trapq(self):
@@ -150,8 +292,15 @@ class PrinterMotionQueuing:
     # Flush tracking
     def _handle_shutdown(self):
         self.can_pause = False
+        self._handle_timing_terminal("klippy:shutdown")
 
     def _advance_flush_time(self, want_flush_time, want_step_gen_time=0.0):
+        timing_enabled = self._timing_enabled
+        if timing_enabled:
+            entry_time = self.reactor.monotonic()
+            estimated_print_time = self.mcu.estimated_print_time(entry_time)
+            need_step_gen_time = self.need_step_gen_time
+        callbacks_time = gen_steps_time = None
         flush_time = max(
             want_flush_time,
             self.last_flush_time,
@@ -160,27 +309,51 @@ class PrinterMotionQueuing:
         step_gen_time = max(
             want_step_gen_time, self.last_step_gen_time, flush_time
         )
-        # Invoke flush callbacks (if any)
-        for cb in self.flush_callbacks:
-            cb(flush_time, step_gen_time)
-        # Determine maximum history to keep
-        trapq_free_time = step_gen_time - self.kin_flush_delay
-        clear_history_time = self.clear_history_time
-        if not self.can_pause:
-            clear_history_time = max(0.0, trapq_free_time - MOVE_HISTORY_EXPIRE)
-        # Generate stepper movement and transmit
-        ret = self.steppersyncmgr_gen_steps(
-            self.steppersyncmgr, flush_time, step_gen_time, clear_history_time
-        )
-        if ret:
-            raise self.mcu.error("Internal error in stepcompress")
-        self.last_flush_time = flush_time
-        self.last_step_gen_time = step_gen_time
-        # Move processed trapq entries to history list, and expire old history
-        for trapq in self.trapqs:
-            self.trapq_finalize_moves(
-                trapq, trapq_free_time, clear_history_time
-            )
+        try:
+            # Invoke flush callbacks (if any)
+            for cb in self.flush_callbacks:
+                cb(flush_time, step_gen_time)
+            if timing_enabled:
+                callbacks_time = self.reactor.monotonic()
+            # Determine maximum history to keep
+            trapq_free_time = step_gen_time - self.kin_flush_delay
+            clear_history_time = self.clear_history_time
+            if not self.can_pause:
+                clear_history_time = max(
+                    0.0, trapq_free_time - MOVE_HISTORY_EXPIRE
+                )
+            # Generate stepper movement and transmit
+            try:
+                ret = self.steppersyncmgr_gen_steps(
+                    self.steppersyncmgr, flush_time, step_gen_time,
+                    clear_history_time
+                )
+            finally:
+                if timing_enabled:
+                    gen_steps_time = self.reactor.monotonic()
+            if ret:
+                raise self.mcu.error("Internal error in stepcompress")
+            self.last_flush_time = flush_time
+            self.last_step_gen_time = step_gen_time
+            # Move processed trapq entries to history list, and expire history
+            for trapq in self.trapqs:
+                self.trapq_finalize_moves(
+                    trapq, trapq_free_time, clear_history_time
+                )
+        finally:
+            if timing_enabled:
+                self._timing_records.append({
+                    "kind": "advance_flush_time",
+                    "entry_time": entry_time,
+                    "callbacks_time": callbacks_time,
+                    "gen_steps_time": gen_steps_time,
+                    "want_flush_time": want_flush_time,
+                    "want_step_gen_time": want_step_gen_time,
+                    "flush_time": flush_time,
+                    "step_gen_time": step_gen_time,
+                    "need_step_gen_time": need_step_gen_time,
+                    "estimated_print_time": estimated_print_time,
+                })
 
     def _await_flush_time(self, want_flush_time):
         while 1:
@@ -203,6 +376,11 @@ class PrinterMotionQueuing:
         return kin_time + self.kin_flush_delay
 
     def _flush_handler(self, eventtime):
+        timing_enabled = self._timing_enabled
+        deadline = self.reactor.NEVER
+        if timing_enabled:
+            entry_time = self.reactor.monotonic()
+            expected_time = self._timing_expected_flush
         try:
             est_print_time = self.mcu.estimated_print_time(eventtime)
             aggr_sg_time = self.need_step_gen_time - 2.0 * self.kin_flush_delay
@@ -245,13 +423,28 @@ class PrinterMotionQueuing:
                 if self.last_flush_time >= max_flush_time:
                     return self.reactor.NEVER
                 waketime = self.last_flush_time - BGFLUSH_LOW_TIME
-            return eventtime + waketime - est_print_time
+            deadline = eventtime + waketime - est_print_time
+            return deadline
         except:
             logging.exception("Exception in flush_handler")
             self.printer.invoke_shutdown("Exception in flush_handler")
+        finally:
+            if timing_enabled:
+                self._timing_expected_flush = deadline
+                self._timing_records.append({
+                    "kind": "flush_handler",
+                    "expected_time": expected_time,
+                    "entry_time": entry_time,
+                    "deadline": deadline,
+                })
         return self.reactor.NEVER
 
     def _flush_handler_debug(self, eventtime):
+        timing_enabled = self._timing_enabled
+        deadline = self.reactor.NEVER
+        if timing_enabled:
+            entry_time = self.reactor.monotonic()
+            expected_time = self._timing_expected_flush
         # Use custom flushing code when in batch output mode
         try:
             faux_time = self.need_flush_time - 1.5
@@ -264,7 +457,8 @@ class PrinterMotionQueuing:
                 self._advance_flush_time(0.0, target)
                 flush_count += 1
             if flush_count:
-                return self.reactor.NOW
+                deadline = self.reactor.NOW
+                return deadline
             self._advance_flush_time(
                 self.need_flush_time + get_danger_options().bgflush_extra_time
             )
@@ -273,6 +467,15 @@ class PrinterMotionQueuing:
         except:
             logging.exception("Exception in flush_handler_debug")
             self.printer.invoke_shutdown("Exception in flush_handler_debug")
+        finally:
+            if timing_enabled:
+                self._timing_expected_flush = deadline
+                self._timing_records.append({
+                    "kind": "flush_handler",
+                    "expected_time": expected_time,
+                    "entry_time": entry_time,
+                    "deadline": deadline,
+                })
         return self.reactor.NEVER
 
     def note_mcu_movequeue_activity(self, mq_time, is_step_gen=True):
@@ -282,11 +485,13 @@ class PrinterMotionQueuing:
         self.need_flush_time = max(self.need_flush_time, mq_time)
         if self.do_kick_flush_timer:
             self.do_kick_flush_timer = False
+            self._timing_expected_flush = None
             self.reactor.update_timer(self.flush_timer, self.reactor.NOW)
 
     def drip_update_time(self, start_time, end_time, drip_completion):
         self._await_flush_time(start_time)
         # Disable background flushing from timer
+        self._timing_expected_flush = None
         self.reactor.update_timer(self.flush_timer, self.reactor.NEVER)
         self.do_kick_flush_timer = False
         self._advance_flush_time(start_time)
@@ -306,6 +511,7 @@ class PrinterMotionQueuing:
             self.note_mcu_movequeue_activity(flush_time)
             self._advance_flush_time(flush_time)
         # Restore background flushing
+        self._timing_expected_flush = None
         self.reactor.update_timer(self.flush_timer, self.reactor.NOW)
         self._advance_flush_time(flush_time + self.kin_flush_delay)
 

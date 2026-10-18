@@ -82,6 +82,136 @@ actual commands and the above output. The generated data is useful for
 testing and inspection; it is not useful for sending to a real
 micro-controller.
 
+## Motion timing diagnostics
+
+The opt-in host capture helps distinguish late motion generation from
+late delivery to an MCU. It does not change scheduling constants, queue
+eligibility, clocks, or safety thresholds. `Timer too close` remains a
+nonfatal warning; independent shutdown checks such as `Stepper too far
+in past` remain in effect. Warning reports and this instrumentation are
+not a fix for the original late-step failure. A causal patch requires
+evidence of the bottleneck and a supervised verification afterward.
+
+### Deploying the matching host code
+
+Deploy the reviewed host revision through the installation's existing
+source-update mechanism. Include the Python sources and matching native
+C helper sources, headers, and CFFI declarations together; do not deploy
+only the Python files or reuse an incompatible helper binary. Record
+the actual deployed source revision and helper build identity with the
+capture. The helper uses the existing host-side rebuild path when its
+sources change; the host must have the normal compiler and Python/CFFI
+build prerequisites. Confirm the matching helper rebuild/load succeeds
+before attempting the capture. A helper build or compatibility error is
+a deployment error, not a reason to silently omit native diagnostics.
+
+Restart the Klippy host service after updating, using the installation's
+service name. For the standard service convention used in the
+[migration instructions](Migrating_from_Klipper.md), this is:
+
+```
+sudo systemctl restart klipper
+```
+
+This is a host-only change: no MCU firmware update or flashing is
+required, and no printer configuration section or configuration
+overwrite is needed. Do not run `SAVE_CONFIG` for this feature. Use the
+known printer host and existing installation paths; the capture
+procedure does not prescribe a remote address or a deployment script.
+
+### Supervised reproduction
+
+Capture is disabled by default. While idle, enable it with
+`SET_MOTION_TIMING_DIAGNOSTICS ENABLE=1`. Enabling clears previous
+records and enables all currently connected MCU serial queues.
+`ENABLE=0` stops recording without deleting history; re-enabling starts
+fresh. Changing the setting during a print, including while paused, is
+rejected with `Cannot change motion timing diagnostics during a print`.
+No configuration section is added.
+
+The operator must confirm bed/nozzle clearance and supervise the
+existing print. The print's normal startup may heat, home, and move the
+printer. For the purge-line failure reproduction, the operator enters:
+
+```gcode
+SET_MOTION_TIMING_DIAGNOSTICS ENABLE=1
+SDCARD_PRINT_FILE FILENAME="Cartographer V4 - Standard.step_PLA_18m54s.gcode"
+```
+
+After completion or failure, **before restarting the host**, enter:
+
+```gcode
+GET_TIMER_TOO_CLOSE_STATS
+DUMP_MOTION_TIMING_DIAGNOSTICS
+```
+
+Both query commands remain available after shutdown. Save the complete
+resulting printer log and console report, including the bounded capture
+and records preceding the warning/failure, not only the final error
+line. Reports and retained snapshots are in memory and are lost on host
+restart. Do not re-enable capture before saving it, because doing so
+clears the previous records. If the failure does not reproduce, retain
+the successful capture; an uneventful run does not establish that the
+original fault is fixed.
+
+### Capture contents and interpretation
+
+The Python ring retains the newest 128 flush/generation records. The
+native serial queue retains the newest 128 enqueue/message-build
+records per MCU, under its existing queue lock. Collection does not
+allocate a new object per step. Python flush records distinguish an
+expected invocation deadline from actual entry; externally kicked or
+disabled timer invocations have no expected deadline. Generation
+records separate time spent in Python flush callbacks from synchronous
+C step generation/emission and include the requested/effective flush
+and generation times.
+
+Each warning can snapshot the numeric rings and non-destructive raw
+serial history (up to 100 sent and 100 received messages per MCU).
+The first warning snapshot is preserved; the latest snapshot refreshes
+at most once per monotonic second. This snapshot throttling never
+throttles the warning statistics. Raw message bytes and original send/
+receive timestamps are retained in memory, so subsequent traffic
+overwriting live history cannot erase a saved warning snapshot.
+Messages are not decoded and bulk traces are not formatted/logged in
+the warning callback while motion continues.
+
+Print completion, cancellation, error, shutdown, and explicit dumps
+capture current rings/history and emit a log line beginning
+`MOTION_TIMING_DIAGNOSTICS ` followed by one JSON object. It contains
+the trigger, host timestamp, live Python ring, MCU-name-to-serial-record
+map, and retained first/latest warning snapshots (null when absent).
+At output time, raw bytes are represented as hexadecimal and decoded
+with the MCU's existing message parser for readable commands such as
+`queue_step`. An undecodable record retains its hex bytes and timestamps
+and is marked undecodable rather than discarding the rest of the
+capture. Disconnected MCUs report unavailable live serial history
+without preventing other MCU records or retained snapshots from being
+dumped. Each dump also logs each MCU's live configuration, clock-sync,
+and available serial debug information.
+
+Native `kind=1` records mark enqueue; `kind=2` records mark outgoing
+message-build. Their `req_clock` is the queue's priority/need time,
+**not universally a physical first-step deadline**. Zero request/minimum
+clocks denote no finite positive scheduled request and must not be
+interpreted as a deadline miss. Correlate finite request clocks with
+the retained decoded `queue_step` commands and clock conversion fields,
+including 32-bit wrap, before reconstructing a missed step deadline.
+In the live serial send dump, the **first displayed time is estimated
+wire completion, not measured arrival at the MCU**; the other time is
+the original message-build/send timestamp. Do not reverse those times
+or treat their difference as a measured MCU latency.
+
+Compare flush invocation lateness, Python callback duration,
+C generation/emission duration, and enqueue-versus-build timing to
+identify the demonstrated bottleneck. High CPU load alone does not
+identify the cause. Preserve the warning's original host receipt time:
+[`print_stats.timer_too_close`](Status_Reference.md#print_stats)
+uses scheduled-layer/receive-time attribution, not physical layer
+position. Known startup is layer 0; absent slicer metadata is unknown.
+Elapsed warning times include pauses, and the completed report remains
+queryable until the next print starts or the host restarts.
+
 ## Motion analysis and data logging
 
 Kalico supports logging its internal motion history, which can be

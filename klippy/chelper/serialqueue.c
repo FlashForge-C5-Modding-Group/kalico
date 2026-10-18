@@ -36,6 +36,8 @@ struct command_queue {
     struct list_node node;
 };
 
+#define TIMING_QUEUE_SIZE 128
+
 struct serialqueue {
     // Input reading
     struct pollreactor *pr;
@@ -75,6 +77,9 @@ struct serialqueue {
     struct list_head old_sent, old_receive;
     // Stats
     uint32_t bytes_write, bytes_read, bytes_retransmit, bytes_invalid;
+    // Opt-in timing capture (protected by lock, no per-record allocation)
+    int timing_enabled, timing_pos, timing_count;
+    struct pull_queue_timing timing[TIMING_QUEUE_SIZE];
 };
 
 #define SQPF_SERIAL 0
@@ -119,6 +124,30 @@ debug_queue_add(struct list_head *root, struct queue_message *qm)
         root, struct queue_message, node);
     list_del(&old->node);
     message_free(old);
+}
+
+// Record a queue boundary while holding sq->lock and with capture enabled.
+static void
+timing_queue_add(struct serialqueue *sq, uint32_t kind, uint32_t bytes
+                 , double eventtime, uint64_t req_clock, uint64_t min_clock)
+{
+    struct pull_queue_timing *t = &sq->timing[sq->timing_pos];
+    t->kind = kind;
+    t->bytes = bytes;
+    t->eventtime = eventtime;
+    t->conv_time = sq->ce.conv_time;
+    t->est_freq = sq->ce.est_freq;
+    t->req_clock = req_clock;
+    t->min_clock = min_clock;
+    t->conv_clock = sq->ce.conv_clock;
+    t->send_seq = sq->send_seq;
+    t->receive_seq = sq->receive_seq;
+    t->ready_bytes = sq->ready_bytes;
+    t->upcoming_bytes = sq->upcoming_bytes;
+    t->need_ack_bytes = sq->need_ack_bytes;
+    sq->timing_pos = (sq->timing_pos + 1) % TIMING_QUEUE_SIZE;
+    if (sq->timing_count < TIMING_QUEUE_SIZE)
+        sq->timing_count++;
 }
 
 // Wake up the receiver thread if it is waiting
@@ -457,6 +486,7 @@ build_and_send_command(struct serialqueue *sq, uint8_t *buf, int pending
                        , double eventtime)
 {
     int len = MESSAGE_HEADER_SIZE;
+    uint64_t timing_req_clock = 0, timing_min_clock = 0;
     while (sq->ready_bytes) {
         // Find highest priority message (message with lowest req_clock)
         uint64_t min_clock = MAX_CLOCK;
@@ -481,6 +511,13 @@ build_and_send_command(struct serialqueue *sq, uint8_t *buf, int pending
             list_del(&cq->node);
         memcpy(&buf[len], qm->msg, qm->len);
         len += qm->len;
+        if (sq->timing_enabled
+            && qm->req_clock > 0
+            && qm->req_clock < BACKGROUND_PRIORITY_CLOCK
+            && (!timing_req_clock || qm->req_clock < timing_req_clock)) {
+            timing_req_clock = qm->req_clock;
+            timing_min_clock = qm->min_clock;
+        }
         sq->ready_bytes -= qm->len;
         if (qm->notify_id) {
             // Message requires notification - add to notify list
@@ -515,6 +552,9 @@ build_and_send_command(struct serialqueue *sq, uint8_t *buf, int pending
     sq->send_seq++;
     sq->need_ack_bytes += len;
     list_add_tail(&out->node, &sq->sent_queue);
+    if (sq->timing_enabled)
+        timing_queue_add(sq, 2, len, eventtime
+                         , timing_req_clock, timing_min_clock);
     return len;
 }
 
@@ -810,6 +850,18 @@ serialqueue_send_batch(struct serialqueue *sq, struct command_queue *cq
 
     // Add list to cq->upcoming_queue
     pthread_mutex_lock(&sq->lock);
+    if (sq->timing_enabled) {
+        uint64_t req_clock = 0, min_clock = 0;
+        struct queue_message *m;
+        list_for_each_entry(m, msgs, node) {
+            if (m->req_clock > 0 && m->req_clock < BACKGROUND_PRIORITY_CLOCK
+                && (!req_clock || m->req_clock < req_clock)) {
+                req_clock = m->req_clock;
+                min_clock = m->min_clock;
+            }
+        }
+        timing_queue_add(sq, 1, len, get_monotonic(), req_clock, min_clock);
+    }
     if (list_empty(&cq->ready_queue) && list_empty(&cq->upcoming_queue))
         list_add_tail(&cq->node, &sq->pending_queues);
     list_join_tail(msgs, &cq->upcoming_queue);
@@ -937,9 +989,25 @@ serialqueue_get_clock_est(struct serialqueue *sq, struct clock_estimate *ce)
 void __visible
 serialqueue_get_stats(struct serialqueue *sq, char *buf, int len)
 {
-    struct serialqueue stats;
+    struct {
+        uint32_t bytes_write, bytes_read, bytes_retransmit, bytes_invalid;
+        uint64_t send_seq, receive_seq, retransmit_seq;
+        double srtt, rttvar, rto;
+        int ready_bytes, upcoming_bytes;
+    } stats;
     pthread_mutex_lock(&sq->lock);
-    memcpy(&stats, sq, sizeof(stats));
+    stats.bytes_write = sq->bytes_write;
+    stats.bytes_read = sq->bytes_read;
+    stats.bytes_retransmit = sq->bytes_retransmit;
+    stats.bytes_invalid = sq->bytes_invalid;
+    stats.send_seq = sq->send_seq;
+    stats.receive_seq = sq->receive_seq;
+    stats.retransmit_seq = sq->retransmit_seq;
+    stats.srtt = sq->srtt;
+    stats.rttvar = sq->rttvar;
+    stats.rto = sq->rto;
+    stats.ready_bytes = sq->ready_bytes;
+    stats.upcoming_bytes = sq->upcoming_bytes;
     pthread_mutex_unlock(&sq->lock);
 
     snprintf(buf, len, "bytes_write=%u bytes_read=%u"
@@ -990,5 +1058,70 @@ serialqueue_extract_old(struct serialqueue *sq, int sentq
         list_del(&qm->node);
         message_free(qm);
     }
+    return pos;
+}
+
+// Start a fresh capture on enable; disable preserves existing evidence.
+void __visible
+serialqueue_set_timing_enabled(struct serialqueue *sq, int enabled)
+{
+    pthread_mutex_lock(&sq->lock);
+    if (enabled)
+        sq->timing_pos = sq->timing_count = 0;
+    sq->timing_enabled = !!enabled;
+    pthread_mutex_unlock(&sq->lock);
+}
+
+// Copy the newest timing records in chronological order without consuming.
+int __visible
+serialqueue_extract_timing(struct serialqueue *sq
+                           , struct pull_queue_timing *out, int max)
+{
+    if (max <= 0)
+        return 0;
+    pthread_mutex_lock(&sq->lock);
+    int count = sq->timing_count;
+    if (count > max)
+        count = max;
+    int start = (sq->timing_pos + TIMING_QUEUE_SIZE - count) % TIMING_QUEUE_SIZE;
+    int i;
+    for (i=0; i<count; i++)
+        out[i] = sq->timing[(start + i) % TIMING_QUEUE_SIZE];
+    pthread_mutex_unlock(&sq->lock);
+    return count;
+}
+
+// Copy newest nonempty debug entries without replacing or freeing the history.
+int __visible
+serialqueue_snapshot_old(struct serialqueue *sq, int sentq
+                         , struct pull_queue_message *out, int max)
+{
+    if (max <= 0)
+        return 0;
+    pthread_mutex_lock(&sq->lock);
+    struct list_head *root = sentq ? &sq->old_sent : &sq->old_receive;
+    struct queue_message *qm;
+    int count = 0;
+    list_for_each_entry(qm, root, node) {
+        if (qm->len)
+            count++;
+    }
+    int skip = count > max ? count - max : 0;
+    int pos = 0;
+    list_for_each_entry(qm, root, node) {
+        if (!qm->len)
+            continue;
+        if (skip) {
+            skip--;
+            continue;
+        }
+        struct pull_queue_message *pqm = &out[pos++];
+        memcpy(pqm->msg, qm->msg, qm->len);
+        pqm->len = qm->len;
+        pqm->sent_time = qm->sent_time;
+        pqm->receive_time = qm->receive_time;
+        pqm->notify_id = 0;
+    }
+    pthread_mutex_unlock(&sq->lock);
     return pos;
 }

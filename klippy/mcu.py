@@ -1572,6 +1572,26 @@ class MCU:
 
         return "\n".join(out)
 
+    def set_timing_diagnostics(self, enabled):
+        self._serial.set_timing_diagnostics(enabled)
+
+    def get_timing_diagnostics(self):
+        return self._serial.get_timing_diagnostics()
+
+    def get_timing_debug_snapshot(self):
+        return self._serial.get_timing_debug_snapshot()
+
+    def format_timing_debug_snapshot(self, snapshot):
+        return self._serial.format_timing_debug_snapshot(snapshot)
+
+    def dump_timing_debug(self):
+        out = [self.dump_debug(), self._clocksync.dump_debug()]
+        if self._serial.serialqueue:
+            out.append(self._serial.dump_timing_debug())
+        else:
+            out.append("Serial timing history unavailable: MCU disconnected")
+        return "\n".join(out)
+
     def stats(self, eventtime):
         load = "mcu_awake=%.03f mcu_task_avg=%.06f mcu_task_stddev=%.06f" % (
             self._mcu_tick_awake,

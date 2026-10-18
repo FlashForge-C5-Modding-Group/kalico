@@ -12,6 +12,17 @@ If I want my printer to light itself on fire, I should be able to make my printe
 
 See the [Kalico Additions document](https://docs.kalico.gg/Kalico_Additions.html) for more information on *some* of the differences from Klipper.
 
+## Print timing diagnostics
+
+Per-print `Timer too close` reports retain MCU and scheduled-layer counts
+until the next print starts. Query them with
+[`GET_TIMER_TOO_CLOSE_STATS`](docs/G-Codes.md#get_timer_too_close_stats)
+or through [`print_stats.timer_too_close`](docs/Status_Reference.md#print_stats).
+For late-delivery investigations, enable the default-off, bounded
+[motion timing capture](docs/Debugging.md#motion-timing-diagnostics).
+These host-side diagnostics do not change MCU scheduling or safety checks
+and do not establish that a timing fault has been repaired.
+
 ## Features merged into the main branch:
 
 - [core: no Python2 tests; no PRU boards](https://github.com/KalicoCrew/kalico/pull/39)

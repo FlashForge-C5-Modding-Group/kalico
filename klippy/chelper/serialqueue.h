@@ -25,6 +25,13 @@ struct pull_queue_message {
     uint64_t notify_id;
 };
 
+struct pull_queue_timing {
+    uint32_t kind, bytes;
+    double eventtime, conv_time, est_freq;
+    uint64_t req_clock, min_clock, conv_clock, send_seq, receive_seq;
+    int ready_bytes, upcoming_bytes, need_ack_bytes;
+};
+
 struct serialqueue;
 struct serialqueue *serialqueue_alloc(int serial_fd, char serial_fd_type
                                       , int client_id, char name[16]);
@@ -52,5 +59,10 @@ void serialqueue_get_clock_est(struct serialqueue *sq
 void serialqueue_get_stats(struct serialqueue *sq, char *buf, int len);
 int serialqueue_extract_old(struct serialqueue *sq, int sentq
                             , struct pull_queue_message *q, int max);
+void serialqueue_set_timing_enabled(struct serialqueue *sq, int enabled);
+int serialqueue_extract_timing(struct serialqueue *sq
+                               , struct pull_queue_timing *out, int max);
+int serialqueue_snapshot_old(struct serialqueue *sq, int sentq
+                             , struct pull_queue_message *out, int max);
 
 #endif // serialqueue.h

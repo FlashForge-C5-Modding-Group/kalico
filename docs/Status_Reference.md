@@ -473,6 +473,53 @@ defined):
    TOTAL_LAYER=<value>` G-Code command.
 - `info.current_layer`: The current layer value of the last
   `SET_PRINT_STATS_INFO CURRENT_LAYER=<value>` G-Code command.
+- `timer_too_close`: A fresh JSON-compatible snapshot of the current or
+  retained last print's received `Timer too close` warnings. It contains
+  exactly the following fields:
+    - `filename`: The print's filename as a string, or an empty string
+      before any print.
+    - `state`: One of `standby`, `printing`, `paused`, `complete`,
+      `cancelled`, or `error`.
+    - `total`: The integer total warning count.
+    - `attribution`: The literal string `receive_time_scheduled_layer`.
+    - `by_layer`: A list of bucket objects, each containing exactly
+      `mcu` (MCU name string), `layer` (integer or null), `count`
+      (integer), `first_elapsed`, and `last_elapsed` (monotonic seconds
+      since this print started, including paused time). Integer layers
+      are sorted ascending, null last, then by MCU name within each
+      layer. Layer 0 means known startup before layer 1; null means
+      unavailable slicer metadata. The console report displays these
+      as `startup` and `unknown`, respectively.
+
+The warning report is separate from ordinary print statistics.
+Pause/resume retains its counters and time origin. Completion,
+cancellation, error, ordinary statistics reset, and file selection
+retain it; the next print start clears it. Resetting an active report
+finalizes it as cancelled. An empty or zero-warning print still has a
+report. Before any print, `filename` is empty, `state` is `standby`,
+`total` is 0, and `by_layer` is empty. Reports are held in memory and
+do not survive a host restart. Snapshot lists and bucket objects are
+copies, not mutable references to the stored counters.
+
+Attribution converts the original host receive timestamp to the main
+MCU's estimated print time and selects the last applicable scheduled
+layer boundary. An already-known layer supplies the print-start
+baseline. Without metadata the layer is null; initial `TOTAL_LAYER`
+metadata establishes layer 0 at that command's current estimated print
+time, without relabeling earlier warnings. Later layer changes follow
+the preceding queued move's scheduled end, not when the parser reads
+the layer command. Warnings can await unresolved lookahead boundaries;
+at termination they use the last resolved boundary without generating
+more motion. This is scheduled-layer/host-receipt attribution, not an
+MCU event timestamp or a physical-position measurement.
+
+Warnings outside the print's start/end interval are excluded. A delayed
+callback whose receive timestamp is within the retained completed
+interval can update its count; a callback belonging to an earlier print
+cannot contaminate the next one. Thus the count measures warning
+messages received by the host, not an independently verified MCU total.
+Use [`GET_TIMER_TOO_CLOSE_STATS`](G-Codes.md#get_timer_too_close_stats)
+for a console/log report, also available after shutdown.
 
 ## probe
 

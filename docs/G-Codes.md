@@ -1368,6 +1368,33 @@ updated. If TEMPLATE is an empty string then this command will clear
 any previous template assigned to the LED (one can then use `SET_LED`
 commands to manage the LED's color settings).
 
+### [motion_queuing]
+
+The motion_queuing module is automatically loaded; no configuration
+section is required.
+
+#### SET_MOTION_TIMING_DIAGNOSTICS
+`SET_MOTION_TIMING_DIAGNOSTICS ENABLE=<0|1>`: Enable or disable bounded
+host motion-timing capture. Capture is disabled by default. Enabling
+clears the previous capture and starts collecting Python flush/generation
+timings and serial enqueue/message-build timings for connected MCUs.
+Disabling stops collection without deleting the retained history.
+Re-enabling starts a fresh capture.
+
+This command is only allowed while no print is active, including no
+paused print; otherwise it reports `Cannot change motion timing
+diagnostics during a print`. It does not change motion scheduling or
+safety thresholds. See the
+[supervised capture procedure](Debugging.md#motion-timing-diagnostics)
+for deployment requirements and interpreting the evidence.
+
+#### DUMP_MOTION_TIMING_DIAGNOSTICS
+`DUMP_MOTION_TIMING_DIAGNOSTICS`: Write the current bounded capture,
+retained first/latest warning snapshots, and live MCU debug information
+to the host log. This command is also available after shutdown and does
+not clear the capture. The log includes a `MOTION_TIMING_DIAGNOSTICS`
+JSON record; save the complete log, not just the console response.
+
 ### [output_pin]
 
 The following command is available when an
@@ -1552,6 +1579,38 @@ Add `SET_PRINT_STATS_INFO [TOTAL_LAYER=<total_layer_count>]` to your
 slicer start gcode section and `SET_PRINT_STATS_INFO [CURRENT_LAYER=
 <current_layer>]` at the layer change gcode section to pass layer
 information from your slicer to Kalico.
+
+#### GET_TIMER_TOO_CLOSE_STATS
+`GET_TIMER_TOO_CLOSE_STATS`: Report the current or last print's received
+`Timer too close` warning count and per-MCU/per-layer breakdown to the
+console and host log. The command is available after shutdown, accepts
+no reset parameter, and never clears the report. Before the first print
+it reports `Timer too close: no print recorded`.
+
+A recorded print, including a zero-warning print, begins with
+`Timer too close: <total> warning(s) - <filename> [<state>]`, followed
+by rows in the form `MCU=<name> layer=<startup|unknown|number> count=<n>
+first=<seconds>s last=<seconds>s`. `startup` is known layer 0 before
+layer 1; `unknown` means slicer layer metadata is unavailable. First and
+last times are monotonic seconds since print start, including paused
+time. Buckets are sorted by integer layer ascending, unknown last,
+then by MCU name within each layer.
+
+Layer attribution uses the warning's host receive time and scheduled
+motion layer boundaries, not parser read-ahead or measured physical
+position. Initial `TOTAL_LAYER` metadata establishes startup from that
+point onward; earlier unknown warnings are not retroactively relabeled.
+Pause/resume continues the same report. Completion, cancellation, error,
+file selection, and ordinary print-statistics reset retain the report
+until the next print starts or the host restarts.
+
+A summary is emitted automatically at completion/cancellation/error.
+A delayed warning received within the finished print's time interval
+can correct the retained report and emit an `updated` summary. See
+[`print_stats.timer_too_close`](Status_Reference.md#print_stats)
+for the structured status fields and
+[motion timing diagnostics](Debugging.md#motion-timing-diagnostics)
+for opt-in fault capture. Counting warnings does not repair their cause.
 
 ### [probe]
 
