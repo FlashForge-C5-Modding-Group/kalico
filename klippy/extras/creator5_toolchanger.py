@@ -2387,16 +2387,15 @@ class Creator5Toolchanger:
         self._with_motion(gcmd, measure)
 
     def cmd_cool_for_dock(self, gcmd):
-        hotend = gcmd.get_float('HOTEND')
-        if not math.isfinite(hotend) or hotend < 150.:
-            raise gcmd.error('HOTEND must be a finite operating temperature '
-                             'of at least 150 C; heat the tool before purging')
+        hotend = gcmd.get_float('HOTEND', above=0.)
+        if not math.isfinite(hotend):
+            raise gcmd.error('HOTEND must be finite')
         _, _, attached = self._preflight(gcmd)
         if attached is None:
             raise gcmd.error('No attached tool to cool before docking')
         self.cmd_verify_nozzle_z(gcmd)
         extruder = 'extruder' if attached == 0 else 'extruder%d' % attached
-        target = hotend - 100.
+        target = max(0., hotend - 100.)
         reactor = self.printer.get_reactor()
         heater = self.printer.lookup_object(extruder)
         # Leave the bucket through the inboard waypoint before moving to the
