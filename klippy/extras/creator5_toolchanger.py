@@ -153,6 +153,9 @@ class Creator5Toolchanger:
             'clearance_z_speed', 20., above=0.)
         self.lower_bed_speed = config.getfloat(
             'lower_bed_speed', 10., above=0.)
+        # Where C5_LOWER_BED stops: 5 mm above the bottom of Z travel (256).
+        self.lower_bed_z = config.getfloat('lower_bed_z', 254., above=0.,
+                                           maxval=256.)
         self.dock_approach_speed = config.getfloat(
             'dock_approach_speed', 20., above=0.)
         self.dock_predock_offset = config.getfloat(
@@ -389,7 +392,7 @@ class Creator5Toolchanger:
         gcmd.respond_info('Creator 5 bed soak complete')
 
     def cmd_lower_bed(self, gcmd):
-        """Move to the physical Z maximum, without G-code or nozzle offsets."""
+        """Lower the bed to lower_bed_z, without G-code or nozzle offsets."""
         toolhead = self.printer.lookup_object('toolhead')
         status = toolhead.get_status(self.printer.get_reactor().monotonic())
         if 'z' not in status.get('homed_axes', ''):
@@ -400,8 +403,9 @@ class Creator5Toolchanger:
             raise gcmd.error('Cannot determine the physical Z travel limit')
         if current_z > z_max + .001:
             raise gcmd.error('Current Z position exceeds the travel limit')
-        if current_z < z_max - .001:
-            self._move(z=z_max, feed=self.lower_bed_speed * 60.)
+        # Never raises the bed: a bed already lower than that stays put.
+        if current_z < self.lower_bed_z - .001:
+            self._move(z=self.lower_bed_z, feed=self.lower_bed_speed * 60.)
 
     def _home_off_docked_head(self, gcmd):
         # Every G28 first releases the carrier latch. A carrier resting
