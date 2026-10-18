@@ -311,7 +311,7 @@ class GCodeDispatch:
                 cmd = "".join(parts[3:5]).strip()
             else:
                 cmd = "".join(parts[:3]).strip()
-            if re.match(r"^[A-Z][0-9]+_[A-Z0-9_]+(?:\s|$)", line.upper()):
+            if re.match(r"^_*[A-Z][0-9]+_[A-Z0-9_]+(?:\s|$)", line.upper()):
                 cmd = line.split(None, 1)[0].upper()
             # Build gcode "params" dictionary
             params = {

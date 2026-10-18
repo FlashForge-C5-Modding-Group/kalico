@@ -276,6 +276,11 @@ class Creator5Toolchanger:
         self.chamber_wait_switch = Creator5MiscSwitch(
             self.printer, self.gcode, 'chamber_wait',
             config.getboolean('chamber_wait_default', True))
+        # Notify when a door is open during a print (see _OC_DOOR in
+        # printer.misc.cfg).
+        self.door_notify_switch = Creator5MiscSwitch(
+            self.printer, self.gcode, 'door_notify',
+            config.getboolean('door_notify_default', False))
         for name, handler in (
             ('C5_TOOL_STATUS', self.cmd_status),
             ('C5_TOOL_SELECT', self.cmd_select),
@@ -398,10 +403,44 @@ class Creator5Toolchanger:
         if current_z < z_max - .001:
             self._move(z=z_max, feed=self.lower_bed_speed * 60.)
 
+    def _home_off_docked_head(self, gcmd):
+        # Every G28 first releases the carrier latch. A carrier resting
+        # unlatched on a docked head reads docked and grabbed at once, which
+        # blocks all motion, so it is homed in X (away from the docks, the
+        # same way it leaves a dock) before the sensors are checked. Not
+        # with a head reading attached: releasing would drop it, and the
+        # normal path docks it instead.
+        dock = [self._button(name, gcmd) for name in self.dock_buttons]
+        grab = [self._button(name, gcmd) for name in self.grab_buttons]
+        if any(grab[i] and not dock[i] for i in range(4)):
+            return
+        self._run('M400')
+        self._run('MOTOR_RELEASE')
+        self._pause_ms(self.release_latch_wait_ms)
+        resting = [i for i in range(4) if dock[i] and grab[i]]
+        if not resting:
+            return
+        gcmd.respond_info('Carrier is resting on docked T%s; homing X to move '
+                          'it off' % ',T'.join(str(i) for i in resting))
+        old_passthrough = self._g28_passthrough
+        self._g28_passthrough = True
+        try:
+            self._run('G28 X')
+        finally:
+            self._g28_passthrough = old_passthrough
+        dock = [self._button(name, gcmd) for name in self.dock_buttons]
+        grab = [self._button(name, gcmd) for name in self.grab_buttons]
+        still = [i for i in range(4) if dock[i] and grab[i]]
+        if still:
+            raise gcmd.error('T%s still reads docked and grabbed after the '
+                             'carrier moved off; check its sensors'
+                             % ',T'.join(str(i) for i in still))
+
     def cmd_G28(self, gcmd):
         if self._g28_passthrough:
             self.prev_G28(gcmd)
             return
+        self._home_off_docked_head(gcmd)
         requested = [gcmd.get(axis, None) is not None for axis in 'XYZ']
         if not any(requested) or all(requested):
             self.cmd_home_for_print(gcmd)
