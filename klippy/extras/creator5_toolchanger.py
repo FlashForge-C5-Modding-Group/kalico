@@ -296,6 +296,8 @@ class Creator5Toolchanger:
             ('C5_CHECK_BUILD_PLATE', self.cmd_check_build_plate),
             ('C5_OFFSET_WIZARD', self.cmd_offset_wizard),
             ('C5_BED_SOAK', self.cmd_bed_soak),
+            ('C5_BOOT_INIT_WAIT', self.cmd_boot_init_wait),
+            ('C5_BOOT_WAIT', self.cmd_boot_wait),
             ('C5_LOWER_BED', self.cmd_lower_bed),
             ('C5_FLOW_STROKES', self.cmd_flow_strokes),
             ('C5_EXTRUDER_ROTATION_CALIBRATE',
@@ -364,6 +366,17 @@ class Creator5Toolchanger:
     def cmd_flow_off(self, gcmd):
         self.flow_switch.set_enabled(False)
         gcmd.respond_info('Creator 5 flow calibration disabled')
+
+    def cmd_boot_init_wait(self, gcmd):
+        """Preserve AFC's fixed two-second startup window for early prints."""
+        self._pause_ms(2000.)
+
+    def cmd_boot_wait(self, gcmd):
+        """Wait five seconds after AFC PREP, without an MCU dwell."""
+        afc = self.printer.lookup_object('AFC', None)
+        if afc is None or not afc.prep_done:
+            raise gcmd.error('AFC PREP did not finish; refusing print start')
+        self._pause_ms(5000.)
 
     def cmd_bed_soak(self, gcmd):
         """Wait after bed heat-up without queuing a long MCU dwell."""
