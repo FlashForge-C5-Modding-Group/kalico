@@ -960,6 +960,17 @@ class Creator5Toolchanger:
         self.active = attached
         return dock
 
+    def _afc_extruder(self, physical_name, afc=None):
+        if afc is None:
+            afc = self.printer.lookup_object('AFC', None)
+        return afc.tools.get(physical_name) if afc is not None else None
+
+    def _afc_lane(self, afc, physical_name):
+        # AFC registers tools by physical extruder, but standalone lanes by
+        # the AFC_extruder section alias (for example extruder0 for extruder).
+        extruder = self._afc_extruder(physical_name, afc)
+        return afc.lanes.get(extruder.name) if extruder is not None else None
+
     def _dock(self, gcmd, tool, raise_z=True):
         x, y = self.docks[tool]
         clear_feed = self.clear_travel_speed * 60.
@@ -991,8 +1002,7 @@ class Creator5Toolchanger:
         # bookkeeping/LED state (no physical motion), safe to call after
         # the dock move above has already completed.
         extruder_name = 'extruder' if tool == 0 else 'extruder%d' % tool
-        extruder_obj = self.printer.lookup_object(
-            'AFC_extruder ' + extruder_name, None)
+        extruder_obj = self._afc_extruder(extruder_name)
         if extruder_obj is not None and extruder_obj.lane_loaded:
             lane = extruder_obj.lanes.get(extruder_obj.lane_loaded)
             if lane is not None:
@@ -1210,7 +1220,7 @@ class Creator5Toolchanger:
                 or afc.error_state):
             return
         name = 'extruder' if tool == 0 else 'extruder%d' % tool
-        lane = afc.lanes.get(name)
+        lane = self._afc_lane(afc, name)
         if lane is None or afc.current is None:
             afc.error.AFC_error('T%d wheel failure: AFC active lane is unknown'
                                 % tool)
@@ -1252,8 +1262,8 @@ class Creator5Toolchanger:
             raise gcmd.error('The print is not paused')
         source = 'extruder' if tool == 0 else 'extruder%d' % tool
         target = 'extruder' if to == 0 else 'extruder%d' % to
-        lane = afc.lanes.get(source)
-        replacement = afc.lanes.get(target)
+        lane = self._afc_lane(afc, source)
+        replacement = self._afc_lane(afc, target)
         if lane is None or replacement is None:
             raise gcmd.error('No AFC lane for T%d or T%d' % (tool, to))
         # Keeps the position AFC saved when the runout paused the print.
@@ -1578,8 +1588,9 @@ class Creator5Toolchanger:
         # head. A recovered head with no AFC selection can dock directly.
         afc = self.printer.lookup_object('AFC', None)
         name = 'extruder' if attached == 0 else 'extruder%d' % attached
-        self._run('AFC_UNSELECT_TOOL' if afc is not None and
-                  afc.current == name else 'C5_TOOL_DOCK')
+        lane = self._afc_lane(afc, name) if afc is not None else None
+        self._run('AFC_UNSELECT_TOOL' if lane is not None and
+                  afc.current == lane.name else 'C5_TOOL_DOCK')
         _, _, still_attached = self._preflight(gcmd)
         if still_attached is not None:
             raise gcmd.error('Dock T%d before loadcell reference' % attached)
@@ -2169,8 +2180,11 @@ class Creator5Toolchanger:
             self.printer.get_reactor().monotonic())['target']
         self._run('C5_AUTO_NOZZLE_Z T=%d HOTEND=%.1f BED=%.1f '
                   'FIRST_LAYER_HEIGHT=0.2' % (tool, temp, bed))
-        start = self.printer.lookup_object(
-            'filament_switch_sensor %s_tool_start' % extruder, None)
+        afc_extruder = self._afc_extruder(extruder)
+        start = getattr(afc_extruder, 'fila_tool_start', None)
+        if start is None:
+            start = self.printer.lookup_object(
+                'filament_switch_sensor %s_tool_start' % extruder, None)
         if start is not None and not start.get_status(None).get(
                 'filament_detected', True):
             raise gcmd.error('No filament loaded in T%d' % tool)
