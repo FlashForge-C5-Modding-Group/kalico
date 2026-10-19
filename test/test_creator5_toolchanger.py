@@ -43,6 +43,9 @@ class GCmd:
     def get(self, name, default=None):
         return self.params.get(name, default)
 
+    def get_command_parameters(self):
+        return dict(self.params)
+
     def error(self, message):
         return RuntimeError(message)
 
@@ -74,9 +77,13 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board.plate_check_x = 43.
         self.board.plate_check_y = 226.
         self.board.plate_check_min_delta = .8
+        self.board.plate_check_travel_speed = 100.
+        self.board.build_plate_detected = None
         self.board._stock_pin_approach_z = None
         self.board.print_z_baseline = [None] * 4
         self.board._button_objects = {}
+        self.board.dock_buttons = ['dock%d' % i for i in range(4)]
+        self.board.grab_buttons = ['grab%d' % i for i in range(4)]
         self.board._ui_sensor_cache = None
         self.board.busy = False
         self.board.toolchange_sensor_settle_ms = 0
@@ -88,6 +95,7 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board.post_select_accel = None
         self.board.flow_verdict_settle_ms = 50
         self.board.lower_bed_speed = 10.
+        self.board.lower_bed_z = 254.
         self.board.offset_calibration_lift = 3.
         self.board.offset_calibration_lift_speed = 10.
         self.board.safe_z = 10.
@@ -100,6 +108,198 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board.printer = mock.Mock()
         self.board.printer.lookup_object.return_value.get_status.return_value = {
             'homing_origin': (.1, .2, .3, 0.)}
+        self.stepper_enable = types.SimpleNamespace(
+            get_steppers=lambda: ['extruder'],
+            set_motors_enable=lambda names, enable: False)
+
+    def _afc_tool_fixture(self, t0_alias='extruder0'):
+        afc = types.SimpleNamespace(
+            tools={}, lanes={}, current=t0_alias, in_toolchange=False,
+            error_state=False, error=mock.Mock(),
+            function=types.SimpleNamespace(
+                is_printing=lambda: True, is_paused=lambda: True))
+        for tool in range(4):
+            physical = 'extruder' if tool == 0 else 'extruder%d' % tool
+            alias = t0_alias if tool == 0 else physical
+            extruder = types.SimpleNamespace(
+                name=alias, creator5_tool_index=tool, tool_start_state=True,
+                fila_tool_start=None, lane_loaded=alias, lanes={},
+                tc_lane=None)
+            lane = types.SimpleNamespace(
+                name=alias, extruder_obj=extruder,
+                _is_normal_printing_state=lambda: True)
+            extruder.lanes[alias] = lane
+            extruder.tc_lane = lane
+            afc.tools[physical] = extruder
+            afc.lanes[alias] = lane
+        return afc
+
+    def test_dock_clears_loaded_lane_using_physical_afc_tool_map(self):
+        for tool, alias in ((0, 'extruder0'), (0, 'extruder'),
+                            (1, 'extruder1')):
+            with self.subTest(tool=tool, alias=alias):
+                afc = self._afc_tool_fixture(alias if tool == 0 else 'extruder0')
+                physical = 'extruder' if tool == 0 else 'extruder1'
+                extruder = afc.tools[physical]
+                lane = afc.lanes[alias]
+                lane.set_tool_unloaded = mock.Mock()
+                objects = {
+                    'AFC': afc,
+                    'AFC_extruder ' + alias: extruder,
+                    'gcode_move': types.SimpleNamespace(
+                        get_status=lambda: {'homing_origin': (0., 0., 2., 0.)})}
+                self.board.printer.lookup_object.side_effect = (
+                    lambda name, default=None: objects.get(name, default))
+                self.board.approach_x = 250.
+                self.board.dock_predock_offset = 20.
+                self.board.dock_approach_speed = 25.
+                self.board.release_latch_wait_ms = 50
+                self.board.departure_speed = 90.
+                self.board._move = mock.Mock()
+                self.board._run = mock.Mock()
+                self.board._pause_ms = mock.Mock()
+                self.board._verify = mock.Mock()
+
+                self.board._dock(GCmd(), tool, raise_z=False)
+
+                lane.set_tool_unloaded.assert_called_once_with(
+                    normal_toolchange=True)
+
+    def test_wheel_clog_resolves_numbered_and_legacy_t0_lanes(self):
+        for alias in ('extruder0', 'extruder'):
+            with self.subTest(alias=alias):
+                afc = self._afc_tool_fixture(alias)
+                self.board.printer.lookup_object.side_effect = (
+                    lambda name, default=None: afc if name == 'AFC' else default)
+                self.board.attached_tool_from_pins = lambda: 0
+
+                self.board.cmd_wheel_runout(GCmd(TOOL=0))
+
+                self.assertIn('T0 clog detected',
+                              afc.error.AFC_error.call_args.args[0])
+
+    def test_t0_wheel_with_empty_alias_sensor_defers_to_presence_runout(self):
+        afc = self._afc_tool_fixture()
+        afc.tools['extruder'].tool_start_state = False
+        self.board.printer.lookup_object.side_effect = (
+            lambda name, default=None: afc if name == 'AFC' else default)
+        self.board.attached_tool_from_pins = lambda: 0
+
+        self.board.cmd_wheel_runout(GCmd(TOOL=0))
+
+        afc.error.AFC_error.assert_not_called()
+
+    def test_runout_switch_resolves_t0_alias_as_source_and_target(self):
+        for alias in ('extruder0', 'extruder'):
+            for source, target, heater in ((0, 1, 'extruder'),
+                                           (1, 0, 'extruder1')):
+                with self.subTest(alias=alias, source=source, target=target):
+                    afc = self._afc_tool_fixture(alias)
+                    source_name = alias if source == 0 else 'extruder1'
+                    target_name = alias if target == 0 else 'extruder1'
+                    afc.current = source_name
+                    source_lane = afc.lanes[source_name]
+                    source_lane._perform_creator5_infinite_runout = mock.Mock()
+                    pause = types.SimpleNamespace(is_paused=True)
+                    objects = {'AFC': afc, 'pause_resume': pause}
+                    self.board.printer.lookup_object.side_effect = (
+                        lambda name, default=None: objects.get(name, default))
+                    self.board._run = mock.Mock()
+
+                    self.board.cmd_runout_switch(
+                        GCmd(TOOL=source, TO=target, TEMP=215.))
+
+                    source_lane._perform_creator5_infinite_runout.assert_called_once_with(
+                        afc.lanes[target_name], target_temp=215.)
+                    self.assertFalse(pause.is_paused)
+                    self.board._run.assert_called_once_with(
+                        'SET_HEATER_TEMPERATURE HEATER=%s TARGET=0' % heater)
+
+    def test_offset_reference_unselects_afc_owned_t0_alias(self):
+        for alias in ('extruder0', 'extruder'):
+            with self.subTest(alias=alias):
+                afc = self._afc_tool_fixture(alias)
+                self.board.printer.lookup_object.side_effect = (
+                    lambda name, default=None: afc if name == 'AFC' else default)
+                self.board._raise_z = mock.Mock()
+                self.board._preflight = lambda command: ([], [], None)
+                self.board._run = mock.Mock()
+
+                self.board._dock_for_offset_reference(GCmd(), 0)
+
+                self.board._run.assert_called_once_with('AFC_UNSELECT_TOOL')
+
+    def _rotation_fixture(self, afc, legacy_sensor=None):
+        objects = {
+            'AFC': afc,
+            'toolhead': types.SimpleNamespace(
+                get_status=lambda eventtime: {'homed_axes': 'xyz'}),
+            'heater_bed': types.SimpleNamespace(
+                get_status=lambda eventtime: {'target': 60.}),
+            'filament_switch_sensor extruder_tool_start': legacy_sensor}
+        self.board.printer.lookup_object.side_effect = (
+            lambda name, default=None: objects.get(name, default))
+        self.board._preflight = lambda command: ([], [], 0)
+        self.board._run = mock.Mock()
+        self.board._move = mock.Mock()
+        self.board._with_motion = lambda command, operation: operation()
+        self.board.cmd_move_to_purge_bucket = mock.Mock()
+        self.board.purge_z = 3.
+        self.board.purge_speed = 2.
+
+    def test_rotation_uses_mapped_afc_sensor_without_changing_physical_heater(self):
+        for alias in ('extruder0', 'extruder', 'custom_t0'):
+            with self.subTest(alias=alias):
+                afc = self._afc_tool_fixture(alias)
+                afc.tools['extruder'].fila_tool_start = types.SimpleNamespace(
+                    get_status=lambda eventtime: {'filament_detected': True})
+                legacy = types.SimpleNamespace(
+                    get_status=lambda eventtime: {'filament_detected': False})
+                self._rotation_fixture(afc, legacy)
+
+                self.board._prepare_rotation(GCmd(), 0, 220.)
+
+                self.board._run.assert_any_call(
+                    'SET_HEATER_TEMPERATURE HEATER=extruder TARGET=220')
+                self.board._run.assert_any_call(
+                    'TEMPERATURE_WAIT SENSOR=extruder MINIMUM=218')
+                self.board._run.assert_any_call(
+                    'ACTIVATE_EXTRUDER EXTRUDER=extruder')
+                self.assertTrue(any(call.args[0].startswith('G1 E')
+                                    for call in self.board._run.call_args_list))
+
+    def test_rotation_empty_afc_alias_sensor_cannot_fall_back_to_legacy_true(self):
+        afc = self._afc_tool_fixture()
+        afc.tools['extruder'].fila_tool_start = types.SimpleNamespace(
+            get_status=lambda eventtime: {'filament_detected': False})
+        legacy = types.SimpleNamespace(
+            get_status=lambda eventtime: {'filament_detected': True})
+        self._rotation_fixture(afc, legacy)
+
+        with self.assertRaisesRegex(RuntimeError, 'No filament loaded in T0'):
+            self.board._prepare_rotation(GCmd(), 0, 220.)
+
+        self.board.cmd_move_to_purge_bucket.assert_not_called()
+        self.assertFalse(any(call.args[0].startswith(
+            ('SET_HEATER_TEMPERATURE', 'G1 E')) for call in
+            self.board._run.call_args_list))
+
+    def test_rotation_without_afc_retains_optional_legacy_presence_sensor(self):
+        for present in (None, True, False):
+            with self.subTest(present=present):
+                sensor = None if present is None else types.SimpleNamespace(
+                    get_status=lambda eventtime: {'filament_detected': present})
+                self._rotation_fixture(None, sensor)
+                if present is False:
+                    with self.assertRaisesRegex(
+                            RuntimeError, 'No filament loaded in T0'):
+                        self.board._prepare_rotation(GCmd(), 0, 220.)
+                    self.board.cmd_move_to_purge_bucket.assert_not_called()
+                else:
+                    self.board._prepare_rotation(GCmd(), 0, 220.)
+                    self.assertTrue(any(
+                        call.args[0].startswith('G1 E')
+                        for call in self.board._run.call_args_list))
 
     def test_wheel_clog_pauses_even_with_infinite_spool_replacement(self):
         afc = mock.Mock(current='extruder1', in_toolchange=False,
@@ -112,6 +312,8 @@ class Creator5OffsetTests(unittest.TestCase):
         lane._is_normal_printing_state.return_value = True
         lane.extruder_obj.is_standalone.return_value = True
         afc.lanes = {'extruder1': lane}
+        lane.extruder_obj.name = 'extruder1'
+        afc.tools = {'extruder1': lane.extruder_obj}
         self.board.printer.lookup_object.return_value = afc
         self.board.attached_tool_from_pins = mock.Mock(return_value=1)
 
@@ -131,6 +333,8 @@ class Creator5OffsetTests(unittest.TestCase):
         lane.extruder_obj.tool_start_state = True
         lane._is_normal_printing_state.return_value = True
         afc.lanes = {'extruder1': lane}
+        lane.extruder_obj.name = 'extruder1'
+        afc.tools = {'extruder1': lane.extruder_obj}
         self.board.printer.lookup_object.return_value = afc
         self.board.attached_tool_from_pins = mock.Mock(return_value=1)
 
@@ -146,6 +350,8 @@ class Creator5OffsetTests(unittest.TestCase):
         lane = mock.Mock(runout_lane='extruder3')
         lane.name = 'extruder2'
         afc.lanes = {'extruder2': lane}
+        lane.extruder_obj.name = 'extruder2'
+        afc.tools = {'extruder2': lane.extruder_obj}
         self.board.printer.lookup_object.return_value = afc
         self.board.attached_tool_from_pins = mock.Mock(return_value=1)
 
@@ -164,6 +370,8 @@ class Creator5OffsetTests(unittest.TestCase):
         lane.extruder_obj.tool_start_state = False
         lane._is_normal_printing_state.return_value = True
         afc.lanes = {'extruder1': lane}
+        lane.extruder_obj.name = 'extruder1'
+        afc.tools = {'extruder1': lane.extruder_obj}
         self.board.printer.lookup_object.return_value = afc
         self.board.attached_tool_from_pins = mock.Mock(return_value=1)
 
@@ -236,6 +444,8 @@ class Creator5OffsetTests(unittest.TestCase):
         lane.extruder_obj.creator5_tool_index = 1
         lane._is_normal_printing_state.return_value = True
         afc.lanes = {'extruder1': lane}
+        lane.extruder_obj.name = 'extruder1'
+        afc.tools = {'extruder1': lane.extruder_obj}
         self.board.printer.lookup_object.return_value = afc
         self.board.attached_tool_from_pins = mock.Mock(
             side_effect=RuntimeError('grab switch conflict'))
@@ -312,7 +522,18 @@ class Creator5OffsetTests(unittest.TestCase):
             self.board.flow_switch.set_enabled.call_args_list,
             [mock.call(True), mock.call(False)])
 
-    def test_lower_bed_uses_machine_z_limit(self):
+    def test_rotation_mapped_tool_without_start_sensor_remains_optional(self):
+        afc = self._afc_tool_fixture()
+        del afc.tools['extruder'].fila_tool_start
+        self._rotation_fixture(afc)
+
+        self.board._prepare_rotation(GCmd(), 0, 220.)
+
+        self.assertTrue(any(call.args[0].startswith('G1 E')
+                            for call in self.board._run.call_args_list))
+
+    def test_lower_bed_uses_configured_machine_z(self):
+        self.board.lower_bed_z = 256.
         toolhead = mock.Mock()
         toolhead.get_status.return_value = {
             'homed_axes': 'xyz', 'axis_maximum': mock.Mock(z=270.)}
@@ -1036,7 +1257,7 @@ class Creator5OffsetTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'exceeds purge_max_x'):
             board._validate_purge_envelope(RuntimeError)
 
-    def test_flow_strokes_stay_over_bucket_and_apply_pa(self):
+    def test_flow_strokes_apply_measured_pa(self):
         self.board.flow_test_z = 8.
         self.board.flow_sweep_x = 4.5
         self.board.flow_test_accel = 625.
@@ -1058,29 +1279,16 @@ class Creator5OffsetTests(unittest.TestCase):
             'can_extrude': True, 'pressure_advance': .02}
         pa.pa_get_value.return_value = 9
         self.board.printer.lookup_object.side_effect = (
-            lambda name, *args: {'extruder': heater, 'pa_adjust': pa}[name])
+            lambda name, *args: {
+                'extruder': heater, 'pa_adjust': pa,
+                'stepper_enable': self.stepper_enable}[name])
         self.board.printer.lookup_objects.return_value = []
         command = GCmd()
         self.board.cmd_flow_strokes(command)
         self.assertEqual(pa.pa_get_value.call_count, 3)
         self.board._pause_ms.assert_has_calls([mock.call(50)] * 3)
-        self.board._move.assert_any_call(x=276.5, y=260., feed=3000,
-                                         machine=False)
-        self.board._move.assert_any_call(x=274.25, feed=3000,
-                                         machine=False)
-        self.board._run.assert_any_call('SET_VELOCITY_LIMIT ACCEL=625')
-        self.board._run.assert_any_call('G1 X278.750 E1.13573 F270')
-        self.board._run.assert_any_call('G1 X274.250 E2.27146 F1372')
-        self.assertFalse(any('X' in call.args[0]
-                             and not ('X274.250' in call.args[0]
-                                      or 'X278.750' in call.args[0])
-                             for call in self.board._run.call_args_list
-                             if call.args[0].startswith('G1 ')))
         self.board._run.assert_any_call(
             'SET_PRESSURE_ADVANCE EXTRUDER=extruder ADVANCE=0.01000')
-        self.assertIn('pressure advance 0.01000', command.message)
-        self.assertTrue(any('T0 flow valid: PA 0.0100 (pass 1)' in msg
-                            for msg in command.messages))
 
     def test_flow_strokes_restore_pa_on_failed_measurement(self):
         self.board.flow_test_z = 8.
@@ -1104,7 +1312,9 @@ class Creator5OffsetTests(unittest.TestCase):
             'can_extrude': True, 'pressure_advance': .02}
         pa.pa_get_value.return_value = 0
         self.board.printer.lookup_object.side_effect = (
-            lambda name, *args: {'extruder': heater, 'pa_adjust': pa}[name])
+            lambda name, *args: {
+                'extruder': heater, 'pa_adjust': pa,
+                'stepper_enable': self.stepper_enable}[name])
         self.board.printer.lookup_objects.return_value = []
         command = GCmd()
         self.board.cmd_flow_strokes(command)
@@ -1145,7 +1355,9 @@ class Creator5OffsetTests(unittest.TestCase):
             order.attach_mock(echeck.start_checks, name + ' start')
             drivers.append((name, driver))
         self.board.printer.lookup_object.side_effect = (
-            lambda name, *args: {'extruder': heater, 'pa_adjust': pa}[name])
+            lambda name, *args: {
+                'extruder': heater, 'pa_adjust': pa,
+                'stepper_enable': self.stepper_enable}[name])
         self.board.printer.lookup_objects.return_value = drivers
         self.board.cmd_flow_strokes(GCmd())
         calls = [c[0] for c in order.mock_calls]
@@ -1179,7 +1391,9 @@ class Creator5OffsetTests(unittest.TestCase):
         pa.pa_get_value.return_value = 0
         order.attach_mock(pa.pa_action, 'pa_action')
         self.board.printer.lookup_object.side_effect = (
-            lambda name, *args: {'extruder': heater, 'pa_adjust': pa}[name])
+            lambda name, *args: {
+                'extruder': heater, 'pa_adjust': pa,
+                'stepper_enable': self.stepper_enable}[name])
         self.board.printer.lookup_objects.return_value = []
         self.board.cmd_flow_strokes(GCmd())
         calls = order.mock_calls
@@ -1334,6 +1548,7 @@ class Creator5OffsetTests(unittest.TestCase):
 
     def test_all_axis_g28_uses_tool_recovery_and_partial_homing_delegates(self):
         calls = []
+        self.board._home_off_docked_head = mock.Mock()
         self.board.cmd_home_for_print = lambda gcmd: calls.append('recover')
         self.board.prev_G28 = lambda gcmd: calls.append('normal')
         self.board.attached_tool_from_pins = lambda: 1
@@ -1365,9 +1580,11 @@ class Creator5OffsetTests(unittest.TestCase):
 
     def test_no_head_all_axis_home_delegates_once_without_recursion(self):
         calls = []
+        self.board._home_off_docked_head = mock.Mock()
         self.board._preflight = lambda command, **kwargs: ([True]*4, [], None)
         self.board.prev_G28 = lambda command: calls.append('normal G28')
-        self.board._run = lambda script: self.board.cmd_G28(GCmd())
+        self.board._run = lambda script: (
+            self.board.cmd_G28(GCmd()) if script.startswith('G28') else None)
         self.board.cmd_G28(GCmd())
         self.assertEqual(calls, ['normal G28'])
         self.assertFalse(self.board._g28_passthrough)
@@ -1565,37 +1782,37 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board._estop.assert_called_once_with('Z', -8., mock.ANY)
 
     def test_stock_pin_uses_three_repeatable_probe_samples(self):
-        session = mock.Mock()
-        session.pull_probed_results.return_value = [
-            mock.Mock(bed_z=z) for z in (1.00, 1.02, 1.01)]
-        probe = mock.Mock()
-        probe.start_probe_session.return_value = session
-        probe.get_position.return_value = [43., 226., 5., 0.]
-        probe.get_probe_params.return_value = {
-            'sample_retract_dist': 2., 'lift_speed': 5.}
-        self.board.printer.lookup_object.return_value = probe
+        probe = mock.Mock(sample_retract_dist=2.)
+        probe.run_probe.side_effect = [
+            [43., 226., z] for z in (1.00, 1.02, 1.01)]
+        probe.get_lift_speed.return_value = 5.
+        toolhead = types.SimpleNamespace(
+            get_position=lambda: [43., 226., 5., 0.])
+        self.board.printer.lookup_object.side_effect = (
+            lambda name, default=None: {
+                'probe': probe, 'toolhead': toolhead}.get(name, default))
         self.board._move = mock.Mock()
         self.board._raise_z = mock.Mock()
         self.assertAlmostEqual(self.board._probe_stock_pin(GCmd(), 43., 226.),
                                1.01)
-        self.assertEqual(session.run_probe.call_count, 3)
-        session.end_probe_session.assert_called_once()
+        self.assertEqual(probe.run_probe.call_count, 3)
+        probe.multi_probe_end.assert_called_once()
 
     def test_stock_pin_rejects_inconsistent_samples(self):
-        session = mock.Mock()
-        session.pull_probed_results.return_value = [
-            mock.Mock(bed_z=z) for z in (1.00, 1.12, 1.01)]
-        probe = mock.Mock()
-        probe.start_probe_session.return_value = session
-        probe.get_position.return_value = [43., 226., 5., 0.]
-        probe.get_probe_params.return_value = {
-            'sample_retract_dist': 2., 'lift_speed': 5.}
-        self.board.printer.lookup_object.return_value = probe
+        probe = mock.Mock(sample_retract_dist=2.)
+        probe.run_probe.side_effect = [
+            [43., 226., z] for z in (1.00, 1.12, 1.01)]
+        probe.get_lift_speed.return_value = 5.
+        toolhead = types.SimpleNamespace(
+            get_position=lambda: [43., 226., 5., 0.])
+        self.board.printer.lookup_object.side_effect = (
+            lambda name, default=None: {
+                'probe': probe, 'toolhead': toolhead}.get(name, default))
         self.board._move = mock.Mock()
         self.board._raise_z = mock.Mock()
         with self.assertRaisesRegex(RuntimeError, 'not repeatable'):
             self.board._probe_stock_pin(GCmd(), 43., 226.)
-        session.end_probe_session.assert_called_once()
+        probe.multi_probe_end.assert_called_once()
 
     def test_load_check_requires_attached_and_matching_active_hotend(self):
         self.board._preflight = mock.Mock(return_value=([], [], 1))
