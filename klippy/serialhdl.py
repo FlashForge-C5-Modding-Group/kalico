@@ -449,17 +449,24 @@ class SerialReader:
                 records.append(item)
         return formatted
 
-    def dump_timing_debug(self):
-        snapshot = self.format_timing_debug_snapshot(
-            self.get_timing_debug_snapshot()
-        )
+    def dump_timing_debug(self, snapshot=None):
+        # A supplied snapshot is historical evidence: never combine it with
+        # newer live queue statistics.
+        live = snapshot is None
+        if live:
+            snapshot = self.get_timing_debug_snapshot()
+        snapshot = self.format_timing_debug_snapshot(snapshot)
         if not snapshot["connected"]:
             return "Serial timing history unavailable: MCU disconnected"
-        out = [
-            "Dumping serial stats: %s" % self.stats(self.reactor.monotonic()),
+        out = []
+        if live:
+            out.append(
+                "Dumping serial stats: %s" % self.stats(self.reactor.monotonic())
+            )
+        out.extend([
             "Sent fields: index, estimated wire completion (not measured MCU"
             " arrival), message-build host time, bytes",
-        ]
+        ])
         for name, label in (("sent", "Sent"), ("received", "Receive:")):
             out.append("Dumping %s queue %d messages"
                        % (name, len(snapshot[name])))

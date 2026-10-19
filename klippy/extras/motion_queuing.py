@@ -64,10 +64,11 @@ class PrinterMotionQueuing:
         self.need_flush_time = self.need_step_gen_time = 0.0
         # Opt-in, bounded host timing capture; no records are created when off.
         self._timing_enabled = False
+        self._timing_recording = False
         self._timing_records = collections.deque(maxlen=128)
         self._timing_expected_flush = None
-        self._timing_first_warning = self._timing_latest_warning = None
-        self._timing_terminal_pending = False
+        self._timing_session = None
+        self._timing_pending = []
         self._timing_print_active = False
         # Register handlers
         printer.register_event_handler("klippy:shutdown", self._handle_shutdown)
@@ -111,40 +112,106 @@ class PrinterMotionQueuing:
                 raise gcmd.error(
                     "Cannot change motion timing diagnostics during a print"
                 )
-        if enabled:
-            self._timing_records.clear()
-            self._timing_first_warning = self._timing_latest_warning = None
-        self._timing_expected_flush = None
-        for mcu in self.all_mcus:
-            mcu.set_timing_diagnostics(enabled)
         self._timing_enabled = bool(enabled)
+        if enabled:
+            self._start_timing_capture()
+        elif self._timing_recording:
+            self._freeze_timing_capture()
 
-    def _snapshot_timing(self, host_time):
+    def _start_timing_capture(self):
+        self._timing_records = collections.deque(maxlen=128)
+        self._timing_expected_flush = None
+        self._timing_session = {
+            "start": self.reactor.monotonic(),
+            "end": None,
+            "records": self._timing_records,
+            "first_warning": None,
+            "latest_warning": None,
+            "snapshot": None,
+            "debug": None,
+        }
+        for mcu in self.all_mcus:
+            mcu.set_timing_diagnostics(True)
+        self._timing_recording = True
+
+    def _snapshot_timing(self, host_time, session):
+        raw_history = {}
+        for mcu in self.all_mcus:
+            raw = mcu.get_timing_debug_snapshot()
+            if session is not None:
+                # Filter copies only: ordinary shutdown extraction still owns
+                # the complete native history, including previous prints.
+                raw = dict(raw)
+                for side, timestamp in (("sent", "sent_time"),
+                                        ("received", "receive_time")):
+                    raw[side] = [
+                        record for record in raw[side]
+                        if record[timestamp] >= session["start"]
+                        and (session["end"] is None
+                             or record[timestamp] <= session["end"])
+                    ]
+            raw_history[mcu.get_name()] = raw
         return {
             "host_time": host_time,
-            "python_ring": list(self._timing_records),
+            "python_ring": list(self._timing_records if session is None
+                                else session["records"]),
             "serial": {
-                mcu.get_name(): mcu.get_timing_diagnostics()
+                mcu.get_name(): [
+                    record for record in mcu.get_timing_diagnostics()
+                    if session is None
+                    or (record["eventtime"] >= session["start"]
+                        and (session["end"] is None
+                             or record["eventtime"] <= session["end"]))
+                ]
                 for mcu in self.all_mcus
             },
-            "raw_history": {
-                mcu.get_name(): mcu.get_timing_debug_snapshot()
-                for mcu in self.all_mcus
-            },
+            "raw_history": raw_history,
         }
 
+    def _freeze_timing_capture(self):
+        session = self._timing_session
+        self._timing_recording = False
+        self._timing_expected_flush = None
+        session["end"] = self.reactor.monotonic()
+        # Copy both rings before disabling collection, and before a deferred
+        # callback can yield to later motion or another print.
+        session["snapshot"] = self._snapshot_timing(session["end"], session)
+        for mcu in self.all_mcus:
+            mcu.set_timing_diagnostics(False)
+        session["debug"] = [
+            mcu.dump_timing_debug(
+                session["snapshot"]["raw_history"][mcu.get_name()]
+            )
+            for mcu in self.all_mcus
+        ]
+        return session
+
     def _handle_timer_too_close(self, mcu_name, receive_time):
-        if not self._timing_enabled:
+        session = self._timing_session
+        if session is None:
             return
+        if not (session["start"] <= receive_time
+                and (session["end"] is None or receive_time <= session["end"])):
+            # An old serial-thread callback may arrive after the next print
+            # starts, while its own terminal dump is still pending.
+            session = next((old for old in reversed(self._timing_pending)
+                            if old["start"] <= receive_time <= old["end"]), None)
+            if session is None:
+                return
         # Throttle copying history, never warning delivery or print counters.
         host_time = self.reactor.monotonic()
-        latest = self._timing_latest_warning
+        latest = session["latest_warning"]
         if latest is not None and host_time - latest["host_time"] < 1.0:
             return
-        snapshot = self._snapshot_timing(host_time)
-        if self._timing_first_warning is None:
-            self._timing_first_warning = snapshot
-        self._timing_latest_warning = snapshot
+        if session["snapshot"] is None:
+            snapshot = self._snapshot_timing(host_time, session)
+        else:
+            # A late pre-end receipt identifies this capture, not newer idle
+            # activity. Keep the frozen evidence's original capture timestamp.
+            snapshot = session["snapshot"]
+        if session["first_warning"] is None:
+            session["first_warning"] = snapshot
+        session["latest_warning"] = snapshot
 
     def _format_timing_warning(self, snapshot):
         if snapshot is None:
@@ -158,51 +225,64 @@ class PrinterMotionQueuing:
         }
         return result
 
-    def _dump_timing_diagnostics(self, trigger, eventtime):
+    def _dump_timing_diagnostics(self, trigger, session):
+        snapshot = None if session is None else session["snapshot"]
+        if snapshot is None:
+            snapshot = self._snapshot_timing(self.reactor.monotonic(), session)
         capture = {
             "trigger": trigger,
-            "host_time": self.reactor.monotonic(),
-            "python_ring": list(self._timing_records),
-            "serial": {
-                mcu.get_name(): mcu.get_timing_diagnostics()
-                for mcu in self.all_mcus
-            },
+            "host_time": snapshot["host_time"],
+            "python_ring": snapshot["python_ring"],
+            "serial": snapshot["serial"],
             "first_warning": self._format_timing_warning(
-                self._timing_first_warning
+                None if session is None else session["first_warning"]
             ),
             "latest_warning": self._format_timing_warning(
-                self._timing_latest_warning
+                None if session is None else session["latest_warning"]
             ),
         }
         logging.info("MOTION_TIMING_DIAGNOSTICS %s", json.dumps(capture))
-        for mcu in self.all_mcus:
-            logging.info("%s", mcu.dump_timing_debug())
+        debug = None if session is None else session["debug"]
+        if debug is None:
+            debug = [
+                mcu.dump_timing_debug(snapshot["raw_history"][mcu.get_name()])
+                for mcu in self.all_mcus
+            ]
+        for message in debug:
+            logging.info("%s", message)
 
     def cmd_DUMP_MOTION_TIMING_DIAGNOSTICS(self, gcmd):
-        self._dump_timing_diagnostics("explicit", self.reactor.monotonic())
+        self._dump_timing_diagnostics("explicit", self._timing_session)
         gcmd.respond_info("Motion timing diagnostics written to printer log")
 
     def _handle_timing_print_start(self):
+        if self._timing_print_active:
+            return
         self._timing_print_active = True
+        if self._timing_enabled:
+            self._start_timing_capture()
 
     def _handle_timing_print_reset(self):
-        # Reset cancels an active/paused print without a terminal stats event.
-        # A retained cancelled report is not evidence of a new cancellation.
+        # Reset cancels an active/paused print, but file selection while idle
+        # must retain the last completed capture.
         if self._timing_print_active:
             self._handle_timing_terminal("print_stats:cancelled_printing")
 
     def _handle_timing_terminal(self, trigger, *args):
         self._timing_print_active = False
-        if not self._timing_enabled or self._timing_terminal_pending:
+        if not self._timing_recording:
             return
-        self._timing_terminal_pending = True
-        self.reactor.register_callback(
-            functools.partial(self._dump_terminal_timing, trigger)
+        session = self._freeze_timing_capture()
+        self._timing_pending.append(session)
+        # Share the serial warning FIFO, so receipts already queued before
+        # termination are dispatched before publishing their frozen capture.
+        self.reactor.register_async_callback(
+            functools.partial(self._dump_terminal_timing, trigger, session)
         )
 
-    def _dump_terminal_timing(self, trigger, eventtime):
-        self._timing_terminal_pending = False
-        self._dump_timing_diagnostics(trigger, eventtime)
+    def _dump_terminal_timing(self, trigger, session, eventtime):
+        self._dump_timing_diagnostics(trigger, session)
+        self._timing_pending.remove(session)
 
     # C trapq tracking
     def allocate_trapq(self):
@@ -295,8 +375,9 @@ class PrinterMotionQueuing:
         self._handle_timing_terminal("klippy:shutdown")
 
     def _advance_flush_time(self, want_flush_time, want_step_gen_time=0.0):
-        timing_enabled = self._timing_enabled
+        timing_enabled = self._timing_recording
         if timing_enabled:
+            timing_session = self._timing_session
             entry_time = self.reactor.monotonic()
             estimated_print_time = self.mcu.estimated_print_time(entry_time)
             need_step_gen_time = self.need_step_gen_time
@@ -341,7 +422,8 @@ class PrinterMotionQueuing:
                     trapq, trapq_free_time, clear_history_time
                 )
         finally:
-            if timing_enabled:
+            if (timing_enabled and self._timing_recording
+                    and timing_session is self._timing_session):
                 self._timing_records.append({
                     "kind": "advance_flush_time",
                     "entry_time": entry_time,
@@ -376,9 +458,10 @@ class PrinterMotionQueuing:
         return kin_time + self.kin_flush_delay
 
     def _flush_handler(self, eventtime):
-        timing_enabled = self._timing_enabled
+        timing_enabled = self._timing_recording
         deadline = self.reactor.NEVER
         if timing_enabled:
+            timing_session = self._timing_session
             entry_time = self.reactor.monotonic()
             expected_time = self._timing_expected_flush
         try:
@@ -429,7 +512,8 @@ class PrinterMotionQueuing:
             logging.exception("Exception in flush_handler")
             self.printer.invoke_shutdown("Exception in flush_handler")
         finally:
-            if timing_enabled:
+            if (timing_enabled and self._timing_recording
+                    and timing_session is self._timing_session):
                 self._timing_expected_flush = deadline
                 self._timing_records.append({
                     "kind": "flush_handler",
@@ -440,9 +524,10 @@ class PrinterMotionQueuing:
         return self.reactor.NEVER
 
     def _flush_handler_debug(self, eventtime):
-        timing_enabled = self._timing_enabled
+        timing_enabled = self._timing_recording
         deadline = self.reactor.NEVER
         if timing_enabled:
+            timing_session = self._timing_session
             entry_time = self.reactor.monotonic()
             expected_time = self._timing_expected_flush
         # Use custom flushing code when in batch output mode
@@ -468,7 +553,8 @@ class PrinterMotionQueuing:
             logging.exception("Exception in flush_handler_debug")
             self.printer.invoke_shutdown("Exception in flush_handler_debug")
         finally:
-            if timing_enabled:
+            if (timing_enabled and self._timing_recording
+                    and timing_session is self._timing_session):
                 self._timing_expected_flush = deadline
                 self._timing_records.append({
                     "kind": "flush_handler",

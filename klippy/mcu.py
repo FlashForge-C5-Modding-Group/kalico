@@ -1584,12 +1584,11 @@ class MCU:
     def format_timing_debug_snapshot(self, snapshot):
         return self._serial.format_timing_debug_snapshot(snapshot)
 
-    def dump_timing_debug(self):
-        out = [self.dump_debug(), self._clocksync.dump_debug()]
-        if self._serial.serialqueue:
-            out.append(self._serial.dump_timing_debug())
-        else:
-            out.append("Serial timing history unavailable: MCU disconnected")
+    def dump_timing_debug(self, snapshot=None):
+        out = [
+            self.dump_debug(), self._clocksync.dump_debug(),
+            self._serial.dump_timing_debug(snapshot),
+        ]
         return "\n".join(out)
 
     def stats(self, eventtime):

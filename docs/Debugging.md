@@ -122,11 +122,23 @@ procedure does not prescribe a remote address or a deployment script.
 ### Supervised reproduction
 
 Capture is disabled by default. While idle, enable it with
-`SET_MOTION_TIMING_DIAGNOSTICS ENABLE=1`. Enabling clears previous
-records and enables all currently connected MCU serial queues.
-`ENABLE=0` stops recording without deleting history; re-enabling starts
-fresh. Changing the setting during a print, including while paused, is
-rejected with `Cannot change motion timing diagnostics during a print`.
+`SET_MOTION_TIMING_DIAGNOSTICS ENABLE=1`. This explicitly clears previous
+records and starts fresh idle collection on the host and all currently
+connected MCU serial queues. Capture remains armed across prints. When
+a new print starts, it clears the previous
+Python/native timing rings and first/latest warning snapshots and starts
+a fresh per-print capture. Pause/resume does not reset that capture.
+
+Completion, cancellation, error, or shutdown freezes and automatically
+dumps the capture, including prints with no warnings. Subsequent idle
+motion and serial traffic cannot overwrite it. Idle print-statistics
+resets and file selection retain it; an active/paused print reset ends
+its capture as a cancellation. If capture is still enabled, the next
+print starts fresh automatically. `ENABLE=0` stops collection without
+deleting the retained capture and prevents automatic capture of later
+prints. Another `ENABLE=1` explicitly starts fresh, even if already
+enabled. Changing the setting during a print, including while paused,
+is rejected with `Cannot change motion timing diagnostics during a print`.
 No configuration section is added.
 
 The operator must confirm bed/nozzle clearance and supervise the
@@ -138,33 +150,38 @@ SET_MOTION_TIMING_DIAGNOSTICS ENABLE=1
 SDCARD_PRINT_FILE FILENAME="Cartographer V4 - Standard.step_PLA_18m54s.gcode"
 ```
 
-After completion or failure, **before restarting the host**, enter:
+After completion or failure, **before starting another print, entering
+`ENABLE=1` again, or restarting the host**, enter:
 
 ```gcode
 GET_TIMER_TOO_CLOSE_STATS
 DUMP_MOTION_TIMING_DIAGNOSTICS
 ```
 
-Both query commands remain available after shutdown. Save the complete
-resulting printer log and console report, including the bounded capture
-and records preceding the warning/failure, not only the final error
-line. Reports and retained snapshots are in memory and are lost on host
-restart. Do not re-enable capture before saving it, because doing so
-clears the previous records. If the failure does not reproduce, retain
-the successful capture; an uneventful run does not establish that the
-original fault is fixed.
+Both query commands remain available after shutdown.
+`DUMP_MOTION_TIMING_DIAGNOSTICS` is read-only and never clears or restarts
+collection. During recording it snapshots current history; after freezing,
+repeated dumps reuse the retained snapshot with its original capture
+time and saved debug information. Save the complete resulting printer
+log and console report, including the bounded capture and records
+preceding the warning/failure, not only the final error line. The
+in-memory capture is replaced by the next enabled print or `ENABLE=1`
+and lost on host restart; log records already emitted remain in the
+saved log. If the failure does not reproduce, retain the successful
+capture; an uneventful run does not establish that the original fault
+is fixed.
 
 ### Capture contents and interpretation
 
 The Python ring retains the newest 128 flush/generation records. The
 native serial queue retains the newest 128 enqueue/message-build
-records per MCU, under its existing queue lock. Collection does not
-allocate a new object per step. Python flush records distinguish an
-expected invocation deadline from actual entry; externally kicked or
-disabled timer invocations have no expected deadline. Generation
-records separate time spent in Python flush callbacks from synchronous
-C step generation/emission and include the requested/effective flush
-and generation times.
+records per MCU, under its existing queue lock. These are bounded recent
+histories, not a full-print trace. Collection does not allocate a new
+object per step. Python flush records distinguish an expected invocation
+deadline from actual entry; externally kicked or disabled timer
+invocations have no expected deadline. Generation records separate time
+spent in Python flush callbacks from synchronous C step generation/
+emission and include the requested/effective flush and generation times.
 
 Each warning can snapshot the numeric rings and non-destructive raw
 serial history (up to 100 sent and 100 received messages per MCU).
@@ -176,19 +193,33 @@ overwriting live history cannot erase a saved warning snapshot.
 Messages are not decoded and bulk traces are not formatted/logged in
 the warning callback while motion continues.
 
-Print completion, cancellation, error, shutdown, and explicit dumps
-capture current rings/history and emit a log line beginning
-`MOTION_TIMING_DIAGNOSTICS ` followed by one JSON object. It contains
-the trigger, host timestamp, live Python ring, MCU-name-to-serial-record
-map, and retained first/latest warning snapshots (null when absent).
-At output time, raw bytes are represented as hexadecimal and decoded
-with the MCU's existing message parser for readable commands such as
-`queue_step`. An undecodable record retains its hex bytes and timestamps
-and is marked undecodable rather than discarding the rest of the
-capture. Disconnected MCUs report unavailable live serial history
-without preventing other MCU records or retained snapshots from being
-dumped. Each dump also logs each MCU's live configuration, clock-sync,
-and available serial debug information.
+A warning delivered late whose original receive time falls within the
+retained print may still attach a first/latest warning snapshot using
+already-frozen evidence. It never samples post-print traffic or changes
+the original capture timestamp. Previously emitted log entries remain
+historical.
+
+Print completion, cancellation, error, and shutdown freeze the current
+rings/history before deferring automatic output. Automatic and explicit
+dumps emit a log line beginning `MOTION_TIMING_DIAGNOSTICS ` followed by
+one JSON object. Its fields are `trigger`, `host_time`, `python_ring`,
+`serial` (an MCU-name-to-native-record map), `first_warning`, and
+`latest_warning` (null when absent). `host_time` is the snapshot's
+monotonic capture time, not the time of a later repeated dump. Warning
+snapshots also contain `raw_history`, with per-MCU `connected`, `sent`,
+and `received` fields. Serial history is restricted to the capture's
+time interval.
+
+At output time, raw message `data` is hexadecimal; `sent_time` and
+`receive_time` retain their original timestamps. The MCU's existing
+message parser supplies `decoded` commands such as `queue_step`; an
+undecodable record retains its bytes/timestamps and an `undecodable`
+marker instead of discarding the rest of the capture. Separate text
+output includes each MCU's configuration, clock-sync, and serial debug
+information. Frozen captures retain that text too, so later dumps do
+not substitute live idle statistics or history. Disconnected MCUs report
+unavailable serial history without preventing other records or retained
+snapshots from being dumped.
 
 Native `kind=1` records mark enqueue; `kind=2` records mark outgoing
 message-build. Their `req_clock` is the queue's priority/need time,

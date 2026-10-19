@@ -20,8 +20,17 @@ until the next print starts. Query them with
 or through [`print_stats.timer_too_close`](docs/Status_Reference.md#print_stats).
 For late-delivery investigations, enable the default-off, bounded
 [motion timing capture](docs/Debugging.md#motion-timing-diagnostics).
-These host-side diagnostics do not change MCU scheduling or safety checks
-and do not establish that a timing fault has been repaired.
+It stays armed across prints: each new print starts fresh, pause/resume
+keeps the same capture, and completion/cancellation/error/shutdown freezes
+and automatically dumps it, even without warnings. Idle traffic and file
+selection do not replace the retained capture; repeated dumps are
+read-only. Save it before the next enabled print, another `ENABLE=1`,
+or host restart. `ENABLE=0` stops collection and later automatic captures
+without deleting the retained evidence; emitted log records remain.
+Snapshots contain bounded recent history, not a full-print trace.
+These host-side diagnostics do not change MCU scheduling or safety checks,
+measure physical layer position or MCU arrival, or establish that a
+timing fault has been repaired.
 
 ## Features merged into the main branch:
 

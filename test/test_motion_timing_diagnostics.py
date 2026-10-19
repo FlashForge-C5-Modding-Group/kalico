@@ -20,7 +20,7 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from klippy import chelper, mcu, msgproto, serialhdl
+from klippy import chelper, mcu, msgproto, reactor, serialhdl
 from klippy.extras import motion_queuing, print_stats, virtual_sdcard
 
 
@@ -139,7 +139,7 @@ class OfflineMCU:
                 record['decoded'] = ['offline history']
         return result
 
-    def dump_timing_debug(self):
+    def dump_timing_debug(self, snapshot=None):
         self.live_dumps += 1
         return 'offline live debug ' + self.name
 
@@ -261,6 +261,384 @@ class MotionTimingTests(unittest.TestCase):
     def records(self, kind):
         return [record for record in self.dump()['python_ring']
                 if record['kind'] == kind]
+
+    def captures(self):
+        return [json.loads(message.split(' ', 1)[1])
+                for message in self.log_messages
+                if message.startswith('MOTION_TIMING_DIAGNOSTICS ')]
+
+    def start_print(self, filename='timing.gcode'):
+        if not isinstance(self.printer.stats, print_stats.PrintStats):
+            self.printer.stats = print_stats.PrintStats(self.config)
+        stats = self.printer.stats
+        stats.set_current_file(filename)
+        stats.note_start()
+        return stats
+
+    def assert_same_evidence(self, actual, expected):
+        self.assertEqual(
+            {key: value for key, value in actual.items() if key != 'trigger'},
+            {key: value for key, value in expected.items() if key != 'trigger'})
+
+    def test_terminal_boundaries_freeze_before_deferred_dump_and_stay_frozen(self):
+        for terminal in ('complete', 'cancelled', 'error', 'shutdown'):
+            with self.subTest(terminal=terminal):
+                self.clock.now = 10.0
+                self.enable()
+                stats = self.start_print()
+                self.motion._advance_flush_time(10.0)
+                self.printer.send_event('mcu:timer_too_close', 'mcu', 10.0)
+                self.clock.now = 11.0
+                self.motion._advance_flush_time(11.0)
+                self.log_messages.clear()
+                for board in self.boards:
+                    board.format_calls.clear()
+                self.clock.now = 12.0
+                if terminal == 'shutdown':
+                    self.printer.send_event('klippy:shutdown')
+                    trigger = 'klippy:shutdown'
+                else:
+                    {'complete': stats.note_complete,
+                     'cancelled': stats.note_cancel,
+                     'error': lambda: stats.note_error('offline failure')}[terminal]()
+                    trigger = 'print_stats:%s_printing' % terminal
+                self.assertFalse(any(board.enabled for board in self.boards),
+                                 'Native collection must stop at the boundary')
+                self.assertEqual(self.log_messages, [],
+                                 'Terminal formatting/logging must be deferred')
+                self.assertTrue(all(not board.format_calls for board in self.boards))
+
+                self.clock.now = 13.0
+                for board in self.boards:
+                    board.history = b'post-print activity'
+                self.motion._advance_flush_time(13.0)
+                self.printer.send_event('mcu:timer_too_close', 'mcu', 13.0)
+                self.clock.now = 14.0
+                self.clock.drain()
+                emitted = self.captures()
+                self.assertEqual(len(emitted), 1)
+                frozen = emitted[0]
+                self.assertEqual(frozen['trigger'], trigger)
+                self.assertEqual(frozen['host_time'], 12.0)
+                self.assertEqual([record['entry_time']
+                                  for record in frozen['python_ring']], [10.0, 11.0])
+                self.assertEqual(frozen['serial']['mcu'][0]['eventtime'], 12.0)
+                self.assertEqual(frozen['first_warning']['host_time'], 10.0)
+                self.assertEqual(frozen['latest_warning']['host_time'], 10.0)
+                self.clock.now = 20.0
+                self.assert_same_evidence(self.dump(), frozen)
+                self.assert_same_evidence(self.dump(), frozen)
+                before = len(self.captures())
+                self.printer.send_event(trigger)
+                self.printer.send_event('klippy:shutdown')
+                self.clock.drain()
+                self.assertEqual(len(self.captures()), before,
+                                 'Duplicate terminal signals must be idempotent')
+
+    def test_empty_print_is_frozen_and_automatically_dumped(self):
+        self.enable()
+        stats = self.start_print('empty.gcode')
+        self.clock.now = 11.0
+        stats.note_complete()
+        self.clock.now = 12.0
+        self.clock.drain()
+        self.assertEqual(len(self.captures()), 1)
+        frozen = self.captures()[0]
+        self.assertEqual(frozen['host_time'], 11.0)
+        self.assertEqual(frozen['python_ring'], [])
+        self.assertIsNone(frozen['first_warning'])
+        self.assertIsNone(frozen['latest_warning'])
+        self.assert_same_evidence(self.dump(), frozen)
+
+    def test_next_print_rearms_fresh_but_pause_resume_keeps_same_capture(self):
+        self.enable()
+        stats = self.start_print('first.gcode')
+        self.motion._advance_flush_time(10.0)
+        self.printer.send_event('mcu:timer_too_close', 'mcu', 10.0)
+        self.clock.now = 11.0
+        stats.note_complete()
+        self.clock.drain()
+        self.clock.now = 12.0
+        self.start_print('second.gcode')
+        fresh = self.dump()
+        self.assertEqual(fresh['python_ring'], [])
+        self.assertIsNone(fresh['first_warning'])
+        self.assertIsNone(fresh['latest_warning'])
+        self.assertTrue(all(board.enabled for board in self.boards),
+                        'Print completion must retain the logical enable flag')
+        self.motion._advance_flush_time(12.0)
+        self.printer.send_event('mcu:timer_too_close', 'mcu', 12.0)
+        stats.note_pause()
+        self.clock.now = 13.0
+        self.motion._advance_flush_time(13.0)
+        stats.note_start()
+        self.clock.now = 14.0
+        self.motion._advance_flush_time(14.0)
+        resumed = self.dump()
+        self.assertEqual([record['entry_time'] for record in resumed['python_ring']],
+                         [12.0, 13.0, 14.0])
+        self.assertEqual(resumed['first_warning']['host_time'], 12.0)
+        self.assertTrue(all(board.enabled for board in self.boards))
+
+    def test_idle_reset_and_file_selection_retain_completed_capture(self):
+        self.enable()
+        stats = self.start_print()
+        self.motion._advance_flush_time(10.0)
+        self.clock.now = 11.0
+        stats.note_complete()
+        self.clock.drain()
+        frozen = self.captures()[-1]
+        self.clock.now = 12.0
+        stats.reset()
+        stats.set_current_file('not-started.gcode')
+        self.motion._advance_flush_time(12.0)
+        self.assert_same_evidence(self.dump(), frozen)
+        self.assertEqual(len([capture for capture in self.captures()
+                              if capture['trigger'] != 'explicit']), 1)
+
+    def test_explicit_disable_retains_capture_and_new_prints_stay_disabled(self):
+        self.enable()
+        self.motion._advance_flush_time(10.0)
+        self.printer.send_event('mcu:timer_too_close', 'mcu', 10.0)
+        self.clock.now = 11.0
+        self.dispatch('SET_MOTION_TIMING_DIAGNOSTICS', 0)
+        frozen = self.dump()
+        self.assertEqual(frozen['host_time'], 11.0)
+        self.clock.now = 12.0
+        stats = self.start_print('disabled.gcode')
+        self.motion._advance_flush_time(12.0)
+        self.printer.send_event('mcu:timer_too_close', 'mcu', 12.0)
+        self.assertFalse(any(board.enabled for board in self.boards))
+        self.clock.now = 13.0
+        stats.note_complete()
+        self.clock.drain()
+        self.assert_same_evidence(self.dump(), frozen)
+        self.assertFalse(any(capture['trigger'] != 'explicit'
+                             for capture in self.captures()))
+        self.clock.now = 14.0
+        self.enable()
+        fresh = self.dump()
+        self.assertEqual(fresh['python_ring'], [])
+        self.assertIsNone(fresh['first_warning'])
+        self.assertIsNone(fresh['latest_warning'])
+        self.motion._advance_flush_time(14.0)
+        self.assertEqual([record['entry_time']
+                          for record in self.dump()['python_ring']], [14.0])
+
+    def test_pending_terminal_dump_owns_old_capture_across_new_session(self):
+        for replacement in ('new-print', 'explicit-enable'):
+            with self.subTest(replacement=replacement):
+                self.clock.now = 10.0
+                self.enable()
+                stats = self.start_print('first.gcode')
+                self.motion._advance_flush_time(10.0)
+                self.printer.send_event('mcu:timer_too_close', 'mcu', 10.0)
+                self.clock.now = 11.0
+                stats.note_complete()
+                self.log_messages.clear()
+                self.clock.now = 12.0
+                if replacement == 'new-print':
+                    self.start_print('second.gcode')
+                else:
+                    # Do not drain: the old automatic dump is still pending.
+                    self.printer.gcode.commands[
+                        'SET_MOTION_TIMING_DIAGNOSTICS'](Command(1))
+                self.motion._advance_flush_time(12.0)
+                self.clock.now = 13.0
+                self.clock.drain()
+                self.assertEqual(len(self.captures()), 1)
+                old = self.captures()[0]
+                self.assertEqual(old['host_time'], 11.0)
+                self.assertEqual([record['entry_time']
+                                  for record in old['python_ring']], [10.0])
+                self.assertEqual(old['first_warning']['host_time'], 10.0)
+                fresh = self.dump()
+                self.assertEqual([record['entry_time']
+                                  for record in fresh['python_ring']], [12.0])
+                self.assertIsNone(fresh['first_warning'])
+                self.assertTrue(all(board.enabled for board in self.boards),
+                                'Stale terminal callbacks must not stop a new capture')
+                self.clock.now = 14.0
+                self.motion._advance_flush_time(14.0)
+                self.assertEqual([record['entry_time']
+                                  for record in self.dump()['python_ring']],
+                                 [12.0, 14.0])
+                if replacement == 'new-print':
+                    stats.note_complete()
+                    self.clock.drain()
+                    automatic = [capture for capture in self.captures()
+                                 if capture['trigger'] != 'explicit']
+                    self.assertEqual(len(automatic), 2)
+                    self.assertEqual(automatic[-1]['host_time'], 14.0)
+                    self.assertEqual([record['entry_time']
+                                      for record in automatic[-1]['python_ring']],
+                                     [12.0, 14.0])
+                    self.assertIsNone(automatic[-1]['first_warning'])
+
+    def test_old_received_warning_cannot_contaminate_next_print(self):
+        self.enable()
+        stats = self.start_print('first.gcode')
+        self.clock.now = 11.0
+        stats.note_complete()
+        self.clock.drain()
+        self.clock.now = 12.0
+        self.start_print('second.gcode')
+        self.clock.now = 13.0
+        self.printer.send_event('mcu:timer_too_close', 'mcu', 10.5)
+        self.printer.send_event('mcu:timer_too_close', 'mcu', 11.5)
+        capture = self.dump()
+        self.assertIsNone(capture['first_warning'])
+        self.assertIsNone(capture['latest_warning'])
+        self.printer.send_event('mcu:timer_too_close', 'mcu', 12.5)
+        self.assertIsNotNone(self.dump()['first_warning'])
+
+    def test_delayed_active_receipts_use_capture_clock_and_throttle_real_copies(self):
+        self.enable()
+        self.start_print()
+        self.clock.now = 20.0
+        self.printer.send_event('mcu:timer_too_close', 'mcu', 11.0)
+        self.printer.send_event('mcu:timer_too_close', 'mcu', 13.0)
+        self.assertEqual([board.snapshot_reads for board in self.boards], [1, 1],
+                         'Spread-out receipts processed together need one snapshot')
+        capture = self.dump()
+        self.assertEqual(capture['first_warning']['host_time'], 20.0)
+        self.assertEqual(capture['latest_warning']['host_time'], 20.0)
+        self.assertEqual(capture['first_warning']['serial']['mcu'][0]['eventtime'],
+                         20.0)
+        before = [board.snapshot_reads for board in self.boards]
+        self.clock.now = 20.5
+        self.printer.send_event('mcu:timer_too_close', 'mcu', 19.0)
+        self.assertEqual([board.snapshot_reads for board in self.boards], before)
+        self.clock.now = 21.01
+        self.printer.send_event('mcu:timer_too_close', 'mcu', 20.0)
+        self.assertEqual([board.snapshot_reads for board in self.boards],
+                         [value + 1 for value in before])
+        capture = self.dump()
+        self.assertEqual(capture['first_warning']['host_time'], 20.0)
+        self.assertEqual(capture['latest_warning']['host_time'], 21.01)
+
+    def test_real_reactor_preserves_queued_serial_warning_before_terminal_dump(self):
+        clock = reactor.Reactor()
+        self.addCleanup(clock.finalize)
+        clock.now = clock.monotonic()
+        board = OfflineMCU('mcu', clock)
+        printer = OfflinePrinter(clock, [board])
+        board.get_printer = lambda: printer
+        config = SimpleNamespace(get_printer=lambda: printer)
+        motion = motion_queuing.PrinterMotionQueuing(config)
+        motion.steppersyncmgr_gen_steps = lambda *args: 0
+        stats = print_stats.PrintStats(config)
+        printer.stats = stats
+        reader = serialhdl.SerialReader.__new__(serialhdl.SerialReader)
+        reader.reactor = clock
+        reader.mcu = board
+        reader.warn_prefix = ''
+        printer.gcode.commands['SET_MOTION_TIMING_DIAGNOSTICS'](Command(1))
+
+        def finish_with_queued_receipt(eventtime):
+            stats.set_current_file('real-reactor.gcode')
+            stats.note_start()
+            clock.now = clock.monotonic()
+            motion._advance_flush_time(clock.now)
+            # The actual serial entrypoint queues asynchronously. Its FIFO
+            # does not become reactor timers until the pipe is serviced.
+            reader.handle_output({'#name': 'output', '#msg': 'Timer too close',
+                                  '#receive_time': clock.now})
+            self.assertEqual(printer.warning_receipts, [])
+            stats.note_complete()
+            clock.register_async_callback(lambda eventtime: clock.end())
+
+        self.log_messages.clear()
+        clock.register_callback(finish_with_queued_receipt)
+        clock.run()
+        emitted = self.captures()
+        self.assertEqual(len(emitted), 1)
+        capture = emitted[0]
+        self.assertEqual(len(printer.warning_receipts), 1)
+        self.assertIsNotNone(capture['first_warning'],
+                             'Queued pre-end serial receipt must precede publication')
+        warning = capture['first_warning']
+        self.assertEqual(warning['host_time'], capture['host_time'])
+        self.assertEqual(warning['python_ring'], capture['python_ring'])
+        self.assertEqual(warning['serial'], capture['serial'])
+
+    def test_pre_end_delayed_warning_uses_frozen_boundary_evidence(self):
+        self.enable()
+        stats = self.start_print()
+        self.motion._advance_flush_time(10.0)
+        self.clock.register_async_callback(
+            lambda eventtime: self.printer.send_event(
+                'mcu:timer_too_close', 'mcu', 11.0))
+        self.clock.now = 12.0
+        self.boards[0].history = b'boundary history'
+        stats.note_complete()
+        self.clock.now = 13.0
+        self.boards[0].history = b'late history'
+        self.motion._advance_flush_time(13.0)
+        self.clock.drain()
+        self.assertEqual(len(self.captures()), 1)
+        frozen = self.captures()[0]
+        warning = frozen['first_warning']
+        self.assertIsNotNone(warning)
+        self.assertEqual(warning['host_time'], frozen['host_time'])
+        self.assertEqual(warning['python_ring'], frozen['python_ring'])
+        self.assertEqual(warning['serial'], frozen['serial'])
+        self.assertEqual(warning['raw_history']['mcu']['sent'][0]['data'],
+                         b'boundary history'.hex())
+        self.printer.send_event('mcu:timer_too_close', 'mcu', 12.5)
+        self.assert_same_evidence(self.dump(), frozen)
+
+    def test_pre_end_warning_after_publication_attaches_only_frozen_evidence(self):
+        self.enable()
+        stats = self.start_print()
+        self.motion._advance_flush_time(10.0)
+        self.clock.now = 12.0
+        self.boards[0].history = b'boundary history'
+        stats.note_complete()
+        self.clock.drain()
+        frozen = self.captures()[0]
+        self.assertIsNone(frozen['first_warning'])
+        self.clock.now = 13.0
+        self.boards[0].history = b'post-publication history'
+        before = [board.snapshot_reads for board in self.boards]
+        self.printer.send_event('mcu:timer_too_close', 'mcu', 11.0)
+        updated = self.dump()
+        self.assertEqual([board.snapshot_reads for board in self.boards], before,
+                         'Late receipt must not recapture live idle evidence')
+        self.assertIsNone(self.captures()[0]['first_warning'],
+                          'Already-published log must remain historical')
+        warning = updated['first_warning']
+        self.assertIsNotNone(warning)
+        self.assertEqual(warning['host_time'], frozen['host_time'])
+        self.assertEqual(warning['python_ring'], frozen['python_ring'])
+        self.assertEqual(warning['serial'], frozen['serial'])
+        self.assertEqual(warning['raw_history']['mcu']['sent'][0]['data'],
+                         b'boundary history'.hex())
+        for field in ('host_time', 'python_ring', 'serial'):
+            self.assertEqual(updated[field], frozen[field])
+        self.assert_same_evidence(self.dump(), updated)
+
+    def test_reentrant_generation_cannot_append_old_record_to_new_print(self):
+        self.enable()
+        stats = self.start_print('first.gcode')
+
+        def finish_and_start_during_generation(*args):
+            self.clock.now = 11.0
+            stats.note_complete()
+            self.clock.now = 12.0
+            self.start_print('second.gcode')
+            return 0
+
+        self.motion.steppersyncmgr_gen_steps = finish_and_start_during_generation
+        self.motion._advance_flush_time(10.0)
+        self.clock.drain()  # Emit the old print's pending automatic dump first.
+        self.assertEqual(self.dump()['python_ring'], [],
+                         'A yielding old generation must not record into the new print')
+        self.motion.steppersyncmgr_gen_steps = lambda *args: 0
+        self.clock.now = 13.0
+        self.motion._advance_flush_time(13.0)
+        self.assertEqual([record['entry_time']
+                          for record in self.dump()['python_ring']], [13.0])
 
     def test_callback_and_generation_delays_have_separate_real_boundaries(self):
         self.enable()
@@ -485,6 +863,8 @@ class MotionTimingTests(unittest.TestCase):
                 self.assertEqual(report['total'], 1)
                 self.assertEqual(len(captures()), before,
                                  'Cancellation capture must be deferred')
+                self.assertFalse(any(board.enabled for board in self.boards),
+                                 'SD reset must stop native capture before dispatch')
                 self.clock.drain()
                 emitted = captures()
                 self.assertEqual(len(emitted), before + 1,
@@ -501,6 +881,8 @@ class MotionTimingTests(unittest.TestCase):
                 sd._reset_file()
                 self.clock.drain()
                 self.assertEqual(len(captures()), before + 1)
+                self.assert_same_evidence(self.dump(), emitted[-1])
+                self.assertFalse(any(board.enabled for board in self.boards))
                 self.clock.now += 2.0
 
     def test_virtual_sd_reset_does_not_capture_when_diagnostics_disabled(self):
@@ -654,6 +1036,174 @@ class NativeQueue:
         reader._timing_debug_history = None
         reader.stats_buf = self.ffi.new('char[4096]')
         return reader
+
+
+class NativePrintCaptureTests(unittest.TestCase):
+    """Per-print lifecycle through real MCU, SerialReader, and socket queues."""
+    dispatch = MotionTimingTests.dispatch
+    enable = MotionTimingTests.enable
+    dump = MotionTimingTests.dump
+    captures = MotionTimingTests.captures
+    collect_log = MotionTimingTests.collect_log
+    start_print = MotionTimingTests.start_print
+    assert_same_evidence = MotionTimingTests.assert_same_evidence
+
+    def setUp(self):
+        self.native = NativeQueue(self)
+        self.clock = ControlledReactor()
+        self.clock.now = self.native.lib.get_monotonic()
+        self.boards = []
+        self.printer = OfflinePrinter(self.clock, self.boards)
+        self.reader = self.native.reader(self.clock)
+        self.clock_evidence = 'print clock evidence'
+        board = mcu.MCU.__new__(mcu.MCU)
+        board._name = 'mcu'
+        board._printer = self.printer
+        board._serial = self.reader
+        board._clocksync = SimpleNamespace(
+            estimated_print_time=lambda eventtime: eventtime,
+            dump_debug=lambda: self.clock_evidence)
+        board._config_cmds = ['config_stepper oid=7']
+        board._oid_count = 8
+        self.reader.mcu = board
+        self.boards.append(board)
+        self.config = SimpleNamespace(get_printer=lambda: self.printer)
+        options = mock.patch.object(motion_queuing, 'get_danger_options',
+            return_value=SimpleNamespace(bgflush_extra_time=.250))
+        options.start()
+        self.addCleanup(options.stop)
+        self.motion = motion_queuing.PrinterMotionQueuing(self.config)
+        self.motion.steppersyncmgr_gen_steps = lambda *args: 0
+        self.log_messages = []
+        logger = mock.patch.object(motion_queuing.logging, 'info', self.collect_log)
+        logger.start()
+        self.addCleanup(logger.stop)
+
+    def sync_clock(self):
+        # Session bounds and serial events must use the same native clock.
+        self.clock.now = self.native.lib.get_monotonic()
+        return self.clock.now
+
+    def test_no_warning_terminal_snapshot_survives_100_later_native_blocks(self):
+        self.enable()
+        stats = self.start_print()
+        first = self.native.send(0)
+        incoming = self.native.receive_data()
+        self.sync_clock()
+        self.motion._advance_flush_time(self.clock.now)
+        expected_numeric = self.native.timing()
+        boundary = self.sync_clock()
+        stats.note_complete()
+        self.assertEqual(self.log_messages, [],
+                         'Bulk terminal logging must wait for the reactor turn')
+        for index in range(1, 107):
+            last = self.native.send(index)
+            self.native.receive_data()
+        self.assertEqual(len(self.native.raw()), 100)
+        self.assertEqual(len(self.native.raw(sent=False)), 100)
+        self.assertNotIn(first, [record['data'] for record in self.native.raw()])
+        self.assertEqual(self.native.timing(), expected_numeric,
+                         'Terminal must stop native numeric recording immediately')
+        self.clock_evidence = 'post-print clock evidence'
+        self.boards[0]._config_cmds = ['post_print_config oid=99']
+        self.sync_clock()
+        self.motion._advance_flush_time(self.clock.now)
+        self.clock.drain()
+        self.assertEqual(len(self.captures()), 1)
+        frozen = self.captures()[0]
+        self.assertEqual(frozen['host_time'], boundary)
+        self.assertEqual(frozen['serial']['mcu'], expected_numeric)
+        self.assertEqual(len(frozen['python_ring']), 1)
+        self.assertIsNone(frozen['first_warning'])
+        self.assertIsNone(frozen['latest_warning'])
+        debug = [message for message in self.log_messages
+                 if not message.startswith('MOTION_TIMING_DIAGNOSTICS ')]
+        output = '\n'.join(debug)
+        self.assertIn('[hex=%s]' % first.hex(), output)
+        self.assertIn('[hex=%s]' % incoming.hex(), output)
+        self.assertNotIn('[hex=%s]' % last.hex(), output)
+        self.assertIn('Dumping sent queue 1 messages', output)
+        self.assertIn('Dumping received queue 1 messages', output)
+        self.assertIn('print clock evidence', output)
+        self.assertNotIn('post-print clock evidence', output)
+        self.assertIn('config_stepper oid=7', output)
+        self.assertNotIn('post_print_config', output)
+        for unused in range(2):
+            before = len(self.log_messages)
+            self.sync_clock()
+            self.assert_same_evidence(self.dump(), frozen)
+            self.assertEqual([message for message in self.log_messages[before:]
+                              if not message.startswith('MOTION_TIMING_DIAGNOSTICS ')],
+                             debug)
+
+    def test_new_print_resets_native_ring_and_excludes_previous_raw_history(self):
+        self.enable()
+        old = self.native.send(0)
+        self.native.receive_data()
+        self.sync_clock()
+        stats = self.start_print('first.gcode')
+        self.assertEqual(self.native.timing(), [],
+                         'A new print must clear the enabled idle native ring')
+        first = self.native.send(1)
+        self.sync_clock()
+        stats.note_complete()
+        self.clock.drain()
+        self.sync_clock()
+        self.start_print('second.gcode')
+        self.assertEqual(self.native.timing(), [],
+                         'Logical enable must rearm with an empty native ring')
+        second = self.native.send(2, request=self.native.base_clock + 12345)
+        incoming = self.native.receive_data()
+        self.sync_clock()
+        self.printer.send_event('mcu:timer_too_close', 'mcu', self.clock.now)
+        before = len(self.log_messages)
+        capture = self.dump()
+        self.assertEqual([record['kind']
+                          for record in capture['serial']['mcu']], [1, 2])
+        self.assertEqual([record['req_clock']
+                          for record in capture['serial']['mcu']],
+                         [self.native.base_clock + 12345] * 2)
+        for warning in ('first_warning', 'latest_warning'):
+            raw = capture[warning]['raw_history']['mcu']
+            self.assertEqual([record['data'] for record in raw['sent']],
+                             [second.hex()])
+            self.assertEqual([record['data'] for record in raw['received']],
+                             [incoming.hex()])
+        output = '\n'.join(self.log_messages[before:])
+        self.assertIn('[hex=%s]' % second.hex(), output)
+        self.assertNotIn('[hex=%s]' % first.hex(), output)
+        self.assertNotIn('[hex=%s]' % old.hex(), output)
+        # Session filtering must never destructively consume shutdown evidence.
+        self.assertEqual([record['data'] for record in self.native.raw()],
+                         [old, first, second])
+
+    def test_queued_serial_warning_from_old_print_does_not_enter_new_capture(self):
+        self.enable()
+        stats = self.start_print('first.gcode')
+        self.native.send(0)
+        receipt = self.sync_clock()
+        self.reader.handle_output({'#name': 'output',
+                                   '#msg': 'Timer too close',
+                                   '#receive_time': receipt})
+        self.assertEqual(stats.get_status(self.clock.now)['timer_too_close']['total'], 0,
+                         'Serial receipt must not mutate print stats off-reactor')
+        stats.note_complete()
+        self.sync_clock()
+        self.start_print('second.gcode')
+        self.native.send(1)
+        self.sync_clock()
+        self.clock.drain()
+        fresh = self.dump()
+        self.assertIsNone(fresh['first_warning'])
+        self.assertIsNone(fresh['latest_warning'])
+        self.assertEqual(stats.get_status(self.clock.now)['timer_too_close']['total'], 0)
+        self.reader.handle_output({'#name': 'output',
+                                   '#msg': 'Timer too close',
+                                   '#receive_time': self.clock.now})
+        self.assertEqual(stats.get_status(self.clock.now)['timer_too_close']['total'], 0)
+        self.clock.drain()
+        self.assertEqual(stats.get_status(self.clock.now)['timer_too_close']['total'], 1)
+        self.assertIsNotNone(self.dump()['first_warning'])
 
 
 class SerialTimingNativeTests(unittest.TestCase):
@@ -819,6 +1369,7 @@ class SerialTimingNativeTests(unittest.TestCase):
     def _assert_queued_warning_survives_failure(self, failure):
         native = NativeQueue(self)
         clock = ControlledReactor()
+        clock.now = native.lib.get_monotonic()
         boards = []
         printer = OfflineShutdownPrinter(clock, boards)
         reader = native.reader(clock)
@@ -842,6 +1393,7 @@ class SerialTimingNativeTests(unittest.TestCase):
         printer.gcode.commands['SET_MOTION_TIMING_DIAGNOSTICS'](Command(1))
         sent = native.send(minimum=4294957296, request=4294968296)
         received = native.receive_data()
+        clock.now = native.lib.get_monotonic()
         original = reader.get_timing_debug_snapshot()
         self.assertEqual([record['data'] for record in original['sent']], [sent])
         self.assertEqual([record['data'] for record in original['received']],
@@ -873,7 +1425,7 @@ class SerialTimingNativeTests(unittest.TestCase):
             clock.drain()  # queued warning, then klippy:shutdown
             clock.drain()  # deferred terminal capture
 
-        self.assertEqual(printer.warning_receipts, [('mcu', 10.0)])
+        self.assertEqual(printer.warning_receipts, [('mcu', clock.now)])
         self.assertEqual(len(printer.shutdown_messages), 1)
         output = '\n'.join(record.getMessage() for record in logs.records)
         if failure == 'shutdown':
@@ -985,9 +1537,8 @@ class SerialTimingNativeTests(unittest.TestCase):
             for name in names:
                 self.require_method(cls, name)
         native = NativeQueue(self)
-        valid = native.send(0)
-        malformed = native.send(payload=b'\x02')
         clock = ControlledReactor()
+        clock.now = native.lib.get_monotonic()
         connected = native.reader(clock)
         disconnected = native.reader(clock)
         disconnected.serialqueue = None
@@ -1009,6 +1560,9 @@ class SerialTimingNativeTests(unittest.TestCase):
         self.assertIn('SET_MOTION_TIMING_DIAGNOSTICS', printer.gcode.commands)
         self.assertIn('DUMP_MOTION_TIMING_DIAGNOSTICS', printer.gcode.commands)
         printer.gcode.commands['SET_MOTION_TIMING_DIAGNOSTICS'](Command(1))
+        valid = native.send(0)
+        malformed = native.send(payload=b'\x02')
+        clock.now = native.lib.get_monotonic()
         printer.send_event('mcu:timer_too_close', 'mcu', clock.now)
         # The retained warning must survive loss of both good and bad live
         # blocks, rather than merely formatting the current serial history.

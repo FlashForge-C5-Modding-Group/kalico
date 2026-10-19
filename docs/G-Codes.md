@@ -1375,11 +1375,21 @@ section is required.
 
 #### SET_MOTION_TIMING_DIAGNOSTICS
 `SET_MOTION_TIMING_DIAGNOSTICS ENABLE=<0|1>`: Enable or disable bounded
-host motion-timing capture. Capture is disabled by default. Enabling
-clears the previous capture and starts collecting Python flush/generation
-timings and serial enqueue/message-build timings for connected MCUs.
-Disabling stops collection without deleting the retained history.
-Re-enabling starts a fresh capture.
+host motion-timing capture. Capture is disabled by default. `ENABLE=1`
+explicitly clears the previous capture and starts fresh idle collection
+of Python flush/generation and connected-MCU serial enqueue/message-build
+timings. It remains armed across prints: when a new print starts, it
+starts a fresh capture, clearing the Python
+and native timing rings and first/latest warning snapshots. Pause/resume
+continues the same capture.
+
+Completion, cancellation, error, or shutdown freezes and automatically
+dumps the capture, even without warnings. Later idle motion/traffic cannot
+overwrite it; idle print-statistics resets and file selection retain it.
+If still enabled, the next print starts fresh automatically. `ENABLE=0`
+stops collection but retains the capture and prevents automatic capture
+of later prints. Save the previous capture before the next print,
+another `ENABLE=1`, or host restart; log records already emitted remain.
 
 This command is only allowed while no print is active, including no
 paused print; otherwise it reports `Cannot change motion timing
@@ -1389,11 +1399,16 @@ safety thresholds. See the
 for deployment requirements and interpreting the evidence.
 
 #### DUMP_MOTION_TIMING_DIAGNOSTICS
-`DUMP_MOTION_TIMING_DIAGNOSTICS`: Write the current bounded capture,
-retained first/latest warning snapshots, and live MCU debug information
-to the host log. This command is also available after shutdown and does
-not clear the capture. The log includes a `MOTION_TIMING_DIAGNOSTICS`
-JSON record; save the complete log, not just the console response.
+`DUMP_MOTION_TIMING_DIAGNOSTICS`: Write the current bounded capture and
+retained first/latest warning snapshots to the host log, followed by MCU
+configuration, clock-sync, and serial debug information. This command is
+also available after shutdown and never clears or restarts collection.
+While recording it takes a read-only snapshot; after freezing, repeated
+dumps reuse the retained snapshot, its original `host_time`, and saved
+debug information instead of newer idle traffic. The log includes a
+`MOTION_TIMING_DIAGNOSTICS` JSON record; save the complete log, not just
+the console response. This is bounded recent history, not a full-print
+trace.
 
 ### [output_pin]
 
