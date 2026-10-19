@@ -94,42 +94,6 @@ class afcPrep:
                                 break
                     self.logger.info("Done capturing TD-1 data")
 
-    def _migrate_creator5_tool_zero_state(self, units):
-        """Rename the old standalone T0 keys once, before restore and normal save."""
-        extruder = self.afc.tools.get('extruder')
-        lane = self.afc.lanes.get('extruder0')
-        if (getattr(extruder, 'creator5_tool_index', None) != 0
-            or getattr(extruder, 'name', None) != 'extruder0'
-            or lane is None
-            or lane.name != 'extruder0'
-            or not lane.standalone_lane
-            or lane.extruder_obj is not extruder
-            or 'extruder' in self.afc.lanes):
-            return
-
-        saved_lanes = units.get(lane.unit, {})
-        saved_extruders = units.get('system', {}).get('extruders', {})
-        for section, records in ((lane.unit, saved_lanes),
-                                 ('system.extruders', saved_extruders)):
-            if 'extruder' not in records:
-                continue
-            if 'extruder0' in records:
-                # Conflicting records are not merged: the configured alias wins.
-                self.logger.warning(
-                    f"Creator5 saved state has both extruder and extruder0 in "
-                    f"{section}; keeping extruder0 without merging legacy data.")
-            else:
-                records['extruder0'] = records.pop('extruder')
-
-        # No live lane named extruder remains, so these references are unambiguous.
-        for record in saved_extruders.values():
-            if record.get('lane_loaded') == 'extruder':
-                record['lane_loaded'] = 'extruder0'
-        for unit_name in self.afc.units:
-            for record in units.get(unit_name, {}).values():
-                if record.get('runout_lane') == 'extruder':
-                    record['runout_lane'] = 'extruder0'
-
     def PREP(self, gcmd):
         overrall_status = True
         while self.printer.state_message != 'Printer is ready':
@@ -145,7 +109,6 @@ class afcPrep:
         if os.path.exists('{}.unit'.format(self.afc.VarFile)) and os.stat('{}.unit'.format(self.afc.VarFile)).st_size > 0:
             try:
                 units=json.load(open('{}.unit'.format(self.afc.VarFile)))
-                self._migrate_creator5_tool_zero_state(units)
             except json.JSONDecodeError as e:
                 # Displaying error for user to fix, do not want to continue just in case
                 # there is actual data in this file as we do not want to overwrite and put
