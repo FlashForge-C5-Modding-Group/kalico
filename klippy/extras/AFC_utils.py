@@ -1,41 +1,35 @@
 # Armored Turtle Automated Filament Changer
 #
 # Copyright (C) 2024-2026 Armored Turtle
+# Copyright (C) 2026 AFCProject
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 
 # File is used to hold common functions that can be called from anywhere and don't belong to a class
 from __future__ import annotations
 
-import traceback
-import json
 import inspect
-
+import json
+import threading
+import traceback
 from datetime import datetime
-from urllib.request import (
-    Request,
-    urlopen
-)
-from urllib.parse import (
-    urlencode,
-    urljoin,
-    quote
-)
+from queue import Empty, Queue
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Union
+from urllib.error import HTTPError
+from urllib.parse import quote, urlencode, urljoin
+from urllib.request import Request, urlopen
 
-from urllib.error import (
-    HTTPError
-)
-
-from typing import TYPE_CHECKING, Optional, Callable, List
+from klippy import chelper
 
 if TYPE_CHECKING:
-    from extras.AFC_logger import AFC_logger
     from configfile import ConfigWrapper
+    from extras.AFC_logger import AFC_logger
     from extras.filament_switch_sensor import SwitchSensor
-    from klippy import Printer
-    from reactor import SelectReactor as Reactor
-    from gcode import GCodeCommand, GCodeDispatch
     from extras.pause_resume import PauseResume
+    from gcode import GCodeCommand, GCodeDispatch
+
+    from klippy import Printer
+    from klippy.reactor import Reactor
 
 ERROR_STR = "Error trying to import {import_lib}, please rerun install-afc.sh script in your AFC-Klipper-Add-On directory then restart klipper\n\n{trace}"
 
@@ -378,45 +372,134 @@ class AFC_moonraker:
         AFC logger object to log and print to console
     """
     ERROR_STRING = "Error getting data from moonraker, check AFC.log for more information"
-    def __init__(self, host: str, port: str, logger: AFC_logger):
+    REQUEST_TIMEOUT = 10
+    sentinel: object = object()
+
+    def __init__(self, host: str, port: str, logger: AFC_logger, reactor: Reactor) -> None:
+        """
+        Initialize the FIFO statistics worker and reactor-owned diagnostics.
+
+        :param host: Moonraker host address.
+        :param port: Moonraker port.
+        :param logger: AFC logger for console and file diagnostics.
+        :param reactor: Reactor used to deliver diagnostics on its owning thread.
+        """
         self.port           = port
         self.logger         = logger
+        self.reactor        = reactor
         self.host           = f'{host.rstrip("/")}:{port}'
         self.database_url   = urljoin(self.host, "server/database/item")
         self.afc_stats_key  = "afc_stats"
-        self.afc_stats      = None
-        self.last_stats_time= None
+        self.afc_stats: Optional[dict[str, Any]] = None
+        self.last_stats_time: Optional[datetime] = None
         self._lane_data     = False
         self.logger.debug(f"Moonraker url: {self.host}")
         self.FILENAME_PATH: str = "server/files/metadata?filename="
 
-    def _get_results(self, url_string, print_error=True):
+        # Only statistics mutations use this worker. Inventory cleanup remains
+        # synchronous so the independent Creator 5 publisher cannot overtake it.
+        self._closing = False
+        self._pending_logs: Queue[tuple[Callable[..., Any], str, dict[str, Any]]] = Queue()
+        self._write_queue: Queue[tuple[Any, tuple[Any, ...]]] = Queue()
+        self._write_thread = threading.Thread(target=self._write_worker, daemon=True,
+                                              name="afc_moonraker")
+        self._write_thread.start()
+
+    def _log_async(self, log_fn: Callable[..., Any], message: str, **kwargs: Any) -> None:
         """
-        Helper function to get results, check for errors and return data if successful
+        Queue a diagnostic and schedule reactor-thread delivery while open.
 
-        :param url_string: URL encoded string to fetch/post data to moonraker
-        :param print_error: Set to True for error to be displayed in console/mainsail panel, setting
-                            to False will still write error to log via debug message
+        :param log_fn: Bound AFC logger method (debug, info, or error).
+        :param message: Message to log.
+        :param kwargs: Keyword arguments for the original AFC logger method.
+        """
+        self._pending_logs.put_nowait((log_fn, message, kwargs))
+        if not self._closing:
+            self.reactor.register_async_callback(self._drain_logs)
 
-        :returns: Returns result dictionary if data is valid, returns None if and error occurred
+    def _drain_logs(self, eventtime: Optional[float] = None, *, shutdown: bool = False) -> None:
+        """
+        Deliver diagnostics once, without AFC console calls during disconnect.
+
+        :param eventtime: Reactor callback time, unused.
+        :param shutdown: Use only the thread-safe underlying file logger.
+        """
+        while True:
+            try:
+                log_fn, message, kwargs = self._pending_logs.get_nowait()
+            except Empty:
+                return
+            if shutdown:
+                trace = kwargs.get("traceback")
+                if trace is not None:
+                    message = f"{message}\n{trace}"
+                getattr(self.logger.logger, log_fn.__name__)(message)
+            else:
+                log_fn(message, **kwargs)
+
+    def _enqueue(self, func: Callable[..., Any], args: tuple[Any, ...]) -> None:
+        """
+        Admit an operation from the reactor thread while the worker is open.
+
+        :param func: Operation to execute on the worker.
+        :param args: Positional arguments for the operation.
+        """
+        if self._closing:
+            error_message = "AFC Moonraker worker is closed"
+            raise RuntimeError(error_message)
+        self._write_queue.put_nowait((func, args))
+
+    def join_thread(self) -> None:
+        """Close admission and attempt admitted work before disconnect returns."""
+        if not self._closing:
+            self._closing = True
+            self._write_queue.put_nowait((self.sentinel, ()))
+        self._write_thread.join()
+        self._drain_logs(shutdown=True)
+
+    def _write_worker(self) -> None:
+        """Attempt FIFO operations until the sentinel is dequeued."""
+        try:
+            thread_name = threading.current_thread().name
+            chelper.get_ffi()[1].set_thread_name(thread_name.encode("utf-8"))
+        except:
+            pass
+        while True:
+            func, args = self._write_queue.get()
+            if func is self.sentinel:
+                return
+            try:
+                func(*args)
+            except Exception:
+                self._log_async(
+                    self.logger.error, "Unexpected error in moonraker background writer")
+                self._log_async(self.logger.debug, traceback.format_exc())
+
+    def _get_results(self, url_string: Union[str, Request],
+                     print_error: bool = True) -> Optional[Any]:
+        """
+        Fetch a response with a socket timeout and deferred error reporting.
+
+        :param url_string: URL or Request to fetch.
+        :param print_error: Report failures at error level instead of debug level.
+        :return: Decoded result, or None on failure.
         """
         data = None
-        # Only print error to console when set, else still print errors bug with debug
-        # logger so that messages are still written to log for debugging purposes
+        logger: Callable[..., Any]
         if print_error:
             logger = self.logger.error
         else:
             logger = self.logger.debug
-
         try:
-            resp = urlopen(url_string)
-            if resp.status >= 200 and resp.status <= 300:
-                data = json.load(resp)
-            else:
-                logger(self.ERROR_STRING)
-                logger(f"Response: {resp.status} Reason: {resp.reason}")
+            with urlopen(url_string, timeout=self.REQUEST_TIMEOUT) as resp:
+                if (resp.status >= 200
+                    and resp.status <= 300):
+                    data = json.load(resp)
+                else:
+                    self._log_async(logger, self.ERROR_STRING)
+                    self._log_async(logger, f"Response: {resp.status} Reason: {resp.reason}")
         except:
-            logger(self.ERROR_STRING, traceback=traceback.format_exc())
+            self._log_async(logger, self.ERROR_STRING, traceback=traceback.format_exc())
             data = None
         return data['result'] if data is not None else data
 
@@ -502,14 +585,22 @@ class AFC_moonraker:
 
         return values
 
-    def update_afc_stats(self, key, value):
+    def update_afc_stats(self, key: str, value: Any) -> None:
         """
-        Updates afc_stats in moonrakers database with key, value pair
+        Queue a statistics update without waiting for Moonraker.
 
-        :param key: The key indicating the field where the value should be inserted
-        :param value: The value to insert into the database
+        :param key: Database key to update.
+        :param value: Value to persist.
         """
-        resp = None
+        self._enqueue(self._update_afc_stats_sync, (key, value))
+
+    def _update_afc_stats_sync(self, key: str, value: Any) -> None:
+        """
+        Post a statistics update from the FIFO worker.
+
+        :param key: Database key to update.
+        :param value: Value to persist.
+        """
         post_payload = {
             "request_method": "POST",
             "namespace": self.afc_stats_key,
@@ -517,10 +608,11 @@ class AFC_moonraker:
             "value": value
         }
         req = Request(self.database_url, urlencode(post_payload).encode())
-
         resp = self._get_results(req)
         if resp is None:
-            self.logger.error(f"Error when trying to update {key} in moonraker, see AFC.log for more info")
+            self._log_async(
+                self.logger.error,
+                f"Error when trying to update {key} in moonraker, see AFC.log for more info")
 
     def get_spool(self, id:int):
         """
@@ -624,12 +716,24 @@ class AFC_moonraker:
                               "\nplease check AFC.log for more information.")
             self.logger.debug(f"{e}")
 
-    def remove_database_entry(self, namespace, key):
+    def remove_database_entry(self, namespace: str, key: str) -> None:
         """
-        Common function for removing entries in moonrakers database
+        Queue statistics deletes and finish other deletes before returning.
 
-        :param namespace: Namespace for moonrakers database
-        :param key: Key to delete from namespace
+        :param namespace: Moonraker database namespace.
+        :param key: Key to delete from the namespace.
+        """
+        if namespace == self.afc_stats_key:
+            self._enqueue(self._remove_database_entry_sync, (namespace, key))
+        else:
+            self._remove_database_entry_sync(namespace, key)
+
+    def _remove_database_entry_sync(self, namespace: str, key: str) -> None:
+        """
+        Delete a database entry with a socket timeout.
+
+        :param namespace: Moonraker database namespace.
+        :param key: Key to delete from the namespace.
         """
         try:
             payload = {
@@ -637,14 +741,15 @@ class AFC_moonraker:
                 "namespace": namespace,
                 "key": key
             }
-            req = Request( self.database_url, urlencode(payload).encode(), method="DELETE")
-            urlopen(req)
-            self.logger.debug(f"Removing {key} from {namespace}")
+            req = Request(self.database_url, urlencode(payload).encode(), method="DELETE")
+            with urlopen(req, timeout=self.REQUEST_TIMEOUT):
+                pass
+            self._log_async(self.logger.debug, f"Removing {key} from {namespace}")
         except HTTPError as e:
-            self.logger.debug(
-                f"Error occurred when trying to delete {key} from {namespace} namespace"
-            )
-            self.logger.debug(f"{e}")
+            self._log_async(
+                self.logger.debug,
+                f"Error occurred when trying to delete {key} from {namespace} namespace")
+            self._log_async(self.logger.debug, f"{e}")
 
     def delete_lane_data(self):
         """

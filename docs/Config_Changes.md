@@ -8,6 +8,12 @@ All dates in this document are approximate.
 
 ## Changes
 
+20261020: AFC `PREP` now retains current statistics, including unsent
+espooler runtime. Restart Klippy to reload counters edited externally
+in Moonraker. Statistics writes no longer wait for HTTP responses.
+Disconnect attempts admitted statistics operations once in FIFO order;
+this does not guarantee durable delivery or a fixed shutdown deadline.
+
 20261002: Homing with a physical endstop no longer backs off by
 `homing_retract_dist` after the final touch; the axis stays on the
 endstop, as in Klipper. The final back-off now only applies to

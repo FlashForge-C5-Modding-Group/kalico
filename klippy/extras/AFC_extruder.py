@@ -70,11 +70,20 @@ class AFCExtruderStats:
     cut_threshold: integer
         Cut threshold set by user in AFC config
     """
-    def __init__(self, extruder_name: str, extruder_obj: AFCExtruder, cut_threshold: int):
+    def __init__(self, extruder_name: str, extruder_obj: AFCExtruder,
+                 cut_threshold: int) -> None:
+        """
+        Initialize ownership and warning state for extruder statistics.
+
+        :param extruder_name: Extruder name used for persisted statistics.
+        :param extruder_obj: Extruder owning these statistics.
+        :param cut_threshold: Configured cut-count warning threshold.
+        """
         self.name = extruder_name
         self.obj  = extruder_obj
         self.logger = extruder_obj.logger
         self.moonraker: AFC_moonraker
+        self._stats_initialized = False
 
         self.cut_total: AFCStats_var
         self.cut_total_since_changed: AFCStats_var
@@ -88,12 +97,10 @@ class AFCExtruderStats:
         self.tc_tool_load: AFCStats_var
 
 
-    def handle_moonraker_stats(self):
-        """
-        Function that should be called at the beginning of PREP so that moonraker has
-        enough time to start before AFC tries to connect. This fixes a race condition that can
-        happen between klipper and moonraker when first starting up.
-        """
+    def handle_moonraker_stats(self) -> None:
+        """Load extruder statistics once, allowing failed initialization to retry."""
+        if self._stats_initialized:
+            return
         self.moonraker = self.obj.afc.moonraker
         values = self.moonraker.get_afc_stats()
 
@@ -136,6 +143,7 @@ class AFCExtruderStats:
         if self.last_blade_changed.value == 0:
             self.last_blade_changed.value = "N/A"
             self.last_blade_changed.update_database()
+        self._stats_initialized = True
 
     def check_cut_threshold(self):
         """
