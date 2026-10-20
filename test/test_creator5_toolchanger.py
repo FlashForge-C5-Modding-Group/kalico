@@ -1334,7 +1334,8 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board.printer.lookup_objects.return_value = []
         command = GCmd()
         self.board.cmd_flow_strokes(command)
-        self.assertEqual(pa.pa_get_value.call_count, 35)
+        # Three failed passes of ten values: three of five can't succeed.
+        self.assertEqual(pa.pa_get_value.call_count, 30)
         self.board._run.assert_any_call(
             'SET_PRESSURE_ADVANCE EXTRUDER=extruder ADVANCE=0.02000')
         self.assertIn('pressure advance unchanged', command.message)

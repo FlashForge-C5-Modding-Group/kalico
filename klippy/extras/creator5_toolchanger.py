@@ -2332,7 +2332,12 @@ class Creator5Toolchanger:
         gcmd.respond_info('Starting T%d flow calibration strokes'
                           % attached)
         old_pa = heater_status.get('pressure_advance', 0.)
-        candidates = (.0100, .0200, .0150, .0350, .0250, .0300, .0400)
+        # Stock tries .010 .020 .015 .035 .025 .030 .040 and keeps each pass's
+        # smallest accepted value; ascending order finds the same value and
+        # can stop there.  The values above .040 are only reached when none
+        # of the stock ones is accepted.
+        candidates = (.0100, .0150, .0200, .0250, .0300, .0350, .0400,
+                      .0450, .0500, .0600)
         # DEBUG=1 leaves the eboard out and logs a sensor trace to a CSV.
         # METHOD=host also scores that trace here instead of asking the
         # eboard (see c5_pa_analysis).
@@ -2342,20 +2347,30 @@ class Creator5Toolchanger:
             raise gcmd.error('METHOD must be eboard or host')
         host = method == 'host'
         if debug or host:
-            # The tested advances only vary the strokes; the estimate is not
-            # limited to them.
+            # The tested advances bracket the answer; it is interpolated,
+            # not picked from them.
             candidates = tuple(float(v) for v in gcmd.get(
-                'ADVANCES', '0,0.04,0.08').split(','))
-            repeats = gcmd.get_int('REPEATS', 2 if host else 1,
-                                   minval=1, maxval=5)
+                'ADVANCES', '0,0.05,0.10' if host else '0,0.01,0.04'
+            ).split(','))
+            repeats = gcmd.get_int('REPEATS', 1, minval=1, maxval=5)
+            refine = gcmd.get_int('REFINE', 1, minval=0, maxval=1)
+            host_max_runs = gcmd.get_int('MAX_RUNS', 9, minval=3, maxval=20)
             apply_result = gcmd.get_int('APPLY', 0, minval=0, maxval=1)
-            sensors = ('eboard', 'sg', 'eddy') + (() if host else ('both',))
+            host_fast = gcmd.get_float('FAST', 10.4, above=1., maxval=25.)
+            host_ratio = gcmd.get_float('RATIO', .25, above=.01, maxval=.5)
+            host_strokes = gcmd.get_int('STROKES', 6, minval=2, maxval=16)
+            host_slow = gcmd.get_float('SLOW', 1., above=0., below=host_fast)
+            host_times = (gcmd.get_float('LEAD', .4, minval=.2, maxval=2.),
+                          gcmd.get_float('FAST_TIME', .5, minval=.35,
+                                         maxval=2.),
+                          gcmd.get_float('SLOW_TIME', .4, minval=.2,
+                                         maxval=2.))
+            sensors = ('eboard', 'sg') + (() if host else ('eddy', 'both'))
             sensor = gcmd.get('SENSOR', 'eboard' if pa.has_stream()
                               else 'sg').lower()
             if sensor not in sensors:
                 raise gcmd.error('SENSOR must be one of %s'
                                  % ', '.join(sensors))
-        minimum_candidate = min(candidates)
         # The eboard classifies the *motor-current waveform*, not a bead on
         # the plate.  Klipper only applies pressure advance to moves with
         # XY motion, so like the stock firmware the strokes are XY moves,
@@ -2374,6 +2389,7 @@ class Creator5Toolchanger:
             calibrated = False
             paused = []
             locked = None
+            senddelay_set = False
             try:
                 self._run('G90')
                 self._run('M83')
@@ -2383,10 +2399,24 @@ class Creator5Toolchanger:
                 self._run('M400')
                 self._enable_extruder_driver(extruder)
                 paused = self._pause_extruder_tmc_checks()
+                # The eboard takes a reply that pauses after the request echo
+                # as two frames and drops both; Klippy's senddelay=2 does that.
+                self._run('SET_TMC_FIELD STEPPER=%s FIELD=senddelay VALUE=0'
+                          % extruder)
+                senddelay_set = True
                 locked = self._lock_xy()
                 self._run('SET_VELOCITY_LIMIT ACCEL=%.0f '
                           'SQUARE_CORNER_VELOCITY=9' % self.flow_test_accel)
-                if debug or host:
+                if host:
+                    self._flow_host(gcmd, attached, extruder, sensor,
+                                    candidates * repeats, refine,
+                                    host_fast, host_slow, host_ratio,
+                                    host_strokes, host_times, fast_feed,
+                                    host_max_runs)
+                    calibrated = apply_result and self._flow_host_apply(
+                        gcmd, attached, extruder)
+                    return
+                if debug:
                     runs = self._flow_capture(
                         gcmd, extruder, candidates * repeats, segments,
                         fast_feed, sensor)
@@ -2394,34 +2424,6 @@ class Creator5Toolchanger:
                     self._flow_write_csv(runs, path)
                     gcmd.respond_info('T%d flow trace: %d runs written to %s'
                                       % (attached, len(runs), path))
-                    if not host:
-                        return
-                    from . import c5_pa_analysis
-                    column = 3 if sensor == 'eddy' else 2
-                    estimate_runs = [c5_pa_analysis.Run(
-                        [t for t, v in grid], [v for t, v in grid],
-                        [r[0] for r in rows if r[column] >= 0],
-                        [r[column] for r in rows if r[column] >= 0])
-                        for advance, rows, grid in runs]
-                    try:
-                        result = c5_pa_analysis.estimate(estimate_runs)
-                    except ValueError as e:
-                        gcmd.respond_info('T%d host flow test failed: %s; '
-                                          'pressure advance unchanged'
-                                          % (attached, e))
-                        return
-                    problem = result.problem()
-                    gcmd.respond_info(
-                        'T%d host flow test: pressure advance %.4f '
-                        '(95%%: %.4f-%.4f, t=%.1f, sensor delay %.0f ms)%s'
-                        % (attached, result.advance, result.low, result.high,
-                           result.t_stat, result.delay * 1000.,
-                           '; not used: ' + problem if problem
-                           else '' if apply_result else ', not applied'))
-                    if apply_result and not problem:
-                        self._run('SET_PRESSURE_ADVANCE EXTRUDER=%s '
-                                  'ADVANCE=%.5f' % (extruder, result.advance))
-                        calibrated = True
                     return
                 for repeat in range(5):
                     successful = []
@@ -2447,13 +2449,12 @@ class Creator5Toolchanger:
                             gcmd.respond_info(
                                 'T%d flow valid: PA %.4f (pass %d)'
                                 % (attached, advance, repeat + 1))
-                            # The remaining candidates cannot improve this
-                            # pass once the lowest PA has been accepted.
-                            if advance == minimum_candidate:
-                                break
+                            break
                     if successful:
                         picks.append(min(successful))
-                    if len(picks) >= 3:
+                    # Three of the five passes must succeed; stop once that
+                    # can no longer happen.
+                    if len(picks) >= 3 or len(picks) + 4 - repeat < 3:
                         break
                 if len(picks) >= 3:
                     result = sum(picks[:3]) / 3.
@@ -2479,6 +2480,9 @@ class Creator5Toolchanger:
                         self._run('RESTORE_GCODE_STATE NAME=C5_FLOW_TEST '
                                   'MOVE=0')
                     finally:
+                        if senddelay_set:
+                            self._run('SET_TMC_FIELD STEPPER=%s '
+                                      'FIELD=senddelay VALUE=2' % extruder)
                         self._resume_tmc_checks(paused)
 
         self._with_motion(gcmd, measure)
@@ -2569,6 +2573,86 @@ class Creator5Toolchanger:
                               for i in range(int((end - start + .3) / .002)))]
             runs.append((advance, rows, grid))
         return runs
+
+    def _flow_host(self, gcmd, attached, extruder, sensor, candidates,
+                   refine, fast, slow, ratio, strokes, times, fast_feed,
+                   max_runs):
+        """Host-scored flow test; leaves the fit in self._flow_host_fit."""
+        from . import c5_pa_analysis
+        lead, fast_time, slow_time = times
+        segments, x = [], 40.
+
+        def add(speed, duration):
+            # XY only carries the extrusion so pressure advance applies;
+            # the XY steppers are detached.
+            dx = speed / ratio * duration
+            segments.append((x + dx, speed / ratio * 60., dx * ratio))
+            return x + dx
+        x = add(slow, lead)
+        for i in range(strokes):
+            x = add(fast, fast_time)
+            x = add(slow, slow_time)
+        if x > 280.:
+            raise gcmd.error('Flow strokes need %.0f mm of (virtual) X travel; '
+                             'raise RATIO or shorten them' % (x - 40.))
+        # The load reading ripples with the motor's electrical cycle (four
+        # full steps); its length in filament lets the fit remove it.
+        stepper = self.printer.lookup_object(extruder).extruder_stepper.stepper
+        mcu_tmc = self.printer.lookup_object('tmc2209 ' + extruder).mcu_tmc
+        microsteps = 256 >> mcu_tmc.get_fields().get_field('mres')
+        period = stepper.get_step_dist() * microsteps * 4.
+        points, all_runs = [], []
+
+        def measure(advances):
+            runs = self._flow_capture(gcmd, extruder, advances, segments,
+                                      fast_feed, sensor)
+            for advance, rows, grid in runs:
+                rows = [r for r in rows if r[2] >= 0]
+                drifts = c5_pa_analysis.stroke_drifts(
+                    [r[0] for r in rows], [r[2] for r in rows],
+                    [r[5] for r in rows], [r[1] for r in rows], fast, period)
+                points.extend((advance, d) for d in drifts)
+                gcmd.respond_info('T%d flow PA %.4f: drift %s' % (
+                    attached, advance,
+                    ' '.join('%+.4f' % d for d in drifts) or 'none'))
+            all_runs.extend(runs)
+        self._flow_host_fit = None
+        try:
+            measure(candidates)
+            fit = c5_pa_analysis.fit_zero(points)
+            # Add runs either side of the estimate while it is too
+            # uncertain, up to MAX_RUNS.
+            while (refine and len(all_runs) + 2 <= max_runs
+                   and 0. <= fit.advance <= max(candidates) + .05):
+                measure((max(0., fit.advance - .01), fit.advance + .01))
+                fit = c5_pa_analysis.fit_zero(points)
+                if fit.high - fit.low <= c5_pa_analysis.MAX_INTERVAL:
+                    break
+        except ValueError as e:
+            gcmd.respond_info('T%d host flow test failed: %s; pressure '
+                              'advance unchanged' % (attached, e))
+            return
+        finally:
+            path = '/tmp/c5_flow_T%d.csv' % attached
+            self._flow_write_csv(all_runs, path)
+        self._flow_host_fit = fit
+        problem = fit.problem()
+        gcmd.respond_info(
+            'T%d host flow test: pressure advance %.4f (95%%: %.4f-%.4f, '
+            't=%.1f, %d strokes, %d runs)%s' % (
+                attached, fit.advance, fit.low, fit.high, fit.t_stat,
+                len(fit.points), len(all_runs),
+                '; not used: ' + problem if problem else ''))
+
+    def _flow_host_apply(self, gcmd, attached, extruder):
+        fit = self._flow_host_fit
+        if fit is None or fit.problem():
+            return False
+        self._run('SET_PRESSURE_ADVANCE EXTRUDER=%s ADVANCE=%.5f'
+                  % (extruder, fit.advance))
+        gcmd.respond_info('T%d pressure advance set to %.4f'
+                          % (attached, fit.advance))
+        return True
 
     def _flow_write_csv(self, runs, path):
         with open(path, 'w') as f:

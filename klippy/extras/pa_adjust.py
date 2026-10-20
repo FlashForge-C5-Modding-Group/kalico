@@ -10,6 +10,7 @@ class PrinterPA:
         gcode = config.get_printer().lookup_object('gcode')
         gcode.register_command("PA_GET", self.cmd_PA_GET)
         gcode.register_command("PA_ACTION", self.cmd_PA_ACTION)
+        gcode.register_command("PA_STREAM", self.cmd_PA_STREAM)
 
         self.mcu = self.printer.lookup_object('mcu eboard')
         self.mcu.register_config_callback(self.build_config)
@@ -62,6 +63,15 @@ class PrinterPA:
             index += len(data) // 6
             if not data or index >= result['total']:
                 return samples
+
+    def cmd_PA_STREAM(self, gcmd):
+        if self._pa_stream_cmd is None:
+            raise gcmd.error('eboard firmware has no PA stream')
+        first = self._pa_stream_cmd.send([0])
+        data = bytearray(first['data'])
+        values = [data[i] | data[i + 1] << 8 for i in range(0, len(data), 6)]
+        gcmd.respond_info('PA stream: %d readings, start clock %d, first %s'
+                          % (first['total'], first['start'], values))
 
     def cmd_PA_GET(self, gcmd):
         # Get PA value
