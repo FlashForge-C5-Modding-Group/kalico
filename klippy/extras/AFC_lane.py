@@ -125,6 +125,7 @@ class AFCLane:
         self.tool_loaded        = False
         self.loaded_to_hub      = False
         self.spool_id           = None
+        self._spool_request_generation = 0
         self.color: str         = ""
         self.multi_color: list  = []
         self.spool_vendor: str  = ""
@@ -410,16 +411,21 @@ class AFCLane:
         Sets filament material type and sets filament density based off material type.
         To use custom density, set density after setting material
         """
+        density = self._get_material_density(value)
         self._material = value
-        if not value:
-            self.filament_density = 1.24 # Setting to a default value
-            return
+        self.filament_density = density
 
+    def _get_material_density(self, value: Optional[str]) -> Optional[float]:
+        """Validate material and resolve density without mutating lane fields."""
+        if value is not None and not isinstance(value, str):
+            raise ValueError("Filament material must be text or None")
+        if not value:
+            return 1.24
         for density in self.afc.common_density_values:
-            v = density.split(":")
-            if v[0] in value:
-                self.filament_density = float(v[1])
-                break
+            configured = density.split(":")
+            if configured[0] in value:
+                return float(configured[1])
+        return self.filament_density
 
     @property
     def lane_index(self) -> str:
@@ -1850,7 +1856,7 @@ class AFCLane:
         Captures TD-1 data for a lane after being loaded into toolhead. When capturing
         data scan time is ignored as its assumed its scanned when loaded into toolhead.
         """
-        if self.afc.td1_present:
+        if self.afc.check_td1_present():
             valid = False
             if self.td1_device_id:
                 valid, _ = self.afc.function.check_for_td1_id(self.td1_device_id)

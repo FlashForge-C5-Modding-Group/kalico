@@ -396,8 +396,8 @@ class AFC_moonraker:
         self.logger.debug(f"Moonraker url: {self.host}")
         self.FILENAME_PATH: str = "server/files/metadata?filename="
 
-        # Only statistics mutations use this worker. Inventory cleanup remains
-        # synchronous so the independent Creator 5 publisher cannot overtake it.
+        # All admitted HTTP shares one FIFO; result-dependent callers wait
+        # cooperatively while the worker owns the request and response.
         self._closing = False
         self._pending_logs: Queue[tuple[Callable[..., Any], str, dict[str, Any]]] = Queue()
         self._write_queue: Queue[tuple[Any, tuple[Any, ...]]] = Queue()
@@ -475,8 +475,33 @@ class AFC_moonraker:
                     self.logger.error, "Unexpected error in moonraker background writer")
                 self._log_async(self.logger.debug, traceback.format_exc())
 
+    def _call_worker(self, func: Callable[..., Any],
+                     args: tuple[Any, ...]) -> Any:
+        """Await a worker result without blocking reactor dispatch."""
+        completion = self.reactor.completion()
+        self._enqueue(self._complete_worker_call, (completion, func, args))
+        result, exc = completion.wait()
+        if exc is not None:
+            raise exc
+        return result
+
+    def _complete_worker_call(self, completion: Any,
+                              func: Callable[..., Any],
+                              args: tuple[Any, ...]) -> None:
+        """Settle every result request, including an unexpected worker error."""
+        try:
+            result, exc = func(*args), None
+        except Exception as error:
+            result, exc = None, error
+        self.reactor.async_complete(completion, (result, exc))
+
     def _get_results(self, url_string: Union[str, Request],
                      print_error: bool = True) -> Optional[Any]:
+        """Cooperatively await an HTTP result from the FIFO worker."""
+        return self._call_worker(self._get_results_sync, (url_string, print_error))
+
+    def _get_results_sync(self, url_string: Union[str, Request],
+                          print_error: bool = True) -> Optional[Any]:
         """
         Fetch a response with a socket timeout and deferred error reporting.
 
@@ -494,14 +519,14 @@ class AFC_moonraker:
             with urlopen(url_string, timeout=self.REQUEST_TIMEOUT) as resp:
                 if (resp.status >= 200
                     and resp.status <= 300):
-                    data = json.load(resp)
+                    data = json.load(resp)['result']
                 else:
                     self._log_async(logger, self.ERROR_STRING)
                     self._log_async(logger, f"Response: {resp.status} Reason: {resp.reason}")
         except:
             self._log_async(logger, self.ERROR_STRING, traceback=traceback.format_exc())
             data = None
-        return data['result'] if data is not None else data
+        return data
 
     def wait_for_moonraker(self, toolhead, timeout:int=30):
         """
@@ -539,15 +564,20 @@ class AFC_moonraker:
             self.logger.debug("Spoolman server is not defined")
             return None
 
-    def get_file_metadata(self, filename: str) -> dict:
-        """
-        Queries moonraker for a print file's metadata.
+    def get_file_metadata(
+        self, filename: str, callback: Callable[[Optional[dict[str, Any]]], None]
+    ) -> None:
+        """Queue metadata and deliver its result on the reactor while open."""
+        self._enqueue(self._get_file_metadata_sync, (filename, callback))
 
-        :param filename: Filename to query moonraker and pull metadata
-        :return dict: Metadata dictionary returned by moonraker, None if the query fails
-        """
-        resp: dict = self._get_results(urljoin(self.host, f"{self.FILENAME_PATH}{quote(filename)}"))
-        return resp
+    def _get_file_metadata_sync(
+        self, filename: str, callback: Callable[[Optional[dict[str, Any]]], None]
+    ) -> None:
+        """Fetch metadata on the worker; never queue a worker-side wait."""
+        resp = self._get_results_sync(
+            urljoin(self.host, f"{self.FILENAME_PATH}{quote(filename)}"))
+        self.reactor.register_async_callback(
+            lambda eventtime: callback(resp) if not self._closing else None)
 
     def get_afc_stats(self) -> Optional[dict]:
         """
@@ -608,7 +638,7 @@ class AFC_moonraker:
             "value": value
         }
         req = Request(self.database_url, urlencode(post_payload).encode())
-        resp = self._get_results(req)
+        resp = self._get_results_sync(req)
         if resp is None:
             self._log_async(
                 self.logger.error,
@@ -702,19 +732,23 @@ class AFC_moonraker:
 
         :params data: Data to send to endpoint
         """
-        # TODO: keeping lane data commented out just incase moonraker wants to add
-        # back lane_data module
-        # if self._lane_data:
-        # url = urljoin( self.host, 'machine/set_lane_data')
+        self._enqueue(self._send_lane_data_sync, (json.dumps(data).encode(),))
+
+    def _send_lane_data_sync(self, payload: bytes) -> None:
+        """Publish the immutable admission snapshot from the FIFO worker."""
         try:
-            req = Request( url=self.database_url, data=json.dumps(data).encode(),
+            req = Request( url=self.database_url, data=payload,
                         method="POST", headers={"Content-Type": "application/json"})
-            if self._get_results(req) is None:
-                self.logger.error("Error sending lane data, check AFC.log for more information")
+            if self._get_results_sync(req) is None:
+                self._log_async(
+                    self.logger.error,
+                    "Error sending lane data, check AFC.log for more information")
         except HTTPError as e:
-            self.logger.error("Error occurred when trying to send lane data to moonraker database,"+
-                              "\nplease check AFC.log for more information.")
-            self.logger.debug(f"{e}")
+            self._log_async(
+                self.logger.error,
+                "Error occurred when trying to send lane data to moonraker database,"+
+                "\nplease check AFC.log for more information.")
+            self._log_async(self.logger.debug, f"{e}")
 
     def remove_database_entry(self, namespace: str, key: str) -> None:
         """
@@ -726,7 +760,7 @@ class AFC_moonraker:
         if namespace == self.afc_stats_key:
             self._enqueue(self._remove_database_entry_sync, (namespace, key))
         else:
-            self._remove_database_entry_sync(namespace, key)
+            self._call_worker(self._remove_database_entry_sync, (namespace, key))
 
     def _remove_database_entry_sync(self, namespace: str, key: str) -> None:
         """
@@ -805,6 +839,7 @@ class AFC_PrintFileMetaData:
         self.logger = logger
         self._filename: str = ""
         self._metadata: dict = {}
+        self._query_generation = 0
 
     @property
     def filename(self) -> str:
@@ -812,18 +847,30 @@ class AFC_PrintFileMetaData:
         :return str: Filename that metadata is currently cached for
         """
         return self._filename
-    @filename.setter
-    def filename(self, value: str) -> None:
-        """
-        Sets current filename and queries moonraker for its metadata, caching
-        the result for the `tool_change_count`/`tool_temperatures` properties.
 
-        :param value: Filename to query moonraker and pull metadata for
-        """
+    def query_filename(self, value: str,
+                       on_fetched: Optional[Callable[[], None]] = None) -> None:
+        """Start a new metadata generation, even for the same filename."""
+        self._query_generation += 1
+        generation = self._query_generation
         self._filename = value
-        if (self._moonraker
-            and value):
-            self._metadata = self._moonraker.get_file_metadata(self._filename) or {}
+        self._metadata = {}
+        if self._moonraker and value:
+            self._moonraker.get_file_metadata(
+                value, lambda resp: self._apply_metadata(
+                    generation, value, resp, on_fetched))
+        elif on_fetched is not None:
+            on_fetched()
+
+    def _apply_metadata(self, generation: int, filename: str,
+                        resp: Optional[dict[str, Any]],
+                        on_fetched: Optional[Callable[[], None]]) -> None:
+        """Discard obsolete results without resuming their print-start work."""
+        if generation != self._query_generation or filename != self._filename:
+            return
+        self._metadata = resp or {}
+        if on_fetched is not None:
+            on_fetched()
 
     @property
     def tool_change_count(self) -> int:
@@ -857,5 +904,6 @@ class AFC_PrintFileMetaData:
         Clears cached filename and metadata, used when a print ends/is reset so
         stale tool change/temperature data isn't reused for the next print.
         """
+        self._query_generation += 1
         self._filename = ""
         self._metadata = {}

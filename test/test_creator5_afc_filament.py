@@ -77,6 +77,21 @@ class Creator5AFCFilamentTests(unittest.TestCase):
             2, spool_id=42, material='ASA', color='AABBCC',
             nozzle_temp=255, bed_temp=95)
 
+    def test_spool_reply_cannot_overwrite_changed_inventory(self):
+        self.spool.afc.spoolman = 'http://spoolman'
+
+        def lookup(spool_id):
+            self.spool.creator5_filament_sync.filaments[2]['material'] = 'PETG'
+            return {'filament': {'material': 'ASA', 'color_hex': 'AABBCC'}}
+
+        self.spool.afc.moonraker.get_spool.side_effect = lookup
+        with self.assertRaisesRegex(
+                ValueError, 'Filament assignment changed while looking up spool'):
+            self.spool.cmd_SET_SPOOL_ID(GCmd(LANE='T2', SPOOL_ID='42'))
+        self.spool.creator5_filament_sync.set_tool_fields.assert_not_called()
+        self.assertEqual(
+            self.spool.creator5_filament_sync.filaments[2]['material'], 'PETG')
+
 
 if __name__ == '__main__':
     unittest.main()

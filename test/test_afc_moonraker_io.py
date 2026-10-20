@@ -97,6 +97,27 @@ class MockLogger:
 WAIT = 5
 
 
+class EventCompletion:
+    """Bounded unit bridge only; real scheduling is covered by reactor smoke."""
+    def __init__(self):
+        self.event = threading.Event()
+        self.result = None
+        self.wait_started = threading.Event()
+
+    def complete(self, result):
+        assert not self.event.is_set(), "completion delivered twice"
+        self.result = result
+        self.event.set()
+
+    def test(self):
+        return self.event.is_set()
+
+    def wait(self):
+        self.wait_started.set()
+        assert self.event.wait(WAIT), "completion did not settle"
+        return self.result
+
+
 class DeferredReactor(MockReactor):
     def __init__(self):
         super().__init__()
@@ -104,6 +125,12 @@ class DeferredReactor(MockReactor):
 
     def register_async_callback(self, callback, waketime=None):
         self.callbacks.put(callback)
+    def completion(self):
+        return EventCompletion()
+
+    def async_complete(self, completion, result):
+        completion.complete(result)
+
 
     def run_callbacks(self):
         while True:
@@ -154,6 +181,7 @@ class LoopbackIO:
         self.contents = {}
         self.statuses = {}
         self.responses = {}
+        self.raw_responses = {}
         self.gates = {}
         self.escaped = []
         self.condition = threading.Condition()
@@ -182,7 +210,7 @@ class LoopbackIO:
                 body = self.rfile.read(length).decode()
                 if self.headers.get("Content-Type") == "application/json":
                     form = {}
-                    data = json.loads(body)
+                    data = json.loads(body) if body else {}
                 else:
                     form = parse_qs(body)
                     data = None
@@ -207,7 +235,8 @@ class LoopbackIO:
                     elif self.command == "DELETE":
                         owner.contents.pop((namespace, key), None)
                 result = owner.responses.get(index, {"value": value})
-                payload = json.dumps({"result": result}).encode()
+                payload = owner.raw_responses.get(
+                    index, json.dumps({"result": result}).encode())
                 try:
                     self.send_response(status)
                     self.send_header("Content-Type", "application/json")
@@ -686,15 +715,12 @@ class TestAFCMoonrakerNamespaceDispatch:
         assert io.contents == {("afc_stats", "next"): "4"}
         assert io.logger.messages == [("debug", "Removing legacy from afc_stats")]
 
-    def test_nonstatistics_delete_remains_available_after_worker_closes(self, moonraker_io):
+    def test_nonstatistics_delete_rejects_closed_worker(self, moonraker_io):
         io = moonraker_io
         io.client.join_thread()
-        io.client.remove_database_entry("lane_data", "stale")
-        assert io.records == [("DELETE", "lane_data", "stale", None)]
-        io.client._drain_logs(shutdown=True)
-        assert io.logger.messages == []
-        assert [(level, text) for level, text, _ in io.logger.handler.records] == [
-            ("debug", "Removing stale from lane_data")]
+        with pytest.raises(RuntimeError, match="AFC Moonraker worker is closed"):
+            io.client.remove_database_entry("lane_data", "stale")
+        assert io.records == []
 
 
 assist = load_classes('AFC_assist.py', [
@@ -704,7 +730,8 @@ AFCExtruderStats = load_classes('AFC_extruder.py', ['AFCExtruderStats']).AFCExtr
 lane_types = load_classes('AFC_lane.py', [
     'AssistActive', 'SpeedMode', 'MoveDirection', 'AFCLaneState',
     'AFCHomingPoints', 'AFCMoveWarning', 'AFCLane'],
-    {'AFC_assist': assist, 'EXCLUDE_TYPES': ['HTLF', 'Claymore', 'OpenAMS', 'ViViD']})
+    {'AFC_assist': assist, 'EXCLUDE_TYPES': ['HTLF', 'Claymore', 'OpenAMS', 'ViViD'],
+     'VALID_DIRECT_HUB': ['direct', 'direct_load']})
 AFCLane = lane_types.AFCLane
 AFC_PrintFileMetaData = load_classes('AFC_utils.py',
                                    ['AFC_PrintFileMetaData']).AFC_PrintFileMetaData
@@ -1326,24 +1353,17 @@ class TestCreator5InventoryOrdering:
         assert io.logger.messages == [("debug", "Removing stale from lane_data")]
 
 
-class TestUnchangedSynchronousMoonrakerApis:
+class TestCooperativeMoonrakerResults:
     @pytest.mark.parametrize(("operation", "response", "expected", "path"), [
-        (lambda client: client.get_file_metadata("folder/file.gcode"),
-         {"size": 15}, {"size": 15},
-         "/server/files/metadata?filename=folder/file.gcode"),
         (lambda client: client.get_spool(7),
          {"id": 7}, {"id": 7}, "/server/spoolman/proxy"),
         (lambda client: client.get_td1_data(),
          {"devices": {"serial": {"color": "red"}}},
          {"serial": {"color": "red"}}, "/machine/td1/data"),
-        (lambda client: client.send_lane_data({
-            "namespace": "lane_data", "key": "lane1", "value": "loaded"}),
-         {"value": "loaded"}, None, "/server/database/item"),
     ])
     def test_public_api_still_waits_for_response_and_returns_result(
             self, moonraker_io, operation, response, expected, path):
         io = moonraker_io
-        io.client.join_thread()
         io.responses[0] = response
         gate = io.gates[0] = threading.Event()
         results, errors = [], []
@@ -1372,3 +1392,917 @@ class TestUnchangedSynchronousMoonrakerApis:
         assert results == [expected]
         assert io.requests[0][0] == path
         assert io.logger.messages == []
+
+
+class TestNetworkWorkerContracts:
+    def test_result_read_cannot_overtake_admitted_statistics(self, moonraker_io):
+        io = moonraker_io
+        gate = io.gates[0] = threading.Event()
+        io.client.update_afc_stats("first", 1)
+        io.wait_requests(1)
+        results = []
+        helper = threading.Thread(target=lambda: results.append(io.client.get_spool(7)))
+        helper.start()
+        try:
+            # A queue barrier cannot pass the held first request.
+            assert not results
+            assert io.records == [("POST", "afc_stats", "first", "1")]
+        finally:
+            gate.set()
+            helper.join(WAIT)
+        assert not helper.is_alive()
+        assert len(results) == 1
+        assert [record[0] for record in io.records] == ["POST", "POST"]
+        assert [request[0] for request in io.requests] == [
+            "/server/database/item", "/server/spoolman/proxy"]
+
+    @pytest.mark.parametrize("body", [b"not json", b"{}", b"null", b"[]"])
+    def test_bad_metadata_envelope_delivers_failure_then_next_callback(
+            self, moonraker_io, body):
+        io = moonraker_io
+        io.raw_responses[0] = body
+        io.responses[1] = {"size": 12}
+        received = []
+        owner = threading.get_ident()
+        io.client.get_file_metadata("bad.gcode", lambda result: received.append(
+            (result, threading.get_ident())))
+        io.client.get_file_metadata("good.gcode", lambda result: received.append(
+            (result, threading.get_ident())))
+        io.wait_idle()
+        assert received == []
+        io.reactor.run_callbacks()
+        assert received == [(None, owner), ({"size": 12}, owner)]
+        assert io.escaped == []
+
+    def test_lane_publication_snapshots_before_waiting_for_http(self, moonraker_io):
+        io = moonraker_io
+        gate = io.gates[0] = threading.Event()
+        io.client.update_afc_stats("hold", 1)
+        io.wait_requests(1)
+        payload = {"namespace": "lane_data", "key": "lane1",
+                   "value": {"material": "PLA"}}
+        io.client.send_lane_data(payload)
+        payload["value"]["material"] = "PETG"
+        try:
+            assert io.records == [("POST", "afc_stats", "hold", "1")]
+            assert io.escaped == []
+        finally:
+            gate.set()
+        io.wait_idle()
+        assert io.requests[1][2] == {
+            "namespace": "lane_data", "key": "lane1",
+            "value": {"material": "PLA"}}
+
+    def test_closed_client_drops_admitted_metadata_callback(self, moonraker_io):
+        io = moonraker_io
+        received = []
+        io.client.get_file_metadata("old.gcode", received.append)
+        io.wait_idle()
+        io.client.join_thread()
+        io.reactor.run_callbacks()
+        assert received == []
+
+
+class TestMetadataRequestGenerations:
+    @pytest.mark.parametrize("restart_filename", ["same.gcode", "new.gcode"])
+    @pytest.mark.parametrize("reset_before_restart", [False, True])
+    def test_restart_rejects_old_reply_and_obsolete_continuation(
+            self, restart_filename, reset_before_restart):
+        callbacks = []
+        client = types.SimpleNamespace(get_file_metadata=lambda filename, callback:
+                                       callbacks.append(callback))
+        metadata = AFC_PrintFileMetaData(client, ThreadLogger())
+        finished = []
+        metadata.query_filename("same.gcode", lambda: finished.append("old"))
+        if reset_before_restart:
+            metadata.reset()
+        metadata.query_filename(restart_filename, lambda: finished.append("new"))
+        callbacks[0]({"filament_change_count": 100, "filament_temps": [280]})
+        assert metadata.tool_change_count == 0
+        assert metadata.tool_temperatures == []
+        assert finished == []
+        callbacks[1]({"filament_change_count": 3, "filament_temps": [210]})
+        assert metadata.tool_change_count == 3
+        assert metadata.tool_temperatures == [210]
+        assert finished == ["new"]
+
+    @pytest.mark.parametrize("client, filename", [(None, "file.gcode"), (None, "")])
+    def test_no_request_still_finishes_once(self, client, filename):
+        metadata = AFC_PrintFileMetaData(client, ThreadLogger())
+        finished = []
+        metadata.query_filename(filename, lambda: finished.append(True))
+        assert finished == [True]
+        assert metadata.tool_change_count == 0
+
+
+class TestDeferredTd1Presence:
+    def test_status_reads_share_refresh_without_fetching_inline(self, afc_connection):
+        obj, io = afc_connection
+        obj.moonraker = io.client
+        obj.printer.state_message = "Printer is ready"
+        obj.function.is_printing.return_value = False
+        io.reactor.monotonic = lambda: 31.
+        assert obj.td1_present is False
+        assert obj.td1_present is False
+        io.client.check_for_td1.assert_not_called()
+        io.reactor.run_callbacks()
+        assert obj.td1_present is True
+        assert io.client.check_for_td1.call_count == 1
+
+    def test_replaced_client_cannot_apply_pending_presence(self, afc_connection):
+        obj, io = afc_connection
+        obj.moonraker = io.client
+        obj.printer.state_message = "Printer is ready"
+        obj.function.is_printing.return_value = False
+        io.reactor.monotonic = lambda: 31.
+        assert obj.td1_present is False
+        obj.moonraker = io.new_client()
+        io.reactor.run_callbacks()
+        assert obj._td1_present is False
+        io.client.check_for_td1.assert_not_called()
+
+
+AFCSpool = load_classes('AFC_spool.py', ['AFCSpool']).AFCSpool
+
+
+class TestSpoolAssignmentGenerations:
+    def setup_spool(self, obj, lane):
+        spool = AFCSpool.__new__(AFCSpool)
+        spool.afc = obj
+        spool.logger = obj.logger
+        spool.disable_weight_check = False
+        spool.creator5_tool_lanes = {}
+        obj.spoolman = "configured"
+        obj.lanes[lane.name] = lane
+        lane.spool_id = 4
+        lane._material = "PETG"
+        lane.filament_density = 1.27
+        lane.send_lane_data = Mock()
+        lane.clear_lane_data = Mock()
+        spool.set_snapmaker_filament_params = Mock()
+        return spool
+
+    @pytest.mark.parametrize("material,densities", [
+        ({"not": "text"}, ["PLA:1.24"]), ("PLA", ["PLA:broken"])])
+    def test_malformed_material_preserves_entire_lane(
+            self, afc_connection, material, densities):
+        obj, io = afc_connection
+        lane = make_lane(obj)
+        spool = self.setup_spool(obj, lane)
+        obj.common_density_values = densities
+        obj.moonraker = io.client
+        io.responses[0] = {
+            "filament": {"material": material, "density": 1.24,
+                         "color_hex": "FFFFFF"}, "remaining_weight": 100}
+        assert spool.set_spoolID(lane, "8") is False
+        assert (lane.spool_id, lane.material, lane.filament_density) == (
+            4, "PETG", 1.27)
+        lane.send_lane_data.assert_not_called()
+        spool.set_snapmaker_filament_params.assert_not_called()
+
+    def test_clear_during_lookup_wins_without_old_publication(self, afc_connection):
+        obj, io = afc_connection
+        lane = make_lane(obj)
+        spool = self.setup_spool(obj, lane)
+
+        def lookup(spool_id):
+            spool.clear_values(lane)
+            return {"filament": {"material": "PLA", "color_hex": "FFFFFF"},
+                    "remaining_weight": 100}
+
+        obj.moonraker = io.client
+        io.client.get_spool = lookup
+        assert spool.set_spoolID(lane, "8") is False
+        assert (lane.spool_id, lane.material, lane.weight) == (None, "", 0)
+        lane.send_lane_data.assert_not_called()
+        spool.set_snapmaker_filament_params.assert_not_called()
+
+    def test_duplicate_appearing_during_lookup_is_rejected(self, afc_connection):
+        obj, io = afc_connection
+        lane = make_lane(obj)
+        spool = self.setup_spool(obj, lane)
+        other = types.SimpleNamespace(spool_id=None)
+        obj.lanes["other"] = other
+
+        def lookup(spool_id):
+            other.spool_id = 8
+            return {"filament": {"material": "PLA", "color_hex": "FFFFFF"},
+                    "remaining_weight": 100}
+
+        obj.moonraker = io.client
+        io.client.get_spool = lookup
+        assert spool.set_spoolID(lane, 8) is False
+        assert lane.spool_id == 4
+        lane.send_lane_data.assert_not_called()
+
+    def test_material_descriptor_validates_before_mutation(self, afc_connection):
+        obj, io = afc_connection
+        lane = make_lane(obj)
+        lane._material = "PETG"
+        lane.filament_density = 1.27
+        with pytest.raises(ValueError, match="Filament material must be text or None"):
+            lane.material = {"truthy": True}
+        assert (lane.material, lane.filament_density) == ("PETG", 1.27)
+
+
+class TestPrintStartMetadataOwnership:
+    def test_delayed_reply_preserves_progress_and_fault_reference(self, afc_connection):
+        obj, io = afc_connection
+        callbacks = []
+        client = types.SimpleNamespace(get_file_metadata=lambda filename, callback:
+                                       callbacks.append(callback))
+        obj.moonraker = io.client
+        obj.print_data_metadata = AFC_PrintFileMetaData(client, obj.logger)
+        obj.function.in_print.return_value = (True, "file.gcode")
+        buffer = Mock()
+        obj.function.get_current_lane_obj.return_value = types.SimpleNamespace(
+            buffer_obj=buffer)
+        io.reactor.unregister_timer = Mock()
+        obj.in_print_timer = object()
+        obj.in_print_reactor_timer(0.)
+        assert obj.in_print_timer is None
+        buffer.update_filament_error_pos.assert_called_once()
+        obj.current_toolchange = 2
+        callbacks[0]({"filament_change_count": 7, "filament_temps": [220]})
+        assert obj.current_toolchange == 2
+        assert obj.number_of_toolchanges == 7
+        assert obj.print_tool_temperatures == [220]
+        buffer.update_filament_error_pos.assert_called_once()
+
+    def test_replaced_metadata_owner_cannot_finish_current_print(self, afc_connection):
+        obj, io = afc_connection
+        old = AFC_PrintFileMetaData(None, obj.logger)
+        obj.print_data_metadata = AFC_PrintFileMetaData(None, obj.logger)
+        obj.function.in_print.return_value = (True, "same.gcode")
+        obj.number_of_toolchanges = 12
+        obj.current_toolchange = 4
+        obj._finish_print_start(old, "same.gcode")
+        assert obj.number_of_toolchanges == 12
+        assert obj.current_toolchange == 4
+
+
+class TestCooperativeBackupReset:
+    @pytest.mark.parametrize("status", [200, 500])
+    def test_reset_waits_for_backup_and_preserves_failure_policy(
+            self, afc_connection, status):
+        obj, io = afc_connection
+        obj.moonraker = io.client
+        gate = io.gates[0] = threading.Event()
+        io.statuses[0] = status
+        io.responses[0] = {"backup_path": "/backup/test.db"}
+        counter = types.SimpleNamespace(reset_count=Mock())
+        obj.lanes["lane1"] = types.SimpleNamespace(
+            name="lane1", lane_load_count=counter)
+        completed = threading.Event()
+        command = types.SimpleNamespace(get=lambda key, default=None:
+                                        "lane1" if key == "LANE" else default)
+        helper = threading.Thread(target=lambda: (
+            obj.cmd_AFC_RESET_STATS(command), completed.set()))
+        helper.start()
+        try:
+            io.wait_requests(1)
+            assert not completed.is_set()
+            counter.reset_count.assert_not_called()
+        finally:
+            gate.set()
+            helper.join(WAIT)
+        assert not helper.is_alive()
+        assert completed.is_set()
+        assert counter.reset_count.call_count == (1 if status == 200 else 0)
+        assert obj.db_backup is (status == 200)
+
+
+class TestSpoolManualSupersession:
+    setup_spool = TestSpoolAssignmentGenerations.setup_spool
+
+    @pytest.mark.parametrize("method, values, field, expected", [
+        ("cmd_SET_COLOR", {"COLOR": "123456"}, "color", "#123456"),
+        ("cmd_SET_WEIGHT", {"WEIGHT": 321.}, "weight", 321.),
+        ("cmd_SET_MATERIAL", {"MATERIAL": "ABS"}, "material", "ABS"),
+        ("cmd_AFC_SET_SPOOL_TEMP", {"BED_TEMP": 80, "EXTRUDER_TEMP": 240},
+         "extruder_temp", 240),
+    ])
+    def test_manual_change_rejects_inflight_reply(
+            self, afc_connection, method, values, field, expected):
+        obj, io = afc_connection
+        lane = make_lane(obj)
+        spool = self.setup_spool(obj, lane)
+        obj.common_density_values = ["ABS:1.04"]
+        command = types.SimpleNamespace(
+            get=lambda key, default=None: {"LANE": lane.name, **values}.get(key, default),
+            get_int=lambda key, default=None, **kwargs: values.get(key, default),
+            get_float=lambda key, default=None: values.get(key, default))
+
+        def lookup(spool_id):
+            getattr(spool, method)(command)
+            return {"filament": {"material": "PLA", "color_hex": "FFFFFF",
+                                 "settings_extruder_temp": 200},
+                    "remaining_weight": 100}
+
+        obj.moonraker = io.client
+        io.client.get_spool = lookup
+        assert spool.set_spoolID(lane, "8") is False
+        assert getattr(lane, field) == expected
+        assert lane.spool_id == 4
+
+
+class TestWorkerResultBridge:
+    @pytest.mark.parametrize("body, expected", [
+        (b'{"result": false}', False), (b'{"result": []}', []),
+        (b'{"result": null}', None), (b'{}', None),
+        (b'not json', None),
+    ])
+    def test_decode_and_close_run_only_on_worker(self, moonraker_io, body, expected):
+        io = moonraker_io
+        owner = threading.get_ident()
+        threads = []
+
+        class Response(stream_io.BytesIO):
+            status = 200
+
+            def read(self, *args):
+                threads.append(threading.get_ident())
+                return super().read(*args)
+
+            def close(self):
+                threads.append(threading.get_ident())
+                return super().close()
+
+        response = Response(body)
+        with patch.dict(AFC_moonraker._get_results.__globals__,
+                        urlopen=lambda *args, **kwargs: response):
+            assert io.client._get_results(io.client.database_url) == expected
+        assert response.closed
+        assert threads and owner not in threads
+        assert set(threads) == {io.client._write_thread.ident}
+
+    def test_worker_exception_returns_to_waiter_and_fifo_keeps_running(self, moonraker_io):
+        io = moonraker_io
+
+        def fail():
+            raise ValueError("controlled worker failure")
+
+        with pytest.raises(ValueError, match="controlled worker failure"):
+            io.client._call_worker(fail, ())
+        io.client.update_afc_stats("later", 2)
+        io.wait_idle()
+        assert io.contents == {("afc_stats", "later"): "2"}
+
+
+class TestTd1RefreshLifecycle:
+    @pytest.mark.parametrize("ready, moving, enabled", [
+        (False, False, True), (True, True, True), (True, False, False)])
+    def test_ineligible_status_never_admits_request(
+            self, afc_connection, ready, moving, enabled):
+        obj, io = afc_connection
+        obj.moonraker = io.client
+        obj.enable_td1_detection = enabled
+        obj.printer.state_message = "Printer is ready" if ready else "Not ready"
+        obj.function.is_printing.return_value = moving
+        io.reactor.monotonic = lambda: 31.
+        assert obj.td1_present is False
+        io.reactor.run_callbacks()
+        io.client.check_for_td1.assert_not_called()
+
+    def test_operational_presence_waits_for_status_refresh(self, afc_connection):
+        obj, io = afc_connection
+        obj.moonraker = io.client
+        obj.printer.state_message = "Printer is ready"
+        obj.function.is_printing.return_value = False
+        io.reactor.monotonic = lambda: 31.
+        assert obj.td1_present is False
+        pending = obj._td1_query_completion
+        results = []
+        helper = threading.Thread(target=lambda: results.append(obj.check_td1_present()))
+        helper.start()
+        assert not pending.test()
+        assert results == []
+        io.reactor.run_callbacks()
+        helper.join(WAIT)
+        assert not helper.is_alive()
+        assert results == [True]
+        assert obj._td1_query_completion is None
+        assert io.client.check_for_td1.call_count == 1
+
+    def test_exception_retains_cache_and_settles_waiter_once(self, afc_connection):
+        obj, io = afc_connection
+        obj.moonraker = io.client
+        obj._td1_present = True
+        obj.printer.state_message = "Printer is ready"
+        obj.function.is_printing.return_value = False
+        io.reactor.monotonic = lambda: 31.
+        io.client.check_for_td1.side_effect = ValueError("controlled refresh failure")
+        assert obj.td1_present is True
+        pending = obj._td1_query_completion
+        io.reactor.run_callbacks()
+        assert pending.wait() is True
+        assert obj._td1_query_completion is None
+        assert obj._td1_present is True
+        assert io.logger.messages == [("error", "TD-1 presence refresh failed")]
+        assert "controlled refresh failure" in io.logger.details[0]["traceback"]
+
+
+class TestMetadataActiveFailures:
+    def test_active_failure_clears_prior_metadata_and_finishes_once(self):
+        callbacks = []
+        client = types.SimpleNamespace(get_file_metadata=lambda filename, callback:
+                                       callbacks.append(callback))
+        metadata = AFC_PrintFileMetaData(client, ThreadLogger())
+        metadata.query_filename("old.gcode")
+        callbacks[0]({"filament_change_count": 5, "filament_temps": [230]})
+        finished = []
+        metadata.query_filename("next.gcode", lambda: finished.append(True))
+        assert metadata.tool_change_count == 0
+        assert metadata.tool_temperatures == []
+        callbacks[1](None)
+        assert metadata.tool_change_count == 0
+        assert metadata.tool_temperatures == []
+        assert finished == [True]
+
+
+class TestSpoolAtomicCommit:
+    setup_spool = TestSpoolAssignmentGenerations.setup_spool
+
+    def test_valid_spool_preserves_density_precedence_and_mapping(self, afc_connection):
+        obj, io = afc_connection
+        lane = make_lane(obj)
+        spool = self.setup_spool(obj, lane)
+        obj.moonraker = io.client
+        obj.ignore_spoolman_material_temps = False
+        obj.common_density_values = ["PLA:1.24"]
+        io.responses[0] = {
+            "filament": {"material": "PLA", "density": 1.3, "diameter": 1.75,
+                         "name": "Silk", "vendor": {"name": "Vendor"},
+                         "multi_color_hexes": "AABBCC,112233",
+                         "settings_extruder_temp": 215, "settings_bed_temp": 60},
+            "remaining_weight": 420, "initial_weight": 1050, "spool_weight": 195}
+        assert spool.set_spoolID(lane, 8) is True
+        assert (lane.spool_id, lane.material, lane.filament_density,
+                lane.filament_diameter, lane.empty_spool_weight, lane.weight,
+                lane.color, lane.multi_color, lane.filament_name, lane.spool_vendor,
+                lane.extruder_temp, lane.bed_temp) == (
+                    8, "PLA", 1.3, 1.75, 195, 420, "#AABBCC",
+                    ["AABBCC", "112233"], "Silk", "Vendor", 215, 60)
+        assert lane.espooler.espooler_values.full_weight == 1050
+        lane.send_lane_data.assert_called_once()
+        spool.set_snapmaker_filament_params.assert_called_once_with(lane)
+
+    @pytest.mark.parametrize("response", [None, {}, {"filament": None},
+        {"filament": {"material": "PLA", "vendor": 1}, "remaining_weight": 100},
+        {"filament": {"material": "PLA", "multi_color_hexes": 5},
+         "remaining_weight": 100}])
+    def test_malformed_lookup_cannot_partially_commit(self, afc_connection, response):
+        obj, io = afc_connection
+        lane = make_lane(obj)
+        spool = self.setup_spool(obj, lane)
+        obj.moonraker = io.client
+        io.responses[0] = response
+        assert spool.set_spoolID(lane, 8) is False
+        assert (lane.spool_id, lane.material, lane.filament_density) == (
+            4, "PETG", 1.27)
+        lane.send_lane_data.assert_not_called()
+        spool.set_snapmaker_filament_params.assert_not_called()
+
+    def test_invalid_weight_is_completed_clear_not_supersession(self, afc_connection):
+        obj, io = afc_connection
+        lane = make_lane(obj)
+        spool = self.setup_spool(obj, lane)
+        obj.moonraker = io.client
+        io.responses[0] = {"filament": {"material": "PLA"}, "remaining_weight": 0}
+        assert spool.set_spoolID(lane, 8) is True
+        assert (lane.spool_id, lane.material, lane.weight) == (None, "", 0)
+        lane.clear_lane_data.assert_called_once()
+        lane.send_lane_data.assert_not_called()
+
+
+class TestResultFailureSettlement:
+    @pytest.mark.parametrize("failure", ["http", "timeout", "connection"])
+    def test_failed_result_settles_and_later_work_succeeds(self, moonraker_io, failure):
+        io = moonraker_io
+        if failure == "http":
+            io.statuses[0] = 500
+        if failure == "timeout":
+            io.client.REQUEST_TIMEOUT = 0.05
+            io.gates[0] = threading.Event()
+        if failure == "connection":
+            with patch.dict(AFC_moonraker._get_results.__globals__,
+                            urlopen=Mock(side_effect=ConnectionRefusedError("refused"))):
+                assert io.client._get_results(io.client.database_url) is None
+        else:
+            try:
+                assert io.client._get_results(io.client.database_url) is None
+            finally:
+                if failure == "timeout":
+                    io.gates[0].set()
+        io.responses[len(io.records)] = {"answer": 42}
+        assert io.client._get_results(io.client.database_url) == {"answer": 42}
+        io.reactor.run_callbacks()
+        errors = [message for level, message in io.logger.messages if level == "error"]
+        assert errors == [io.client.ERROR_STRING]
+
+    def test_closed_result_request_is_rejected_without_http(self, moonraker_io):
+        io = moonraker_io
+        io.client.join_thread()
+        with pytest.raises(RuntimeError, match="AFC Moonraker worker is closed"):
+            io.client.get_spool(8)
+        assert io.records == []
+
+
+class TestSpoolCommandOwnership:
+    setup_spool = TestSpoolAssignmentGenerations.setup_spool
+
+    def test_duplicate_rejected_after_lookup_does_not_update_active_spool(
+            self, afc_connection):
+        obj, io = afc_connection
+        lane = make_lane(obj)
+        spool = self.setup_spool(obj, lane)
+        obj.function.get_current_lane.return_value = lane.name
+        other = types.SimpleNamespace(spool_id=None)
+        obj.lanes["other"] = other
+        spool.set_active_spool = Mock()
+
+        def lookup(spool_id):
+            other.spool_id = 8
+            return {"filament": {"material": "PLA", "color_hex": "FFFFFF"},
+                    "remaining_weight": 100}
+
+        obj.moonraker = io.client
+        io.client.get_spool = lookup
+        command = types.SimpleNamespace(get=lambda key, default=None:
+                                        {"LANE": lane.name, "SPOOL_ID": "8"}.get(
+                                            key, default))
+        spool.cmd_SET_SPOOL_ID(command)
+        assert lane.spool_id == 4
+        spool.set_active_spool.assert_not_called()
+        lane.send_lane_data.assert_not_called()
+
+
+class TestStatusPresenceBoundary:
+    def test_webhook_and_status_share_immediate_cached_presence(self, afc_connection):
+        obj, io = afc_connection
+        obj.moonraker = io.client
+        obj.printer.state_message = "Printer is ready"
+        obj.function.is_printing.return_value = False
+        io.reactor.monotonic = lambda: 31.
+        request = Mock()
+        with patch.object(obj, "get_bypass_state", return_value=False), \
+                patch.object(obj, "_get_quiet_mode", return_value=False):
+            assert obj.get_status()["td1_present"] is False
+        obj._webhooks_status(request)
+        assert request.send.call_args.args[0]["status:"]["AFC"]["system"][
+            "td1_present"] is False
+        io.client.check_for_td1.assert_not_called()
+        io.reactor.run_callbacks()
+        assert io.client.check_for_td1.call_count == 1
+
+
+class TestTd1DeliveryRechecks:
+    @pytest.mark.parametrize("change", ["closed", "moving", "not_ready", "disabled"])
+    def test_pending_refresh_rechecks_runtime_guards(self, afc_connection, change):
+        obj, io = afc_connection
+        obj.moonraker = io.client
+        obj.printer.state_message = "Printer is ready"
+        obj.function.is_printing.return_value = False
+        io.reactor.monotonic = lambda: 31.
+        assert obj.td1_present is False
+        pending = obj._td1_query_completion
+        if change == "closed":
+            io.client.join_thread()
+        elif change == "moving":
+            obj.function.is_printing.return_value = True
+        elif change == "not_ready":
+            obj.printer.state_message = "Not ready"
+        else:
+            obj.enable_td1_detection = False
+        io.reactor.run_callbacks()
+        assert pending.wait() is False
+        assert obj._td1_query_completion is None
+        assert obj._td1_present is False
+        io.client.check_for_td1.assert_not_called()
+
+
+class TestPrintTimerReplacement:
+    def test_file_reset_removes_previous_timer_before_registering_new(
+            self, afc_connection):
+        obj, io = afc_connection
+        old, replacement = object(), object()
+        events = []
+        obj.in_print_timer = old
+        io.reactor.unregister_timer = lambda timer: events.append(("unregister", timer))
+        io.reactor.register_timer = lambda callback, when: (
+            events.append(("register", callback)), replacement)[1]
+        obj._reset_file_callback()
+        assert events == [
+            ("unregister", old), ("register", obj.in_print_reactor_timer)]
+        assert obj.in_print_timer is replacement
+
+
+class TestSpoolClearAndNoop:
+    setup_spool = TestSpoolAssignmentGenerations.setup_spool
+
+    @pytest.mark.parametrize("configured, remember", [
+        (True, False), (True, True), (False, False), (False, True)])
+    def test_explicit_clear_or_remembered_noop_completes_without_lookup(
+            self, afc_connection, configured, remember):
+        obj, io = afc_connection
+        lane = make_lane(obj)
+        spool = self.setup_spool(obj, lane)
+        obj.spoolman = "configured" if configured else None
+        obj.moonraker = io.client
+        io.client.get_spool = Mock(side_effect=AssertionError("unexpected lookup"))
+        lane.remember_spool = remember
+        assert spool.set_spoolID(lane, "") is True
+        assert lane.spool_id == (4 if remember else None)
+        assert lane.clear_lane_data.call_count == (0 if remember else 1)
+
+    def test_unknown_material_retains_density_without_partial_update(self, afc_connection):
+        obj, io = afc_connection
+        lane = make_lane(obj)
+        lane._material = "PETG"
+        lane.filament_density = 1.27
+        lane.material = "Unlisted"
+        assert (lane.material, lane.filament_density) == ("Unlisted", 1.27)
+
+
+class TestDetachedSpoolOwner:
+    setup_spool = TestSpoolAssignmentGenerations.setup_spool
+
+    def test_replaced_lane_cannot_receive_old_assignment(self, afc_connection):
+        obj, io = afc_connection
+        lane = make_lane(obj)
+        spool = self.setup_spool(obj, lane)
+        replacement = types.SimpleNamespace(spool_id=None)
+
+        def lookup(spool_id):
+            obj.lanes[lane.name] = replacement
+            return {"filament": {"material": "PLA", "color_hex": "FFFFFF"},
+                    "remaining_weight": 100}
+
+        obj.moonraker = io.client
+        io.client.get_spool = lookup
+        assert spool.set_spoolID(lane, 8) is False
+        assert lane.spool_id == 4
+        assert replacement.spool_id is None
+        lane.send_lane_data.assert_not_called()
+        spool.set_snapmaker_filament_params.assert_not_called()
+
+
+class TestSpoolConfiguredPrecedence:
+    setup_spool = TestSpoolAssignmentGenerations.setup_spool
+
+    def test_ignored_temperatures_and_missing_density_keep_existing_precedence(
+            self, afc_connection):
+        obj, io = afc_connection
+        lane = make_lane(obj)
+        spool = self.setup_spool(obj, lane)
+        obj.moonraker = io.client
+        obj.ignore_spoolman_material_temps = True
+        spool.disable_weight_check = True
+        lane.extruder_temp = 260
+        io.responses[0] = {"filament": {"settings_extruder_temp": 190,
+                                      "color_hex": "FFFFFF"},
+                           "remaining_weight": 0}
+        assert spool.set_spoolID(lane, 8, save_vars=False) is True
+        assert lane.material is None
+        assert lane.filament_density is None
+        assert lane.extruder_temp == 260
+        assert lane.weight == 0
+        assert lane.color == "#FFFFFF"
+
+
+class TestRemainingPresenceBoundaries:
+    def test_disabled_operational_and_scheduler_return_without_request(self, afc_connection):
+        obj, io = afc_connection
+        obj.moonraker = io.client
+        obj.enable_td1_detection = False
+        assert obj._schedule_td1_refresh() is None
+        assert obj.check_td1_present() is False
+        io.client.check_for_td1.assert_not_called()
+
+    @pytest.mark.parametrize("cached", [False, True])
+    def test_operational_cache_without_eligible_refresh(self, afc_connection, cached):
+        obj, io = afc_connection
+        obj.moonraker = io.client
+        obj.printer.state_message = "Printer is ready"
+        obj.function.is_printing.return_value = False
+        obj._td1_present = cached
+        assert obj.check_td1_present() is cached
+        io.client.check_for_td1.assert_not_called()
+
+    @pytest.mark.parametrize("close_client", [False, True])
+    def test_owner_change_during_query_discards_returned_presence(
+            self, afc_connection, close_client):
+        obj, io = afc_connection
+        obj.moonraker = io.client
+        obj.printer.state_message = "Printer is ready"
+        obj.function.is_printing.return_value = False
+        io.reactor.monotonic = lambda: 31.
+
+        def query():
+            if close_client:
+                io.client.join_thread()
+            else:
+                obj.moonraker = io.new_client()
+            return True, True, True
+
+        io.client.check_for_td1.side_effect = query
+        assert obj.td1_present is False
+        pending = obj._td1_query_completion
+        io.reactor.run_callbacks()
+        assert pending.wait() is False
+        assert obj._td1_present is False
+
+    def test_obsolete_completion_does_not_clear_new_pending_slot(self, afc_connection):
+        obj, io = afc_connection
+        obj.moonraker = io.new_client()
+        newer = io.reactor.completion()
+        obj._td1_query_completion = newer
+        obsolete = io.reactor.completion()
+        # Deliver an abandoned callback against the replaced client.
+        obj._refresh_td1_present(0., obsolete, io.client)
+        assert obsolete.wait() is False
+        assert obj._td1_query_completion is newer
+        assert not newer.test()
+        io.client.check_for_td1.assert_not_called()
+
+
+class TestRemainingMetadataBoundaries:
+    @pytest.mark.parametrize("printing", [False, True])
+    @pytest.mark.parametrize("lane", [None, types.SimpleNamespace(buffer_obj=None)])
+    def test_timer_without_metadata_owner_finishes_without_http(
+            self, afc_connection, printing, lane):
+        obj, io = afc_connection
+        obj.moonraker = None
+        obj.print_data_metadata = None
+        obj.function.in_print.return_value = (printing, "file.gcode")
+        obj.function.get_current_lane_obj.return_value = lane
+        obj.number_of_toolchanges = 3
+        obj.current_toolchange = 2
+        io.reactor.unregister_timer = Mock()
+        obj.in_print_timer = object()
+        assert obj.in_print_reactor_timer(0.) == io.reactor.NEVER
+        assert obj.in_print_timer is None
+        assert obj.current_toolchange == 2
+        assert obj.number_of_toolchanges == (0 if printing else 3)
+        assert io.records == []
+
+    def test_current_owner_different_print_does_not_apply_counts(self, afc_connection):
+        obj, io = afc_connection
+        metadata = AFC_PrintFileMetaData(None, obj.logger)
+        obj.print_data_metadata = metadata
+        obj.function.in_print.return_value = (True, "other.gcode")
+        obj.number_of_toolchanges = 4
+        obj._finish_print_start(metadata, "old.gcode")
+        assert obj.number_of_toolchanges == 4
+
+    def test_no_client_without_continuation_clears_old_cache(self):
+        metadata = AFC_PrintFileMetaData(None, ThreadLogger())
+        metadata._metadata = {"filament_change_count": 7}
+        metadata.query_filename("file.gcode")
+        assert metadata.filename == "file.gcode"
+        assert metadata.tool_change_count == 0
+
+
+class TestLanePublicationFailure:
+    def test_http_failure_reports_on_owner_and_does_not_stop_fifo(self, moonraker_io):
+        io = moonraker_io
+        io.statuses[0] = 500
+        io.client.send_lane_data({"namespace": "lane_data", "key": "lane1",
+                                  "value": {"material": "PLA"}})
+        io.client.update_afc_stats("later", 2)
+        io.wait_idle()
+        assert io.logger.messages == []
+        io.reactor.run_callbacks()
+        assert io.logger.messages == [
+            ("error", io.client.ERROR_STRING),
+            ("error", "Error sending lane data, check AFC.log for more information")]
+        assert io.logger.threads == [threading.get_ident()] * 2
+        assert io.contents == {("afc_stats", "later"): "2"}
+
+    def test_invalid_json_payload_does_not_admit_partial_request(self, moonraker_io):
+        io = moonraker_io
+        with pytest.raises(TypeError):
+            io.client.send_lane_data({"value": object()})
+        io.client.update_afc_stats("later", 2)
+        io.wait_idle()
+        assert io.records == [("POST", "afc_stats", "later", "2")]
+
+
+afcFunction = load_classes(
+    'AFC_functions.py', ['afcFunction'],
+    {'AFCprompt': lambda *args: Mock()}).afcFunction
+afcPrep = load_classes('AFC_prep.py', ['afcPrep']).afcPrep
+
+
+class TestOperationalPresenceConsumers:
+    @pytest.mark.parametrize("present", [False, True])
+    def test_lane_capture_uses_operational_presence(self, afc_connection, present):
+        obj, io = afc_connection
+        lane = make_lane(obj)
+        obj.moonraker = io.client
+        obj._td1_present = present
+        obj.printer.state_message = "Printer is ready"
+        obj.function.is_printing.return_value = False
+        lane.td1_device_id = "serial"
+        obj.function.check_for_td1_id.return_value = (True, None)
+        lane.unit_obj.get_td1_data = Mock()
+        lane.get_td1_data_load()
+        assert lane.unit_obj.get_td1_data.call_count == int(present)
+
+    @pytest.mark.parametrize("present", [False, True])
+    def test_prep_capture_requires_operational_presence(self, afc_connection, present):
+        obj, io = afc_connection
+        lane = make_lane(obj)
+        obj.lanes[lane.name] = lane
+        obj.moonraker = io.client
+        obj._td1_present = present
+        obj.printer.state_message = "Printer is ready"
+        obj.function.is_printing.return_value = False
+        obj.function.get_current_lane_obj.return_value = None
+        obj.function.check_for_td1_error.return_value = (False, None)
+        lane.td1_device_id = "serial"
+        lane.prep_state = True
+        lane.get_td1_data = Mock(return_value=(True, "captured"))
+        prep = afcPrep.__new__(afcPrep)
+        prep.afc, prep.logger, prep.get_td1_data = obj, io.logger, True
+        prep._td1_prep(True)
+        assert lane.get_td1_data.call_count == int(present)
+        assert obj.function.check_for_td1_error.call_count == int(present)
+
+    @pytest.mark.parametrize("present", [False, True])
+    def test_calibration_accepts_fresh_presence_without_moving_fixture(
+            self, afc_connection, present):
+        obj, io = afc_connection
+        lane = make_lane(obj)
+        obj.lanes[lane.name] = lane
+        lane.hub_obj = types.SimpleNamespace(state=False)
+        lane.unit_obj.calibrate_td1 = Mock(return_value=(True, "", 0.))
+        obj.moonraker = io.client
+        obj.function.get_current_lane.return_value = None
+        obj.function.is_printing.return_value = False
+        obj.printer.state_message = "Printer is ready"
+        io.reactor.monotonic = lambda: 31.
+        io.client.check_for_td1.return_value = (True, present, True)
+        function = afcFunction.__new__(afcFunction)
+        function.afc, function.logger = obj, io.logger
+        function._afc_cali_comp = Mock()
+        command = types.SimpleNamespace(
+            get=lambda key, default=None: lane.name if key == "TD1" else default,
+            get_float=lambda key, default=None: default)
+        assert obj.td1_present is False
+        pending = obj._td1_query_completion
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            result = executor.submit(function.cmd_CALIBRATE_AFC, command)
+            assert pending.wait_started.wait(WAIT)
+            lane.unit_obj.calibrate_td1.assert_not_called()
+            io.reactor.run_callbacks()
+            result.result(timeout=WAIT)
+        assert lane.unit_obj.calibrate_td1.call_count == int(present)
+        assert function._afc_cali_comp.call_count == int(present)
+        assert io.client.check_for_td1.call_count == 1
+
+
+class TestSpoolCommandCompletionBoundaries:
+    setup_spool = TestSpoolAssignmentGenerations.setup_spool
+
+    def test_loaded_lane_success_updates_led_and_active_spool_after_lookup(
+            self, afc_connection):
+        obj, io = afc_connection
+        lane = make_lane(obj)
+        spool = self.setup_spool(obj, lane)
+        obj.moonraker = io.client
+        obj.function.get_current_lane.return_value = lane.name
+        obj.units[lane.unit] = lane.unit_obj
+        lane.unit_obj._get_lane_color = Mock(return_value="#FFFFFF")
+        spool.set_active_spool = Mock()
+        io.responses[0] = {"filament": {"material": "PLA", "color_hex": "FFFFFF"},
+                           "remaining_weight": 100}
+        command = types.SimpleNamespace(get=lambda key, default=None:
+                                        {"LANE": lane.name, "SPOOL_ID": "8"}.get(
+                                            key, default))
+        spool.cmd_SET_SPOOL_ID(command)
+        assert lane.spool_id == 8
+        obj.function.afc_led.assert_called_once_with("#FFFFFF", lane.led_index)
+        spool.set_active_spool.assert_called_once_with(8)
+        lane.send_lane_data.assert_called_once()
+
+    @pytest.mark.parametrize("response", [None, {"filament": None}])
+    def test_creator5_failed_real_lookup_preserves_record_and_gcode_error(
+            self, afc_connection, response):
+        obj, io = afc_connection
+        obj.moonraker = io.client
+        obj.spoolman = "configured"
+        spool = AFCSpool.__new__(AFCSpool)
+        spool.afc = obj
+        spool.creator5_tool_lanes = {"T2": 2}
+        records = [{"material": "PETG", "color": "#112233"} for _ in range(4)]
+        spool.creator5_filament_sync = Mock(filaments=records)
+        command = types.SimpleNamespace(
+            get=lambda key, default=None: {"LANE": "T2", "SPOOL_ID": "8"}.get(
+                key, default), error=ValueError)
+        io.responses[0] = response
+        with pytest.raises(ValueError, match="Cannot assign spool to T2: Spool ID not found"):
+            spool.cmd_SET_SPOOL_ID(command)
+        assert io.requests[0][0] == "/server/spoolman/proxy"
+        assert records[2] == {"material": "PETG", "color": "#112233"}
+        spool.creator5_filament_sync.set_tool_fields.assert_not_called()
