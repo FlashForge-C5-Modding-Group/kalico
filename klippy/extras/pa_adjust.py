@@ -1,6 +1,4 @@
-# Printer cooling fan
-#
-# Copyright (C) 2016-2024  Kevin O'Connor <kevin@koconnor.net>
+# Creator 5 eboard pressure-advance measurement
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 from . import pulse_counter, output_pin
@@ -17,6 +15,7 @@ class PrinterPA:
         self.mcu.register_config_callback(self.build_config)
         self._pa_value_get_cmd = None
         self._pa_action_cmd = None
+        self._pa_stream_cmd = None
         #start end
     def build_config(self):
         self._pa_value_get_cmd = self.mcu.lookup_query_command(
@@ -25,6 +24,11 @@ class PrinterPA:
 
         self._pa_action_cmd = self.mcu.lookup_command(
             "pa_action action=%u pc=%u")
+        # Only OpenCreator eboard firmware records the readings themselves.
+        if self.mcu.try_lookup_command("get_pa_stream index=%hu") is not None:
+            self._pa_stream_cmd = self.mcu.lookup_query_command(
+                "get_pa_stream index=%hu",
+                "pa_stream index=%hu total=%hu start=%u data=%*s")
     def cmd_PA_ACTION(self, gcmd):
         #0:PA_close  1:PA_start
         action = gcmd.get_int('ACTION', 0)
@@ -37,6 +41,27 @@ class PrinterPA:
 
     def pa_get_value(self):
         return self._pa_value_get_cmd.send()["value"]
+
+    def has_stream(self):
+        return self._pa_stream_cmd is not None
+
+    def read_stream(self):
+        """[(print_time, SG_RESULT)] of the last PA_ACTION capture."""
+        if self._pa_stream_cmd is None:
+            raise self.printer.command_error(
+                'eboard firmware cannot report its PA readings; update it')
+        samples, index = [], 0
+        while True:
+            result = self._pa_stream_cmd.send([index])
+            data = bytearray(result['data'])
+            for i in range(0, len(data) - 5, 6):
+                clock = self.mcu.clock32_to_clock64(
+                    int.from_bytes(data[i + 2:i + 6], 'little'))
+                samples.append((self.mcu.clock_to_print_time(clock),
+                                data[i] | data[i + 1] << 8))
+            index += len(data) // 6
+            if not data or index >= result['total']:
+                return samples
 
     def cmd_PA_GET(self, gcmd):
         # Get PA value

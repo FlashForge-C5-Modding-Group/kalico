@@ -108,6 +108,10 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board.printer = mock.Mock()
         self.board.printer.lookup_object.return_value.get_status.return_value = {
             'homing_origin': (.1, .2, .3, 0.)}
+        # Outboard of approach_x, so dock-lane travel stays X then Y.
+        self.board.printer.lookup_object.return_value.get_position.return_value = [
+            300., 0., 10., 0.]
+        self.board.pickup_minimum_cruise_ratio = None
         self.stepper_enable = types.SimpleNamespace(
             get_steppers=lambda: ['extruder'],
             set_motors_enable=lambda names, enable: False)
@@ -146,6 +150,8 @@ class Creator5OffsetTests(unittest.TestCase):
                 objects = {
                     'AFC': afc,
                     'AFC_extruder ' + alias: extruder,
+                    'toolhead': types.SimpleNamespace(
+                        get_position=lambda: [300., 0., 10., 0.]),
                     'gcode_move': types.SimpleNamespace(
                         get_status=lambda: {'homing_origin': (0., 0., 2., 0.)})}
                 self.board.printer.lookup_object.side_effect = (
@@ -660,6 +666,16 @@ class Creator5OffsetTests(unittest.TestCase):
         board._run.assert_any_call('SET_GCODE_OFFSET X=0 Y=0 MOVE=0')
         self.assertFalse(any(' Z=0 ' in call.args[0] for call in
                              board._run.call_args_list))
+
+    def test_dock_lane_travel_is_diagonal_from_inboard(self):
+        board = self.board
+        board.approach_x = 250.
+        board._move = mock.Mock()
+        board.printer.lookup_object.return_value.get_position.return_value = [
+            150., 150., 10., 0.]
+        board._travel_to_lane(50., 36000.)
+        self.assertEqual(board._move.call_args_list, [
+            mock.call(x=250., y=50., feed=36000.)])
 
     def test_pickup_speeds_come_from_config(self):
         board = self.board
@@ -1730,9 +1746,9 @@ class Creator5OffsetTests(unittest.TestCase):
                                                    SAVE=0))
         self.assertEqual(self.board._probe_stock_pin.call_count, 2)
         self.assertEqual(self.board._probe_stock_pin.call_args_list[0].args[1:],
-                         (43., 226.))
+                         (43., 226., 3))
         self.assertEqual(self.board._probe_stock_pin.call_args_list[1].args[1:],
-                         (28.5, 214.5))
+                         (28.5, 214.5, 3))
         self.assertEqual(self.board._run.call_args_list[0].args[0],
                          'C5_LEVELBOARD_REFERENCE_CALIBRATE SAVE=0 '
                          'BUILDPLATE_REMOVED=1')
