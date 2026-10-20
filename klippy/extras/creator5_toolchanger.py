@@ -899,6 +899,16 @@ class Creator5Toolchanger:
         parts.append('F%d' % feed)
         self._run(' '.join(parts))
 
+    def _travel_to_lane(self, y, feed):
+        # Inboard of approach_x nothing sits between the head and the dock
+        # lane, so go there in one diagonal move instead of X then Y.
+        toolhead = self.printer.lookup_object('toolhead')
+        if toolhead.get_position()[0] <= self.approach_x + .001:
+            self._move(x=self.approach_x, y=y, feed=feed)
+        else:
+            self._move(x=self.approach_x, feed=feed)
+            self._move(y=y, feed=feed)
+
     def _raise_z(self):
         toolhead = self.printer.lookup_object('toolhead')
         if toolhead.get_position()[2] < self.safe_z:
@@ -989,8 +999,7 @@ class Creator5Toolchanger:
         self._run('SET_GCODE_OFFSET X=0 Y=0 MOVE=0')
         if raise_z:
             self._raise_z()
-        self._move(x=self.approach_x, feed=clear_feed)
-        self._move(y=y, feed=clear_feed)
+        self._travel_to_lane(y, clear_feed)
         self._move(x=x - self.dock_predock_offset, feed=clear_feed)
         self._move(x=x - 10., feed=self.dock_approach_speed * 60.)
         self._move(x=x, feed=self.dock_approach_speed * 60.)
@@ -1058,8 +1067,7 @@ class Creator5Toolchanger:
         self._apply_offsets(tool)
         if raise_z:
             self._raise_z()
-        self._move(x=self.approach_x, feed=clear_feed)
-        self._move(y=y, feed=clear_feed)
+        self._travel_to_lane(y, clear_feed)
         self._move(x=self.pre_dock_x,
                    feed=self.pickup_predock_speed * 60.)
         self._move(x=x, feed=self.pickup_latch_speed * 60.)
