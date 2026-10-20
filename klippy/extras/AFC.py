@@ -79,13 +79,19 @@ def load_config(config):
     return afc(config)
 
 class afc:
-    def __init__(self, config: ConfigWrapper):
+    def __init__(self, config: ConfigWrapper) -> None:
+        """
+        Initialize AFC configuration and lazy Moonraker statistics ownership.
+
+        :param config: AFC configuration section.
+        """
         self.config  = config
         self.printer = config.get_printer()
         self.reactor = self.printer.get_reactor()
         self.webhooks = self.printer.load_object(config, 'webhooks')
         self.printer.register_event_handler("klippy:connect",self.handle_connect)
         self.printer.register_event_handler("klippy:ready", self.handle_ready)
+        self.printer.register_event_handler("klippy:disconnect", self._handle_disconnect)
         self.logger  = AFC_logger(self.printer, self)
 
         self.spool: AFCSpool = self.printer.load_object(config, 'AFC_spool')
@@ -111,10 +117,12 @@ class afc:
         self.position_saved     = False
         self.spoolman           = None
         self.moonraker: Optional[AFC_moonraker] = None
+        self.afc_stats: Optional[AFCStats] = None
         self.print_data_metadata : Optional[AFC_PrintFileMetaData] = None
         self.td1_defined        = False
         self._td1_present       = False
         self._last_td1_query:float    = 0
+        self._td1_query_completion = None
         self.lane_data_enabled  = False
         self.prep_done          = False         # Variable used to hold of save_vars function from saving too early and overriding save before prep can be ran
         self.in_print_timer     = None
@@ -405,16 +413,23 @@ class afc:
         if lane_obj.unit_obj.type != "ViViD":
             self.gcode.register_mux_command('HUB_LOAD',     "LANE", lane_obj.name, self.cmd_HUB_LOAD,       desc=self.cmd_HUB_LOAD_help)
 
-    def handle_moonraker_connect(self):
-        """
-        Function that should be called at the beginning of PREP so that moonraker has
-        enough time to start before AFC tries to connect. This fixes a race condition that can
-        happen between klipper and moonraker when first starting up.
-        """
+    def _handle_disconnect(self) -> None:
+        """Attempt admitted statistics work after the reactor stops."""
+        if self.moonraker is not None:
+            self.moonraker.join_thread()
 
+    def handle_moonraker_connect(self) -> Optional[bool]:
+        """
+        Connect during PREP while retaining initialized statistics and worker.
+
+        :return: False when readiness times out, otherwise None.
+        """
         try:
-            self.moonraker = AFC_moonraker( self.moonraker_host, self.moonraker_port, self.logger )
-            if not self.moonraker.wait_for_moonraker( toolhead=self.toolhead, timeout=self.moonraker_connect_to ):
+            if self.moonraker is None:
+                self.moonraker = AFC_moonraker(
+                    self.moonraker_host, self.moonraker_port, self.logger, self.reactor)
+            if not self.moonraker.wait_for_moonraker(
+                    toolhead=self.toolhead, timeout=self.moonraker_connect_to):
                 return False
 
             # Remove current lane_data from database before pushing data back up so that
@@ -431,7 +446,8 @@ class afc:
                     self.toolhead.dwell(1)
             if self.enable_td1_detection:
                 self.td1_defined, self._td1_present, self.lane_data_enabled = self.moonraker.check_for_td1()
-            self.afc_stats = AFCStats(self.moonraker, self.logger, len(self.tools) > 1)
+            if self.afc_stats is None:
+                self.afc_stats = AFCStats(self.moonraker, self.logger, len(self.tools) > 1)
             self.print_data_metadata = AFC_PrintFileMetaData(moonraker=self.moonraker,
                                                              logger=self.logger)
 
@@ -603,17 +619,57 @@ class afc:
     def td1_present(self):
         if not self.enable_td1_detection:
             return False
-        present = self._td1_present
-        current_time = self.reactor.monotonic()
-        if (self.printer.state_message == 'Printer is ready'
-            and self.moonraker is not None
-            and (current_time - self._last_td1_query) > 30 ):
-            if not self.function.is_printing(check_movement=True):
-                self._last_td1_query = current_time
-                present = self.moonraker.check_for_td1()[1]
-                self._td1_present = present
+        self._schedule_td1_refresh()
+        return self._td1_present
 
-        return present
+    def _schedule_td1_refresh(self) -> Optional[Any]:
+        """Schedule one eligible presence query without yielding from status."""
+        if not self.enable_td1_detection:
+            return None
+        if self._td1_query_completion is not None:
+            return self._td1_query_completion
+        client = self.moonraker
+        current_time = self.reactor.monotonic()
+        if (self.printer.state_message != 'Printer is ready'
+            or client is None or client._closing
+            or (current_time - self._last_td1_query) <= 30
+            or self.function.is_printing(check_movement=True)):
+            return None
+        completion = self.reactor.completion()
+        self._td1_query_completion = completion
+        self._last_td1_query = current_time
+        self.reactor.register_async_callback(
+            lambda eventtime: self._refresh_td1_present(eventtime, completion, client))
+        return completion
+
+    def _refresh_td1_present(self, eventtime: float, completion: Any,
+                             client: AFC_moonraker) -> None:
+        """Refresh cached presence only while the captured client is current."""
+        try:
+            if (not self.enable_td1_detection
+                or self.printer.state_message != 'Printer is ready'
+                or client is not self.moonraker or client._closing
+                or self.function.is_printing(check_movement=True)):
+                return
+            present = client.check_for_td1()[1]
+            if client is self.moonraker and not client._closing:
+                self._td1_present = present
+        except Exception:
+            self.logger.error("TD-1 presence refresh failed",
+                              traceback=traceback.format_exc())
+        finally:
+            if self._td1_query_completion is completion:
+                self._td1_query_completion = None
+            completion.complete(self._td1_present)
+
+    def check_td1_present(self) -> bool:
+        """Await an eligible/shared refresh for result-dependent operations."""
+        if not self.enable_td1_detection:
+            return False
+        completion = self._schedule_td1_refresh()
+        if completion is not None:
+            completion.wait()
+        return self._td1_present if self.enable_td1_detection else False
 
     def _reset_file_callback(self):
         """
@@ -622,6 +678,9 @@ class afc:
 
         AFC errors are also reset as well as pause states are cleared in klipper's pause_resume module
         """
+        if self.in_print_timer is not None:
+            self.reactor.unregister_timer(self.in_print_timer)
+            self.in_print_timer = None
         if self.enable_print_metadata:
             self.in_print_timer = self.reactor.register_timer(
                 self.in_print_reactor_timer,
@@ -643,18 +702,13 @@ class afc:
         """
         # Remove timer from reactor
         self.reactor.unregister_timer(self.in_print_timer)
+        self.in_print_timer = None
         # Check to see if printer is printing and return filament
         in_print, print_filename = self.function.in_print(return_file=True)
         self.logger.debug("In print: {}, Filename: {}".format(in_print, print_filename))
         if in_print:
             self.number_of_toolchanges = 0
-            if (self.moonraker is not None
-                and self.print_data_metadata):
-                self.print_data_metadata.filename = print_filename
-                self.number_of_toolchanges = self.print_data_metadata.tool_change_count
-                self.print_tool_temperatures = self.print_data_metadata.tool_temperatures
-            self.current_toolchange     = -1 # Reset
-            self.logger.info("Total number of toolchanges set to {}".format(self.number_of_toolchanges))
+            metadata = self.print_data_metadata
 
             # Get current lane and update position to reset fault detection as sometimes
             # purging in PRINT_START can lead to false positive detections
@@ -662,8 +716,26 @@ class afc:
             if current_lane:
                 if current_lane.buffer_obj is not None:
                     current_lane.buffer_obj.update_filament_error_pos()
+            if self.moonraker is not None and metadata is not None:
+                metadata.query_filename(
+                    print_filename,
+                    on_fetched=lambda: self._finish_print_start(metadata, print_filename))
+            else:
+                self._finish_print_start(metadata, print_filename)
 
         return self.reactor.NEVER
+
+    def _finish_print_start(self, metadata: Optional[AFC_PrintFileMetaData],
+                            filename: str) -> None:
+        """Apply metadata only to the captured owner's still-current print."""
+        if (metadata is not self.print_data_metadata
+            or self.function.in_print(return_file=True) != (True, filename)):
+            return
+        if metadata is not None:
+            self.number_of_toolchanges = metadata.tool_change_count
+            self.print_tool_temperatures = metadata.tool_temperatures
+        self.logger.info("Total number of toolchanges set to {}".format(
+            self.number_of_toolchanges))
 
     def _get_default_material_temps(self, cur_lane):
         """

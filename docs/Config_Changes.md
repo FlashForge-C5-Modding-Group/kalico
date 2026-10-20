@@ -8,6 +8,22 @@ All dates in this document are approximate.
 
 ## Changes
 
+20261020: AFC `PREP` now retains current statistics, including unsent
+espooler runtime. Restart Klippy to reload counters edited externally
+in Moonraker. AFC Moonraker HTTP now runs on its FIFO worker rather than
+blocking reactor dispatch. Result-dependent operations (including spool
+lookups, cleanup and backups) wait cooperatively; statistics mutations,
+lane publication and print-metadata queries return without waiting for
+HTTP. PREP cleanup still finishes before the connection event enables
+Creator 5 inventory publication, whose independent executor is unchanged.
+TD-1 status reports cached presence while an eligible refresh is pending;
+operations that need presence await that refresh. Superseded metadata and
+spool replies cannot overwrite newer print or filament assignments.
+Disconnect attempts admitted worker operations once in FIFO order; this
+does not guarantee durable delivery or a fixed shutdown deadline. These
+changes address network stalls, not an established cause of printer
+timing shutdowns.
+
 20261002: Homing with a physical endstop no longer backs off by
 `homing_retract_dist` after the final touch; the axis stays on the
 endstop, as in Klipper. The final back-off now only applies to
