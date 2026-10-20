@@ -147,6 +147,11 @@ class Creator5Toolchanger:
         self.max_offset_correction = config.getfloat(
             'max_offset_correction', 3., above=0.)
         self.pickup_accel = config.getfloat('pickup_accel', 8000., above=0.)
+        # Toolchange moves are short: with the printer's minimum_cruise_ratio
+        # they never reach their speed, so a lower ratio lets them use the
+        # full pickup_accel. Unset keeps the printer's own.
+        self.pickup_minimum_cruise_ratio = config.getfloat(
+            'pickup_minimum_cruise_ratio', None, minval=0., below=1.)
         self.clear_travel_speed = config.getfloat(
             'clear_travel_speed', 80., above=0.)
         self.clearance_z_speed = config.getfloat(
@@ -1079,7 +1084,10 @@ class Creator5Toolchanger:
                    feed=self.pickup_departure_speed * 60.)
 
     def _with_motion(self, gcmd, operation, final_accel=None):
-        old_accel = self.printer.lookup_object('toolhead').get_max_velocity()[1]
+        toolhead = self.printer.lookup_object('toolhead')
+        old_accel = toolhead.get_max_velocity()[1]
+        old_mcr = toolhead.get_status(
+            self.printer.get_reactor().monotonic()).get('minimum_cruise_ratio')
         gcode_move = self.printer.lookup_object('gcode_move')
         was_absolute = gcode_move.get_status().get('absolute_coordinates')
         self._ui_sensor_cache = None
@@ -1088,6 +1096,9 @@ class Creator5Toolchanger:
         try:
             self._run('G90')
             self._run('SET_VELOCITY_LIMIT ACCEL=%.0f' % self.pickup_accel)
+            if self.pickup_minimum_cruise_ratio is not None and old_mcr is not None:
+                self._run('SET_VELOCITY_LIMIT MINIMUM_CRUISE_RATIO=%.3f'
+                          % self.pickup_minimum_cruise_ratio)
             result = operation()
             completed = True
             return result
@@ -1097,6 +1108,9 @@ class Creator5Toolchanger:
                                  final_accel is not None else old_accel)
                 self._run('SET_VELOCITY_LIMIT ACCEL=%.4f'
                           % restore_accel)
+                if self.pickup_minimum_cruise_ratio is not None and old_mcr is not None:
+                    self._run('SET_VELOCITY_LIMIT MINIMUM_CRUISE_RATIO=%.6f'
+                              % old_mcr)
                 if not was_absolute:
                     self._run('G91')
             finally:
