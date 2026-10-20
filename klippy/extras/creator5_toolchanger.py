@@ -1421,7 +1421,8 @@ class Creator5Toolchanger:
         old[0], old[1] = x, y
         gcmd.respond_info('T%d levelboard XY X=%.4f Y=%.4f' % (tool, x, y))
 
-    def _probe_stock_pin(self, gcmd, x, y):
+    def _probe_stock_pin(self, gcmd, x, y, runs=3):
+        # runs: probe runs to compare (each is [probe] samples taps).
         # Kalico's probe.py has no get_probe_params()/start_probe_session()
         # (those are mainline klipper's ProbeSessionHelper API) -- its
         # PrinterProbe.run_probe(gcmd) already does its own multi-sample
@@ -1439,10 +1440,10 @@ class Creator5Toolchanger:
         probe.multi_probe_begin(always_restore_toolhead=True)
         try:
             values = []
-            for i in range(3):
+            for i in range(runs):
                 pos = probe.run_probe(gcmd)
                 values.append(pos[2])
-                if i < 2:
+                if i < runs - 1:
                     # run_probe() only retracts between its OWN internal
                     # samples, never after the last one -- every other
                     # multi-probe caller in klipper (e.g. cmd_PROBE_ACCURACY)
@@ -1457,12 +1458,12 @@ class Creator5Toolchanger:
         finally:
             probe.multi_probe_end()
             self._raise_z()
-        if (len(values) != 3 or not all(math.isfinite(z) for z in values)
+        if (len(values) != runs or not all(math.isfinite(z) for z in values)
                 or max(values) - min(values) >= .1):
             raise gcmd.error('Stock calibration pin is not repeatable within 0.1 mm')
         return sum(values) / len(values)
 
-    def _measure_plate_pins(self, gcmd):
+    def _measure_plate_pins(self, gcmd, runs=3):
         # Stock checkPlatformRemove(): compare the regular pin's contact
         # height at X43/Y226 with the cylinder position from test.json.
         if not os.path.isfile(self.test_json_path):
@@ -1476,8 +1477,8 @@ class Creator5Toolchanger:
         if not all(math.isfinite(v) for v in (cylinder_x, cylinder_y)):
             raise gcmd.error('Factory cylinder position must be finite')
         first = self._probe_stock_pin(gcmd, self.plate_check_x,
-                                      self.plate_check_y)
-        second = self._probe_stock_pin(gcmd, cylinder_x, cylinder_y)
+                                      self.plate_check_y, runs)
+        second = self._probe_stock_pin(gcmd, cylinder_x, cylinder_y, runs)
         return first, second
 
     def _check_plate_removed(self, gcmd):
@@ -1492,8 +1493,9 @@ class Creator5Toolchanger:
 
     def _check_plate_present(self, gcmd, raise_error=True):
         # Inverse of _check_plate_removed: with the plate installed both
-        # pins read within plate_check_min_delta of each other.
-        first, second = self._measure_plate_pins(gcmd)
+        # pins read within plate_check_min_delta of each other. A plate is
+        # there or not (0.8 mm apart), so one probe run per pin will do.
+        first, second = self._measure_plate_pins(gcmd, runs=1)
         if abs(first - second) >= self.plate_check_min_delta:
             msg = ('Build plate not detected; install the build plate and '
                    'restart the print (calibration pin heights differ by '
