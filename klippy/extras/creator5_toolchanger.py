@@ -258,6 +258,9 @@ class Creator5Toolchanger:
         self.flow_switch = Creator5FlowSwitch(
             self.printer, self.gcode,
             config.getboolean('flow_calibration_default', True))
+        self.host_pa_switch = Creator5MiscSwitch(
+            self.printer, self.gcode, 'host_pressure_advance',
+            config.getboolean('host_pressure_advance_default', False))
         self.purge_switch = Creator5MiscSwitch(
             self.printer, self.gcode, 'purge',
             config.getboolean('purge_default', True))
@@ -773,6 +776,10 @@ class Creator5Toolchanger:
                              % (offset, attached))
 
     def _chamber_heater_active(self, gcmd):
+        # The Creator 5 (non-Pro) has no chamber heater configured.
+        if self.printer.lookup_object('heater_generic chamber_heater',
+                                      None) is None:
+            return False
         try:
             heater = self.printer.lookup_object('heaters').lookup_heater(
                 'chamber_heater')
@@ -1292,6 +1299,8 @@ class Creator5Toolchanger:
         afc.error.reset_failure()
         lane._perform_creator5_infinite_runout(replacement, target_temp=temp)
         if afc.error_state:
+            # Still paused: offer the other tools or a reload again.
+            self._run('_OC_RUNOUT_PROMPT')
             return
         # PAUSE marked the print paused; the switch resumed it directly.
         self.printer.lookup_object('pause_resume').is_paused = False
@@ -2602,6 +2611,10 @@ class Creator5Toolchanger:
         microsteps = 256 >> mcu_tmc.get_fields().get_field('mres')
         period = stepper.get_step_dist() * microsteps * 4.
         points, all_runs = [], []
+        path = '/tmp/c5_flow_T%d.csv' % attached
+        # Written a run at a time: formatting a long test's whole trace at
+        # once stalls the reactor long enough to miss an MCU clock wrap.
+        self._flow_write_csv([], path)
 
         def measure(advances):
             runs = self._flow_capture(gcmd, extruder, advances, segments,
@@ -2615,6 +2628,7 @@ class Creator5Toolchanger:
                 gcmd.respond_info('T%d flow PA %.4f: drift %s' % (
                     attached, advance,
                     ' '.join('%+.4f' % d for d in drifts) or 'none'))
+            self._flow_write_csv(runs, path, first=len(all_runs))
             all_runs.extend(runs)
         self._flow_host_fit = None
         try:
@@ -2632,9 +2646,6 @@ class Creator5Toolchanger:
             gcmd.respond_info('T%d host flow test failed: %s; pressure '
                               'advance unchanged' % (attached, e))
             return
-        finally:
-            path = '/tmp/c5_flow_T%d.csv' % attached
-            self._flow_write_csv(all_runs, path)
         self._flow_host_fit = fit
         problem = fit.problem()
         gcmd.respond_info(
@@ -2654,10 +2665,11 @@ class Creator5Toolchanger:
                           % (attached, fit.advance))
         return True
 
-    def _flow_write_csv(self, runs, path):
-        with open(path, 'w') as f:
-            f.write('run,advance,t,e,sg,eddy,reserve,v,a\n')
-            for run, (advance, rows, grid) in enumerate(runs):
+    def _flow_write_csv(self, runs, path, first=None):
+        with open(path, 'w' if first is None else 'a') as f:
+            if first is None:
+                f.write('run,advance,t,e,sg,eddy,reserve,v,a\n')
+            for run, (advance, rows, grid) in enumerate(runs, first or 0):
                 for t, e, sg, value, reserve, v, a in rows:
                     f.write('%d,%.4f,%.4f,%.5f,%d,%d,%d,%.3f,%.1f\n' % (
                         run, advance, t, e, sg, value, reserve, v, a))

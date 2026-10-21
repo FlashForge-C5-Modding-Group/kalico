@@ -221,6 +221,22 @@ class Creator5OffsetTests(unittest.TestCase):
                     self.board._run.assert_called_once_with(
                         'SET_HEATER_TEMPERATURE HEATER=%s TARGET=0' % heater)
 
+    def test_failed_runout_switch_asks_again(self):
+        afc = self._afc_tool_fixture('extruder')
+        source_lane = afc.lanes['extruder']
+        source_lane._perform_creator5_infinite_runout = mock.Mock(
+            side_effect=lambda *a, **k: setattr(afc, 'error_state', True))
+        pause = types.SimpleNamespace(is_paused=True)
+        objects = {'AFC': afc, 'pause_resume': pause}
+        self.board.printer.lookup_object.side_effect = (
+            lambda name, default=None: objects.get(name, default))
+        self.board._run = mock.Mock()
+
+        self.board.cmd_runout_switch(GCmd(TOOL=0, TO=1))
+
+        self.board._run.assert_called_once_with('_OC_RUNOUT_PROMPT')
+        self.assertTrue(pause.is_paused)
+
     def test_offset_reference_unselects_afc_owned_t0_alias(self):
         for alias in ('extruder0', 'extruder'):
             with self.subTest(alias=alias):
@@ -496,6 +512,15 @@ class Creator5OffsetTests(unittest.TestCase):
         switch.cmd_set(GCmd(VALUE=1))
         self.assertEqual(switch.get_status(0.), {'value': 1.})
 
+    def test_host_pressure_advance_switch_starts_disabled(self):
+        printer, gcode = mock.Mock(), mock.Mock()
+        switch = MODULE.Creator5MiscSwitch(
+            printer, gcode, 'host_pressure_advance', False)
+        printer.add_object.assert_called_once_with(
+            'output_pin host_pressure_advance', switch)
+        self.assertEqual(switch.saved_key, 'c5_host_pressure_advance')
+        self.assertEqual(switch.get_status(0.), {'value': 0.})
+
     def test_misc_switch_restores_and_saves_fluidd_changes(self):
         printer, gcode = mock.Mock(), mock.Mock()
         printer.lookup_object.return_value = mock.Mock(
@@ -587,10 +612,20 @@ class Creator5OffsetTests(unittest.TestCase):
 
     def test_unknown_chamber_heater_state_does_not_bypass_open_doors(self):
         self.board.door_buttons = ['topDoor']
-        self.board.printer.lookup_object.return_value = None
+        # configured, but the heaters object can't be read
+        self.board.printer.lookup_object.side_effect = (
+            lambda name, default=None: mock.Mock()
+            if name == 'heater_generic chamber_heater' else None)
         with self.assertRaisesRegex(RuntimeError,
                                     'Cannot verify chamber heater state'):
             self.board._check_chamber_doors(GCmd(), 'Door %s is open')
+
+    def test_creator5_without_chamber_heater_skips_door_check(self):
+        self.board.door_buttons = ['topDoor']
+        self.board._button = lambda name, gcmd: False   # door open
+        self.board.printer.lookup_object.side_effect = (
+            lambda name, default=None: None)
+        self.board._check_chamber_doors(GCmd(), 'Door %s is open')
 
     def test_attached_tool_and_status_use_only_dock_grab_pins(self):
         states = {'dock0': 'PRESSED', 'dock1': 'PRESSED',
