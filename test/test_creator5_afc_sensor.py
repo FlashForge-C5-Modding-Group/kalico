@@ -70,8 +70,48 @@ class Creator5AfcSensorTest(unittest.TestCase):
         target.set_tool_loaded.assert_called_once_with(
             normal_toolchange=True)
         source.afc.restore_pos.assert_called_once_with(
-            move_z_first=False)
+            move_z_first=False, keep_offsets=True)
         source.afc.error.pause_resume.send_resume_command.assert_called_once()
+
+    def _runout_lane(self, runout_lane=None, backup_loaded=True):
+        runout = load_method('AFC_lane.py', 'AFCLane', '_creator5_runout',
+                             {'AFCLaneState': AFCLaneState})
+        source = mock.Mock(name='source', runout_lane=runout_lane)
+        source.name = 'extruder'
+        source.extruder_obj.creator5_tool_index = 0
+        backup = mock.Mock(name='backup')
+        backup.name = 'extruder2'
+        backup.extruder_obj.creator5_tool_index = 2
+        backup.extruder_obj.tool_start_state = backup_loaded
+        source.afc.lanes = {'extruder2': backup}
+        source.afc.position_saved = True   # stale from an earlier change
+        calls = []
+        source.afc.error.pause_resume.send_pause_command.side_effect = (
+            lambda: calls.append('pause'))
+        source.afc.save_pos.side_effect = (
+            lambda: calls.append('save %s' % source.afc.position_saved))
+        return runout, source, calls
+
+    def test_runout_with_backup_switches_without_asking(self):
+        runout, source, calls = self._runout_lane('extruder2')
+        runout(source)
+        # stopped after the current line, then a fresh position saved
+        self.assertEqual(calls, ['pause', 'save False'])
+        source.gcode.run_script.assert_called_once_with(
+            'PAUSE\nC5_FILAMENT_RUNOUT TOOL=0 TO=2')
+        source.set_tool_unloaded.assert_called_once_with()
+
+    def test_runout_without_backup_asks(self):
+        runout, source, calls = self._runout_lane(None)
+        runout(source)
+        source.gcode.run_script.assert_called_once_with(
+            'PAUSE\nC5_FILAMENT_RUNOUT TOOL=0')
+
+    def test_runout_with_empty_backup_asks(self):
+        runout, source, calls = self._runout_lane('extruder2', backup_loaded=False)
+        runout(source)
+        source.gcode.run_script.assert_called_once_with(
+            'PAUSE\nC5_FILAMENT_RUNOUT TOOL=0')
 
     def test_eject_tells_operator_to_use_the_cutter(self):
         load_unload_sequence = load_method('AFC_extruder.py', 'AFCExtruder',
@@ -456,7 +496,8 @@ class Creator5AfcSensorTest(unittest.TestCase):
         change_tool = load_method('AFC.py', 'afc', 'CHANGE_TOOL')
         change_tool(afc, lane)
         lane.tool_swap.assert_called_once_with()
-        afc.restore_pos.assert_called_once_with(move_z_first=False)
+        afc.restore_pos.assert_called_once_with(move_z_first=False,
+                                                keep_offsets=True)
         self.assertFalse(afc.in_toolchange)
         afc.afcDeltaTime.set_start_time.assert_called_once_with()
         afc.afcDeltaTime.log_total_time.assert_called_once_with(

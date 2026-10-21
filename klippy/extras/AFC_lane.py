@@ -1044,6 +1044,49 @@ class AFCLane:
             # Set LED to not ready
             self.unit_obj.lane_not_ready(self)
 
+    def _creator5_runout(self):
+        """Creator 5 tool runout: pause, then switch to the runout lane, or ask.
+
+        Runs from the filament sensor's reactor callback, like Klipper's own
+        runout handling: stop the print after its current line, keep that
+        position for the switch to return to, then run the rest as G-code
+        (holding the G-code mutex). C5_FILAMENT_RUNOUT retracts the empty
+        filament and either switches to TO straight away or shows the prompt.
+        """
+        tool = self.extruder_obj.creator5_tool_index
+        to = None
+        if self.runout_lane is not None:
+            replacement = self.afc.lanes.get(self.runout_lane)
+            index = (replacement.extruder_obj.creator5_tool_index
+                     if replacement is not None and replacement is not self
+                     else None)
+            if index is None:
+                self.logger.error("Runout lane %s for %s is not another Creator 5 tool"
+                                  % (self.runout_lane, self.name))
+            elif not replacement.extruder_obj.tool_start_state:
+                self.logger.error("Runout lane %s has no filament; asking instead"
+                                  % (replacement.name,))
+            else:
+                to = index
+        self.afc.error.pause_resume.send_pause_command()
+        # This is the position the switch returns to; never a stale one.
+        self.afc.position_saved = False
+        self.afc.save_pos()
+        self.status = AFCLaneState.NONE
+        self.unit_obj.lane_not_ready(self)
+        self.set_tool_unloaded()
+        self.set_unloaded()
+        self.afc.save_vars()
+        if to is None:
+            self.logger.info("T%d ran out of filament" % tool)
+        else:
+            self.logger.info("Infinite Spool: T%d ran out, switching to T%d" % (tool, to))
+        try:
+            self.gcode.run_script("PAUSE\nC5_FILAMENT_RUNOUT TOOL=%d%s"
+                                  % (tool, "" if to is None else " TO=%d" % to))
+        except Exception as exc:
+            self.afc.error.AFC_error("Creator 5 runout handling failed: %s" % (exc,))
+
     def _perform_creator5_infinite_runout(self, replacement=None, target_temp=None):
         """Switch complete heads on runout, without AFC filament feed moves."""
         if replacement is None:
@@ -1745,6 +1788,8 @@ class AFCLane:
             sensor_name = sensor if sensor else "toolhead"
             if not sensor_obj.runout_helper.sensor_enabled:
                 self.logger.warning(f"{sensor_name} runout has been detected, but pause and runout detection has been disabled")
+            elif self.extruder_obj.creator5_tool_index is not None:
+                self._creator5_runout()
             elif (self.runout_lane is not None
                   and self.extruder_obj.is_standalone()):
                 # TODO: For now this only works for standalone toolheads, more reboust toolhead
@@ -1759,13 +1804,6 @@ class AFCLane:
                     self.set_tool_unloaded()
                     self.set_unloaded()
                     self.afc.save_vars()
-                tool = self.extruder_obj.creator5_tool_index
-                if tool is not None and self.afc.function.is_paused():
-                    try:
-                        self.gcode.run_script_from_command(
-                            "C5_FILAMENT_RUNOUT TOOL=%d" % tool)
-                    except Exception as exc:
-                        self.logger.error("C5_FILAMENT_RUNOUT failed: %s" % exc)
 
     def handle_hub_runout(self, sensor=None):
         """
