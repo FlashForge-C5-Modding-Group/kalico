@@ -1,6 +1,8 @@
 import importlib.util
 import io
 from pathlib import Path
+import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -10,6 +12,11 @@ SPEC = importlib.util.spec_from_file_location(
     / 'klippy' / 'extras' / 'virtual_sdcard.py')
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
+PRINT_STATS_SPEC = importlib.util.spec_from_file_location(
+    'print_stats', Path(__file__).resolve().parents[1]
+    / 'klippy' / 'extras' / 'print_stats.py')
+PRINT_STATS_MODULE = importlib.util.module_from_spec(PRINT_STATS_SPEC)
+PRINT_STATS_SPEC.loader.exec_module(PRINT_STATS_MODULE)
 
 
 class VirtualSDEOFTests(unittest.TestCase):
@@ -26,6 +33,7 @@ class VirtualSDEOFTests(unittest.TestCase):
         sd.creator5_preloaded_definitions = set()
         sd.must_pause_work = sd.cmd_from_sd = False
         sd.work_timer = object()
+        sd._in_worker_script = False
         sd.reactor = mock.Mock(NOW=0., NEVER=999.)
         sd.reactor.monotonic.return_value = 0.
         sd.gcode = mock.Mock()
@@ -35,6 +43,170 @@ class VirtualSDEOFTests(unittest.TestCase):
         sd.on_error_gcode = mock.Mock()
         sd.on_error_gcode.render.return_value = 'TURN_OFF_HEATERS'
         return sd
+
+    def attach_print_stats(self, sd):
+        printer = mock.Mock()
+        printer.get_reactor.return_value = sd.reactor
+        printer.lookup_object.return_value = sd.gcode
+        gcode_move = mock.Mock()
+        gcode_move.get_status.return_value = {
+            'position': SimpleNamespace(e=0.0), 'extrude_factor': 1.0}
+        printer.load_object.return_value = gcode_move
+        config = mock.Mock()
+        config.get_printer.return_value = printer
+        sd.printer = printer
+        sd.print_stats = PRINT_STATS_MODULE.PrintStats(config)
+
+    def cancel_from_script(self, sd, cleanup):
+        previous = sd.reactor.pause.side_effect
+        sd.reactor.pause.side_effect = AssertionError(
+            'worker cancellation attempted to wait')
+        try:
+            sd.do_cancel()
+        finally:
+            sd.reactor.pause.side_effect = previous
+        cleanup.append('cancel returned')
+
+    def assert_cancelled(self, sd, original_file, cleanup):
+        self.assertTrue(original_file.closed)
+        self.assertFalse(sd.is_active())
+        self.assertEqual(sd.print_stats.get_status(
+            sd.reactor.monotonic())['state'], 'cancelled')
+        self.assertEqual(cleanup, ['cancel returned'])
+        events = [c.args[0] for c in sd.printer.send_event.call_args_list]
+        self.assertNotIn('print_stats:complete_printing', events)
+
+    def test_automatic_start_cancel_allows_new_print(self):
+        sd = self.make_sd('M109 S220\nG1 X10\n')
+        sd.auto_creator5_start = True
+        self.attach_print_stats(sd)
+        original_file = sd.current_file
+        cleanup = []
+        commands = []
+        def dispatch(line):
+            commands.append(line)
+            if line.startswith('C5_PRINT_START'):
+                self.cancel_from_script(sd, cleanup)
+        sd.gcode.run_script.side_effect = dispatch
+        sd.work_handler(0.)
+        self.assert_cancelled(sd, original_file, cleanup)
+        self.assertNotIn('G1 X10', commands)
+        self.assertNotIn('C5_PRINT_STOP', commands)
+
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, 'retry.gcode').write_text('M109 S220\nG1 X20\n')
+            sd.sdcard_dirname = directory
+            gcmd = mock.Mock()
+            gcmd.get.return_value = 'retry.gcode'
+            gcmd.error = sd.gcode.error
+            commands.clear()
+            sd.printer.send_event.reset_mock()
+            sd.gcode.run_script.side_effect = commands.append
+            sd.cmd_SDCARD_PRINT_FILE(gcmd)
+            retry_file = sd.current_file
+            self.addCleanup(retry_file.close)
+            worker = sd.reactor.register_timer.call_args.args[0]
+            worker(0.)
+        self.assertTrue(retry_file.closed)
+        self.assertFalse(sd.is_active())
+        self.assertEqual(sum(c.startswith('C5_PRINT_START')
+                             for c in commands), 1)
+        self.assertIn('G1 X20', commands)
+        self.assertEqual(commands.count('C5_PRINT_STOP'), 1)
+        self.assertEqual(sd.print_stats.get_status(
+            sd.reactor.monotonic())['state'], 'complete')
+
+    def test_automatic_start_error_can_cancel_cleanup(self):
+        for text in ('G1 X10\n', 'M109 S220\nG1 X10\n'):
+            with self.subTest(text=text):
+                sd = self.make_sd(text)
+                sd.auto_creator5_start = True
+                self.attach_print_stats(sd)
+                original_file = sd.current_file
+                cleanup = []
+                commands = []
+                sd.on_error_gcode.render.return_value = 'CANCEL_PRINT'
+                def dispatch(line):
+                    commands.append(line)
+                    if line.startswith('C5_PRINT_START'):
+                        raise sd.gcode.error('startup failed')
+                    if line == 'CANCEL_PRINT':
+                        self.cancel_from_script(sd, cleanup)
+                sd.gcode.run_script.side_effect = dispatch
+                sd.work_handler(0.)
+                self.assert_cancelled(sd, original_file, cleanup)
+                self.assertNotIn('G1 X10', commands)
+                self.assertNotIn('C5_PRINT_STOP', commands)
+
+    def test_automatic_end_cancel_does_not_complete(self):
+        sd = self.make_sd('M109 S220\nG1 X10\n')
+        sd.auto_creator5_start = True
+        self.attach_print_stats(sd)
+        original_file = sd.current_file
+        cleanup = []
+        commands = []
+        def dispatch(line):
+            commands.append(line)
+            if line == 'C5_PRINT_STOP':
+                self.cancel_from_script(sd, cleanup)
+        sd.gcode.run_script.side_effect = dispatch
+        sd.work_handler(0.)
+        self.assert_cancelled(sd, original_file, cleanup)
+        self.assertIn('G1 X10', commands)
+        self.assertNotIn(mock.call('Done printing file'),
+                         sd.gcode.respond_raw.call_args_list)
+
+    def test_automatic_end_error_can_cancel_cleanup(self):
+        for error_type in (RuntimeError, ValueError):
+            with self.subTest(error_type=error_type):
+                sd = self.make_sd('M109 S220\nG1 X10\n')
+                sd.auto_creator5_start = True
+                self.attach_print_stats(sd)
+                original_file = sd.current_file
+                cleanup = []
+                commands = []
+                sd.on_error_gcode.render.return_value = 'CANCEL_PRINT'
+                def dispatch(line):
+                    commands.append(line)
+                    if line == 'C5_PRINT_STOP':
+                        raise error_type('stop failed')
+                    if line == 'CANCEL_PRINT':
+                        self.cancel_from_script(sd, cleanup)
+                sd.gcode.run_script.side_effect = dispatch
+                sd.work_handler(0.)
+                self.assert_cancelled(sd, original_file, cleanup)
+                self.assertIn('G1 X10', commands)
+                self.assertNotIn(mock.call('Done printing file'),
+                                 sd.gcode.respond_raw.call_args_list)
+
+    def test_worker_scripts_wait_for_dispatcher(self):
+        for blocked_script in ('start', 'end'):
+            with self.subTest(blocked_script=blocked_script):
+                sd = self.make_sd('M109 S220\nG1 X10\n')
+                sd.auto_creator5_start = True
+                self.attach_print_stats(sd)
+                original_file = sd.current_file
+                locked = [blocked_script == 'start']
+                commands = []
+                sd.gcode.get_mutex.return_value.test.side_effect = (
+                    lambda: locked[0])
+                def release_dispatcher(waketime):
+                    locked[0] = False
+                def dispatch(line):
+                    if locked[0]:
+                        raise sd.gcode.error('dispatcher is still occupied')
+                    commands.append(line)
+                    if line == 'G1 X10' and blocked_script == 'end':
+                        locked[0] = True
+                sd.reactor.pause.side_effect = release_dispatcher
+                sd.gcode.run_script.side_effect = dispatch
+                sd.work_handler(0.)
+                self.assertTrue(original_file.closed)
+                self.assertFalse(sd.is_active())
+                self.assertIn('G1 X10', commands)
+                self.assertEqual(commands.count('C5_PRINT_STOP'), 1)
+                self.assertEqual(sd.print_stats.get_status(
+                    sd.reactor.monotonic())['state'], 'complete')
 
     def test_end_macro_with_and_without_newline(self):
         for suffix in ('', '\n', '\r\n'):

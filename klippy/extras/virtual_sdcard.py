@@ -116,6 +116,7 @@ class VirtualSD:
         self.cancelled_work = False
         self.next_file_position = 0
         self.work_timer = None
+        self._in_worker_script = False
         # Error handling
         gcode_macro = self.printer.load_object(config, "gcode_macro")
         self.on_error_gcode = gcode_macro.load_template(
@@ -217,7 +218,8 @@ class VirtualSD:
     def do_pause(self):
         if self.work_timer is not None:
             self.must_pause_work = True
-            while self.work_timer is not None and not self.cmd_from_sd:
+            while (self.work_timer is not None and not self.cmd_from_sd
+                   and not self._in_worker_script):
                 self.reactor.pause(self.reactor.monotonic() + 0.001)
 
     def do_resume(self):
@@ -362,6 +364,23 @@ class VirtualSD:
         return self.cmd_from_sd
 
     # Background work timer
+    def _run_worker_script(self, script):
+        # Synchronous worker scripts outside ordinary SD-file dispatch.
+        # Do not claim worker ownership while another dispatcher owns the
+        # mutex: its cancellation must be able to wait for this worker.
+        gcode_mutex = self.gcode.get_mutex()
+        while gcode_mutex.test():
+            if self.must_pause_work:
+                return False
+            self.reactor.pause(self.reactor.monotonic() + 0.100)
+        was_in_worker_script = self._in_worker_script
+        self._in_worker_script = True
+        try:
+            self.gcode.run_script(script)
+        finally:
+            self._in_worker_script = was_in_worker_script
+        return True
+
     def work_handler(self, eventtime):
         logging.info("Starting SD card print (position %d)", self.file_position)
         self.reactor.unregister_timer(self.work_timer)
@@ -384,28 +403,36 @@ class VirtualSD:
                 header = self.current_file.read(65536)
                 self.current_file.seek(0)
                 definitions = creator5_object_definitions(header)
-                if definitions:
-                    self.gcode.run_script("EXCLUDE_OBJECT_DEFINE RESET=1")
+                if (definitions and self._run_worker_script(
+                        "EXCLUDE_OBJECT_DEFINE RESET=1")):
                     for offset, definition in definitions:
-                        self.gcode.run_script(definition)
+                        if (self.must_pause_work
+                                or not self._run_worker_script(definition)):
+                            break
                         self.creator5_preloaded_definitions.add(offset)
-                start_command = creator5_start_command(header)
-                self.creator5_start_done = True
-                if start_command is not None:
-                    self.gcode.run_script(start_command)
+                if not self.must_pause_work:
+                    start_command = creator5_start_command(header)
+                    self.creator5_start_done = True
+                    if (start_command is not None
+                            and not self._run_worker_script(start_command)):
+                        self.creator5_start_done = False
             except (ValueError, self.gcode.error) as e:
                 error_message = str(e)
-                self.must_pause_work = True
             except:
                 logging.exception("virtual_sdcard Creator 5 print start")
                 error_message = "Creator 5 print start failed"
-                self.must_pause_work = True
             if error_message is not None:
                 try:
-                    self.gcode.run_script(self.on_error_gcode.render())
+                    self._run_worker_script(self.on_error_gcode.render())
                 except:
                     logging.exception("virtual_sdcard on_error")
+                self.must_pause_work = True
         while not self.must_pause_work:
+            # Include reads and EOF scripts in the dispatcher availability
+            # check, so external cancellation can stop the worker first.
+            if gcode_mutex.test():
+                self.reactor.pause(self.reactor.monotonic() + 0.100)
+                continue
             if not lines:
                 # Read more data
                 try:
@@ -423,24 +450,30 @@ class VirtualSD:
                     if (self.auto_creator5_start and self.creator5_start_done
                             and not self.creator5_stop_done):
                         try:
-                            self.gcode.run_script("C5_PRINT_STOP")
+                            if not self._run_worker_script("C5_PRINT_STOP"):
+                                break
                             self.creator5_stop_done = True
                         except self.gcode.error as e:
                             error_message = str(e)
                             try:
-                                self.gcode.run_script(self.on_error_gcode.render())
+                                if not self._run_worker_script(
+                                        self.on_error_gcode.render()):
+                                    break
                             except:
                                 logging.exception("virtual_sdcard on_error")
                         except:
                             logging.exception("virtual_sdcard Creator 5 print stop")
                             error_message = "Creator 5 print stop failed"
                             try:
-                                self.gcode.run_script(self.on_error_gcode.render())
+                                if not self._run_worker_script(
+                                        self.on_error_gcode.render()):
+                                    break
                             except:
                                 logging.exception("virtual_sdcard on_error")
-                    self.current_file.close()
-                    self.current_file = None
-                    if error_message is None:
+                    if self.current_file is not None:
+                        self.current_file.close()
+                        self.current_file = None
+                    if error_message is None and not self.cancelled_work:
                         logging.info("Finished SD card print")
                         self.gcode.respond_raw("Done printing file")
                     break
@@ -449,10 +482,6 @@ class VirtualSD:
                 partial_input = lines.pop()
                 lines.reverse()
                 self.reactor.pause(self.reactor.NOW)
-                continue
-            # Pause if any other request is pending in the gcode class
-            if gcode_mutex.test():
-                self.reactor.pause(self.reactor.monotonic() + 0.100)
                 continue
             # Dispatch command
             self.cmd_from_sd = True

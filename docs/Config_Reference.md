@@ -2011,6 +2011,11 @@ to run OctoPrint well. It allows the Kalico host software to directly
 print gcode files stored in a directory on the host using standard
 sdcard G-Code commands (eg, M24).
 
+Cancellation from automatic Creator 5 startup, end-of-file, or error
+scripts stops the virtual SD job and allows cancellation cleanup to
+continue. A cancelled job can be followed by a new file without restarting
+Klipper; cancellation does not report successful file completion.
+
 ```
 [virtual_sdcard]
 path:
