@@ -1088,8 +1088,12 @@ class Creator5Toolchanger:
         extruder = 'extruder' if tool == 0 else 'extruder%d' % tool
         self._run('ACTIVATE_EXTRUDER EXTRUDER=%s' % extruder)
         self._restore_pressure_advance(extruder)
-        self._move(x=self.approach_x,
-                   feed=self.pickup_departure_speed * 60.)
+        # A pullback longer than the dock-to-approach_x distance already
+        # ends inboard of it; moving "out" to approach_x would step back
+        # toward the docks.
+        if x - self.pullback > self.approach_x:
+            self._move(x=self.approach_x,
+                       feed=self.pickup_departure_speed * 60.)
 
     def _with_motion(self, gcmd, operation, final_accel=None):
         toolhead = self.printer.lookup_object('toolhead')
