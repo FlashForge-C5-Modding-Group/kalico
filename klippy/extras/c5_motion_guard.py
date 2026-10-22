@@ -6,7 +6,9 @@
 
 AXES = ('stepper_x', 'stepper_y', 'stepper_z')
 ACTIONS = ('warn', 'pause')
-# When the firmware follows the angle drift for skipped steps
+# When the firmware follows the angle drift for skipped steps. Prints always
+# use moving: holding and always count false slips while printing, so they
+# only apply in test mode (pulling the carriage by hand).
 SLIP_WATCH = {'moving': 0, 'holding': 1, 'always': 2}
 
 
@@ -35,6 +37,7 @@ class C5MotionGuard:
         self.tripped = None
         self.was_busy = self.was_printing = self.settle = False
         self.test_mode = False
+        self.sent_mode, self.sent_ok = None, False
         self.timer = None
         self.printer.register_event_handler('klippy:ready', self._ready)
         # Homing drives into the endstops and probe; skip those windows too
@@ -69,9 +72,16 @@ class C5MotionGuard:
     def _homing(self, kind, on):
         (self.homing.add if on else self.homing.discard)(kind)
 
-    def _send_slip_watch(self):
-        return all([motor.set_slip_mode(SLIP_WATCH[self.slip_watch])
-                    for motor in self.motors.values()])
+    def _send_slip_watch(self, real_print=False):
+        mode = 0
+        if self.test_mode and not real_print:
+            mode = SLIP_WATCH[self.slip_watch]
+        if mode == self.sent_mode:
+            return self.sent_ok
+        self.sent_mode = mode
+        self.sent_ok = all([motor.set_slip_mode(mode)
+                            for motor in self.motors.values()])
+        return self.sent_ok
 
     def _reset_totals(self):
         self.print_totals = {a: {'slips': 0, 'stalls': 0, 'ignored': 0}
@@ -94,7 +104,9 @@ class C5MotionGuard:
         self.settle = True
 
     def _poll(self, eventtime):
-        printing = self.enabled and (self.test_mode or self._printing())
+        real_print = self._printing()
+        self._send_slip_watch(real_print)
+        printing = self.enabled and (self.test_mode or real_print)
         if printing and not self.was_printing:
             self._reset_totals()
             self._start_window()
@@ -245,21 +257,21 @@ class C5MotionGuard:
         watch = gcmd.get('WATCH', self.slip_watch).lower()
         if watch not in SLIP_WATCH:
             raise gcmd.error("WATCH must be one of: " + ", ".join(SLIP_WATCH))
-        if watch != self.slip_watch:
-            self.slip_watch = watch
-            if self.motors and not self._send_slip_watch():
-                gcmd.respond_info("This mainboard firmware only watches fast "
-                                  "moves; flash the newer MCU update")
         if gcmd.get_int('RESET', 0):
             self._reset_totals()
         # TEST=1 watches outside a print too, to try it with manual moves
-        self.test_mode = bool(gcmd.get_int('TEST', int(self.test_mode),
-                                           minval=0, maxval=1))
-        gcmd.respond_info("Motion guard %s, action %s, watching %s%s"
+        test_mode = bool(gcmd.get_int('TEST', int(self.test_mode),
+                                      minval=0, maxval=1))
+        if (watch, test_mode) != (self.slip_watch, self.test_mode):
+            self.slip_watch, self.test_mode = watch, test_mode
+            if (self.motors and not self._send_slip_watch(self._printing())
+                    and test_mode and watch != 'moving'):
+                gcmd.respond_info("This mainboard firmware only watches fast "
+                                  "moves; flash the newer MCU update")
+        gcmd.respond_info("Motion guard %s, action %s%s"
                           % ("on" if self.enabled else "off", self.action,
-                             self.slip_watch,
-                             ", test mode (watching outside prints)"
-                             if self.test_mode else ""))
+                             ", test mode (watching outside prints, %s)"
+                             % (self.slip_watch,) if self.test_mode else ""))
 
 
 def load_config(config):

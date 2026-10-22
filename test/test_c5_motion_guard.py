@@ -206,17 +206,27 @@ class MotionGuardTest(unittest.TestCase):
         self.assertIn('about 1.000', text)
 
 
-    def test_slip_watch_is_sent_at_ready_and_on_change(self):
+    def test_slip_watch_only_applies_in_test_mode(self):
         g = self.guard(slip_watch='holding')
-        self.assertEqual({m.slip_mode for m in self.motors.values()}, {1})
+        self.assertEqual({m.slip_mode for m in self.motors.values()}, {0})
         gcmd = mock.Mock()
-        gcmd.get_int.side_effect = lambda name, default, **kw: default
+        values = {'TEST': 1}
+        gcmd.get_int.side_effect = lambda name, default, **kw: values.get(
+            name, default)
         gcmd.get.side_effect = lambda name, default: (
             'always' if name == 'WATCH' else default)
         g.cmd_GUARD(gcmd)
         self.assertEqual({m.slip_mode for m in self.motors.values()}, {2})
+        self.state = 'printing'
+        g._poll(0.)
+        self.assertEqual({m.slip_mode for m in self.motors.values()}, {0})
+        self.state = 'standby'
+        g._poll(0.)
+        self.assertEqual({m.slip_mode for m in self.motors.values()}, {2})
+        values['TEST'] = 0
+        g.cmd_GUARD(gcmd)
+        self.assertEqual({m.slip_mode for m in self.motors.values()}, {0})
         self.assertEqual(g.get_status(0.)['slip_watch'], 'always')
-
 
 if __name__ == '__main__':
     unittest.main()
