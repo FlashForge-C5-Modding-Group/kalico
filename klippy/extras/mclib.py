@@ -60,6 +60,15 @@ class MCLIB:
                                    self.cmd_MCLIB_SET_CURRENT,
                                    desc=self.cmd_MCLIB_SET_CURRENT_help)
 
+        # Motion health (c5_motion_guard): totals since the last take_health()
+        self.query_status_cmd = None
+        self.set_stall_cmd = None
+        self.health = self._empty_health()
+        self.last_status = None
+        gcode.register_mux_command("MCLIB_SET_STALL", "STEPPER", self.name,
+                                   self.cmd_MCLIB_SET_STALL,
+                                   desc=self.cmd_MCLIB_SET_STALL_help)
+
         self.set_resonance_damp_cmd = None
         if self.name != 'extruder':
             gcode.register_mux_command("MCLIB_SET_RESONANCE_DAMP", "STEPPER", self.name,
@@ -93,6 +102,14 @@ class MCLIB:
 
         self.set_current_cmd = self.mcu.lookup_command(
             "mclib_set_current oid=%c run_current=%u hold_current=%u")
+        self.set_stall_cmd = self.mcu.lookup_command(
+            "mclib_config_stalldetect oid=%c stallthrs=%u")
+        # Older mainboard firmware has no status query; the guard reports that
+        self.query_status_cmd = self.mcu.try_lookup_command(
+            "mclib_query_status oid=%c")
+        if self.query_status_cmd is not None:
+            self.mcu.register_response(self._handle_status, "mclib_status",
+                                       self.oid)
 
         if self.name != 'extruder':
             self.mcu.add_config_cmd("mclib_set_resonance_damp oid=%d tdx=1 amp=%u phase1=%u phase2=%u"% (
@@ -119,6 +136,53 @@ class MCLIB:
                                     % (self.oid, run_current, hold_current))
             return
         self.set_current_cmd.send([self.oid, run_current, hold_current])
+
+    @staticmethod
+    def _empty_health():
+        return {'stalls': 0, 'slips': 0, 'slip_total': 0, 'samples': 0,
+                'torque_min': None, 'torque_max': None,
+                'err_min': None, 'err_max': None}
+
+    def _handle_status(self, params):
+        self.last_status = params
+        h = self.health
+        h['stalls'] += params['stalls']
+        h['slips'] += params['slips']
+        h['slip_total'] += params['slip_total']
+        if not params['samples']:
+            return
+        h['samples'] += params['samples']
+        for key, pick in (('torque_min', min), ('torque_max', max),
+                          ('err_min', min), ('err_max', max)):
+            value = params[key] / 1000.
+            h[key] = value if h[key] is None else pick(h[key], value)
+
+    def query_health(self):
+        """Ask the MCU for its counters; the reply adds to self.health."""
+        if self.query_status_cmd is None:
+            return False
+        self.query_status_cmd.send([self.oid])
+        return True
+
+    def take_health(self):
+        h, self.health = self.health, self._empty_health()
+        return h
+
+    def get_stall_threshold(self):
+        return self.stall_threshold / 1000.
+
+    cmd_MCLIB_SET_STALL_help = "Set the stall detect threshold of a stepper in mclib"
+    def cmd_MCLIB_SET_STALL(self, gcmd):
+        threshold = gcmd.get_float('THRESHOLD', above=0.)
+        self.stall_threshold = int(threshold * 1000)
+        if self.set_stall_cmd is None:
+            self.mcu.add_config_cmd("mclib_config_stalldetect oid=%d stallthrs=%u"
+                                    % (self.oid, self.stall_threshold))
+        else:
+            self.set_stall_cmd.send([self.oid, self.stall_threshold])
+        gcmd.respond_info("%s stall_threshold=%.3f (until restart; set "
+                          "stall_threshold in [mclib %s] to keep it)"
+                          % (self.name, threshold, self.name))
 
     cmd_MCLIB_SET_RESONANCE_DAMP_help = "Sets the stepper resonance damp paramters in mclib"
     def cmd_MCLIB_SET_RESONANCE_DAMP(self, gcmd):

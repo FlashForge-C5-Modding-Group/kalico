@@ -303,6 +303,34 @@ test_stall_gating_and_wrap(void)
 }
 
 static void
+test_health_counters(void)
+{
+    struct c5_mclib_motor m;
+    struct c5_mclib_output out;
+    struct c5_mclib_health h;
+
+    setup_z(&m, 1000, 1000);
+    c5_mclib_stall_threshold(&m, 600);
+    c5_mclib_enable(&m, 0);
+    uint32_t now = step_many(&m, 0, 20000, 264);
+    c5_mclib_update(&m, now, 0.0f, 0.0f, &out);
+    c5_mclib_update(&m, now + 100u, 0.0f, 0.0f, &out);
+    c5_mclib_take_health(&m, &h);
+    CHECK(h.stall_count == 1, "one stall edge must count once");
+    CHECK(h.samples == 2, "armed updates must be sampled");
+    CHECK(h.slips == 0 && h.slip_total == 0,
+          "a steady error must not count slips");
+    CHECK(h.torque_min <= h.torque_max && h.error_min <= h.error_max,
+          "ranges must be ordered");
+    c5_mclib_take_health(&m, &h);
+    CHECK(h.stall_count == 0 && h.samples == 0,
+          "taking the health must reset the counters");
+    c5_mclib_update(&m, now + 37501u, 0.0f, 0.0f, &out);
+    c5_mclib_take_health(&m, &h);
+    CHECK(h.samples == 0, "slow updates must not be sampled");
+}
+
+static void
 test_hold_run_and_current_ramp(void)
 {
     static const uint32_t run_current[8] = {
@@ -760,6 +788,7 @@ main(void)
     test_reference_waveforms();
     test_electrical_cycle();
     test_stall_gating_and_wrap();
+    test_health_counters();
     test_hold_run_and_current_ramp();
     test_acquisition();
     test_xy_crossover_resonance_and_limits();

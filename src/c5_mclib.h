@@ -28,6 +28,16 @@ struct c5_mclib_observer {
     float angle;
 };
 
+// Motion health since the last c5_mclib_take_health(): stall edges,
+// electrical cycles lost or gained (a cycle is four full steps) and the
+// torque and angle error range while the stall detector was armed.
+struct c5_mclib_health {
+    float torque_min, torque_max, error_min, error_max, last_error;
+    int32_t slips;
+    uint32_t slip_total, stall_count, samples;
+    uint8_t last_valid, stall_prev;
+};
+
 struct c5_mclib_motor {
     uint32_t last_step, last_period, elapsed;
     uint32_t stop_timeout, hold_delay, ramp_ticks;
@@ -49,6 +59,7 @@ struct c5_mclib_motor {
     uint8_t axis, interpolation, direction;
     uint8_t mode, fast_mode, hold_transition, slow;
     uint8_t quarter_count, stall;
+    struct c5_mclib_health health;
 };
 
 struct c5_mclib_acq {
@@ -82,6 +93,8 @@ void c5_mclib_disable(struct c5_mclib_motor *m);
 uint8_t c5_mclib_update(struct c5_mclib_motor *m, uint32_t now,
                         float ia, float ib, struct c5_mclib_output *out);
 uint8_t c5_mclib_stalled(const struct c5_mclib_motor *m);
+void c5_mclib_take_health(struct c5_mclib_motor *m,
+                          struct c5_mclib_health *out);
 void c5_mclib_acq_init(struct c5_mclib_acq *a);
 uint8_t c5_mclib_acquire(struct c5_mclib_acq *a,
                          int16_t raw0, int16_t raw1, float *ia, float *ib);

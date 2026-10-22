@@ -591,6 +591,49 @@ c5_mclib_disable(struct c5_mclib_motor *m)
 }
 
 static void
+update_health(struct c5_mclib_motor *m, float error, uint8_t armed)
+{
+    struct c5_mclib_health *h = &m->health;
+    if (m->stall && !h->stall_prev)
+        h->stall_count++;
+    h->stall_prev = m->stall;
+    if (!armed) {
+        h->last_valid = 0u;
+        return;
+    }
+    // The angle error is wrapped to +-pi, so a jump of more than pi
+    // between two 20 kHz samples is a whole electrical cycle slipping.
+    if (h->last_valid) {
+        float jump = error - h->last_error;
+        if (jump < -ANGLE_PI_CORRECTION) {
+            h->slips++;
+            h->slip_total++;
+        } else if (jump > ANGLE_PI_CORRECTION) {
+            h->slips--;
+            h->slip_total++;
+        }
+    }
+    h->last_error = error;
+    h->last_valid = 1u;
+    float torque = __builtin_fabsf(m->filtered_torque);
+    if (!h->samples) {
+        h->torque_min = h->torque_max = torque;
+        h->error_min = h->error_max = error;
+    } else {
+        if (torque < h->torque_min)
+            h->torque_min = torque;
+        if (torque > h->torque_max)
+            h->torque_max = torque;
+        if (error < h->error_min)
+            h->error_min = error;
+        if (error > h->error_max)
+            h->error_max = error;
+    }
+    if (h->samples != UINT32_MAX)
+        h->samples++;
+}
+
+static void
 update_stall_state(struct c5_mclib_motor *m, float ia, float ib,
                    float initial_error)
 {
@@ -602,8 +645,10 @@ update_stall_state(struct c5_mclib_motor *m, float ia, float ib,
         * (initial_error - m->filtered_angle_error);
     uint8_t decision = __builtin_fabsf(m->filtered_torque)
         < m->stall_threshold;
-    m->stall = decision && !m->hold_transition && !m->slow
+    uint8_t armed = !m->hold_transition && !m->slow
         && m->quarter_count >= 17u;
+    m->stall = decision && armed;
+    update_health(m, initial_error, armed);
 }
 
 static void
@@ -820,6 +865,16 @@ uint8_t
 c5_mclib_stalled(const struct c5_mclib_motor *m)
 {
     return m->stall;
+}
+
+void
+c5_mclib_take_health(struct c5_mclib_motor *m, struct c5_mclib_health *out)
+{
+    *out = m->health;
+    m->health.slips = 0;
+    m->health.slip_total = 0u;
+    m->health.stall_count = 0u;
+    m->health.samples = 0u;
 }
 
 void
