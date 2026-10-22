@@ -213,9 +213,20 @@ command_mclib_query_status(uint32_t *args)
     uint8_t stall = motor->stall;
     irq_restore(flag);
     sendf("mclib_status oid=%c stall=%c stalls=%u slips=%i slip_total=%u"
-          " samples=%u torque_min=%i torque_max=%i err_min=%i err_max=%i"
+          " samples=%u tracked=%u torque_min=%i torque_max=%i err_min=%i"
+          " err_max=%i"
           , oid, stall, h.stall_count, h.slips, h.slip_total, h.samples
-          , milli(h.torque_min), milli(h.torque_max)
+          , h.tracked, milli(h.torque_min), milli(h.torque_max)
           , milli(h.error_min), milli(h.error_max));
 }
 DECL_COMMAND(command_mclib_query_status, "mclib_query_status oid=%c");
+
+void
+command_mclib_config_slip(uint32_t *args)
+{
+    struct c5_mclib_motor *motor = lookup_motor(args[0]);
+    irqstatus_t flag = irq_save();
+    c5_mclib_slip_mode(motor, args[1]);
+    irq_restore(flag);
+}
+DECL_COMMAND(command_mclib_config_slip, "mclib_config_slip oid=%c mode=%c");

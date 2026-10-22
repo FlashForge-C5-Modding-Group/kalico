@@ -63,6 +63,7 @@ class MCLIB:
         # Motion health (c5_motion_guard): totals since the last take_health()
         self.query_status_cmd = None
         self.set_stall_cmd = None
+        self.set_slip_cmd = None
         self.health = self._empty_health()
         self.last_status = None
         gcode.register_mux_command("MCLIB_SET_STALL", "STEPPER", self.name,
@@ -110,6 +111,8 @@ class MCLIB:
         if self.query_status_cmd is not None:
             self.mcu.register_response(self._handle_status, "mclib_status",
                                        self.oid)
+        self.set_slip_cmd = self.mcu.try_lookup_command(
+            "mclib_config_slip oid=%c mode=%c")
 
         if self.name != 'extruder':
             self.mcu.add_config_cmd("mclib_set_resonance_damp oid=%d tdx=1 amp=%u phase1=%u phase2=%u"% (
@@ -167,6 +170,14 @@ class MCLIB:
     def take_health(self):
         h, self.health = self.health, self._empty_health()
         return h
+
+    def set_slip_mode(self, mode):
+        """Slip tracking: 0 fast moves only, 1 also holding still, 2 whenever
+        enabled. False on firmware without it."""
+        if self.set_slip_cmd is None:
+            return False
+        self.set_slip_cmd.send([self.oid, mode])
+        return True
 
     def get_stall_threshold(self):
         return self.stall_threshold / 1000.

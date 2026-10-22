@@ -6,6 +6,8 @@
 
 AXES = ('stepper_x', 'stepper_y', 'stepper_z')
 ACTIONS = ('warn', 'pause')
+# When the firmware follows the angle drift for skipped steps
+SLIP_WATCH = {'moving': 0, 'holding': 1, 'always': 2}
 
 
 class C5MotionGuard:
@@ -17,6 +19,8 @@ class C5MotionGuard:
         self.action = config.getchoice('action', {a: a for a in ACTIONS},
                                        'warn')
         self.poll_time = config.getfloat('poll_time', .5, minval=.1)
+        self.slip_watch = config.getchoice(
+            'slip_watch', {k: k for k in SLIP_WATCH}, 'moving')
         # Net electrical cycles (4 full steps each) lost on one axis in one
         # print before it counts as skipped steps.
         self.slip_limit = config.getint('slip_limit', 1, minval=1)
@@ -48,9 +52,14 @@ class C5MotionGuard:
         self.toolchanger = self.printer.lookup_object('creator5_toolchanger',
                                                       None)
         self._reset_totals()
+        self._send_slip_watch()
         if self.motors:
             self.timer = self.reactor.register_timer(
                 self._poll, self.reactor.NOW)
+
+    def _send_slip_watch(self):
+        return all([motor.set_slip_mode(SLIP_WATCH[self.slip_watch])
+                    for motor in self.motors.values()])
 
     def _reset_totals(self):
         self.print_totals = {a: {'slips': 0, 'stalls': 0, 'ignored': 0}
@@ -146,6 +155,7 @@ class C5MotionGuard:
 
     def get_status(self, eventtime):
         return {'enabled': self.enabled, 'action': self.action,
+                'slip_watch': self.slip_watch,
                 'available': bool(self.motors), 'tripped': self.tripped,
                 'recording': self.recording is not None,
                 'test_mode': self.test_mode,
@@ -159,8 +169,9 @@ class C5MotionGuard:
     cmd_STATUS_help = "Show skipped steps, stalls and motor torque per axis"
     def cmd_STATUS(self, gcmd):
         self._need_firmware(gcmd)
-        lines = ["Motion guard: %s, action %s, slip limit %d%s" % (
-            "on" if self.enabled else "off", self.action, self.slip_limit,
+        lines = ["Motion guard: %s, action %s, watching %s, slip limit %d%s"
+                 % ("on" if self.enabled else "off", self.action,
+                    self.slip_watch, self.slip_limit,
             ", stall axes " + ", ".join(self.stall_axes)
             if self.stall_axes else "")]
         for axis, motor in self.motors.items():
@@ -212,13 +223,22 @@ class C5MotionGuard:
         if action not in ACTIONS:
             raise gcmd.error("ACTION must be one of: " + ", ".join(ACTIONS))
         self.action = action
+        watch = gcmd.get('WATCH', self.slip_watch).lower()
+        if watch not in SLIP_WATCH:
+            raise gcmd.error("WATCH must be one of: " + ", ".join(SLIP_WATCH))
+        if watch != self.slip_watch:
+            self.slip_watch = watch
+            if self.motors and not self._send_slip_watch():
+                gcmd.respond_info("This mainboard firmware only watches fast "
+                                  "moves; flash the newer MCU update")
         if gcmd.get_int('RESET', 0):
             self._reset_totals()
         # TEST=1 watches outside a print too, to try it with manual moves
         self.test_mode = bool(gcmd.get_int('TEST', int(self.test_mode),
                                            minval=0, maxval=1))
-        gcmd.respond_info("Motion guard %s, action %s%s"
+        gcmd.respond_info("Motion guard %s, action %s, watching %s%s"
                           % ("on" if self.enabled else "off", self.action,
+                             self.slip_watch,
                              ", test mode (watching outside prints)"
                              if self.test_mode else ""))
 

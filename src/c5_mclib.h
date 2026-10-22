@@ -36,7 +36,7 @@ struct c5_mclib_health {
     float torque_min, torque_max, error_min, error_max, last_error;
     float drift;
     int32_t slips, level;
-    uint32_t slip_total, stall_count, samples;
+    uint32_t slip_total, stall_count, samples, tracked;
     uint8_t last_valid, stall_prev;
 };
 
@@ -60,7 +60,7 @@ struct c5_mclib_motor {
     uint16_t phase, phase_increment, exponent;
     uint8_t axis, interpolation, direction;
     uint8_t mode, fast_mode, hold_transition, slow;
-    uint8_t quarter_count, stall;
+    uint8_t quarter_count, stall, slip_mode;
     struct c5_mclib_health health;
 };
 
@@ -97,8 +97,15 @@ uint8_t c5_mclib_update(struct c5_mclib_motor *m, uint32_t now,
 uint8_t c5_mclib_stalled(const struct c5_mclib_motor *m);
 void c5_mclib_take_health(struct c5_mclib_motor *m,
                           struct c5_mclib_health *out);
+// Slip tracking: C5_SLIP_MOVING only in fast moves (with the stall
+// detector), C5_SLIP_HOLDING also while holding still, C5_SLIP_ALWAYS
+// whenever the motor is enabled.
+#define C5_SLIP_MOVING 0u
+#define C5_SLIP_HOLDING 1u
+#define C5_SLIP_ALWAYS 2u
+void c5_mclib_slip_mode(struct c5_mclib_motor *m, uint8_t mode);
 void c5_mclib_track_health(struct c5_mclib_motor *m, float error,
-                           uint8_t armed);
+                           uint8_t armed, uint8_t tracking);
 void c5_mclib_acq_init(struct c5_mclib_acq *a);
 uint8_t c5_mclib_acquire(struct c5_mclib_acq *a,
                          int16_t raw0, int16_t raw1, float *ia, float *ib);

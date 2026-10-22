@@ -75,6 +75,10 @@ class FakeMotor:
     def get_stall_threshold(self):
         return 1.
 
+    def set_slip_mode(self, mode):
+        self.slip_mode = mode
+        return True
+
 
 class MotionGuardTest(unittest.TestCase):
     def setUp(self):
@@ -172,6 +176,18 @@ class MotionGuardTest(unittest.TestCase):
         text = gcmd.respond_info.call_args[0][0]
         self.assertIn('stepper_x: torque 2.000 to 9.000', text)
         self.assertIn('about 1.000', text)
+
+
+    def test_slip_watch_is_sent_at_ready_and_on_change(self):
+        g = self.guard(slip_watch='holding')
+        self.assertEqual({m.slip_mode for m in self.motors.values()}, {1})
+        gcmd = mock.Mock()
+        gcmd.get_int.side_effect = lambda name, default, **kw: default
+        gcmd.get.side_effect = lambda name, default: (
+            'always' if name == 'WATCH' else default)
+        g.cmd_GUARD(gcmd)
+        self.assertEqual({m.slip_mode for m in self.motors.values()}, {2})
+        self.assertEqual(g.get_status(0.)['slip_watch'], 'always')
 
 
 if __name__ == '__main__':
