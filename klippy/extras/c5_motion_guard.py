@@ -110,11 +110,13 @@ class C5MotionGuard:
     def _record(self, axis, h):
         r = self.recording.setdefault(axis, {'samples': 0, 'stalls': 0,
                                              'slips': 0, 'torque_min': None,
-                                             'torque_max': None})
+                                             'torque_max': None,
+                                             'err_min': None, 'err_max': None})
         r['samples'] += h['samples']
         r['stalls'] += h['stalls']
         r['slips'] += h['slips']
-        for key, pick in (('torque_min', min), ('torque_max', max)):
+        for key, pick in (('torque_min', min), ('torque_max', max),
+                          ('err_min', min), ('err_max', max)):
             if h[key] is not None:
                 r[key] = h[key] if r[key] is None else pick(r[key], h[key])
 
@@ -194,11 +196,12 @@ class C5MotionGuard:
                 lines.append("%s: no fast moves recorded" % (axis,))
                 continue
             lines.append(
-                "%s: torque %.3f to %.3f over %d samples, %d stall flags, "
-                "%d slips; a stall_threshold of about %.3f stays clear of "
-                "normal moves" % (axis, r['torque_min'], r['torque_max'],
-                                  r['samples'], r['stalls'], r['slips'],
-                                  r['torque_min'] * .5))
+                "%s: torque %.3f to %.3f, drift %.3f to %.3f rad over "
+                "%d samples, %d stall flags, %d slips; a stall_threshold of "
+                "about %.3f stays clear of normal moves" % (
+                    axis, r['torque_min'], r['torque_max'], r['err_min'],
+                    r['err_max'], r['samples'], r['stalls'], r['slips'],
+                    r['torque_min'] * .5))
         gcmd.respond_info("\n".join(lines))
 
     cmd_GUARD_help = "Turn the motion guard on or off, or set its action"

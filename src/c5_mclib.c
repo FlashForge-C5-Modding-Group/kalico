@@ -590,8 +590,14 @@ c5_mclib_disable(struct c5_mclib_motor *m)
     m->hold_transition = 0u;
 }
 
-static void
-update_health(struct c5_mclib_motor *m, float error, uint8_t armed)
+// A slip is the angle error drifting a whole electrical cycle from where it
+// was when the detector armed. The error is wrapped to +-pi and on X/Y sits
+// near +-pi in one direction, so follow it unwrapped instead of counting
+// wraps; the hysteresis keeps noise at a cycle boundary from counting.
+#define SLIP_HYSTERESIS 0.5f
+
+void
+c5_mclib_track_health(struct c5_mclib_motor *m, float error, uint8_t armed)
 {
     struct c5_mclib_health *h = &m->health;
     if (m->stall && !h->stall_prev)
@@ -601,33 +607,44 @@ update_health(struct c5_mclib_motor *m, float error, uint8_t armed)
         h->last_valid = 0u;
         return;
     }
-    // The angle error is wrapped to +-pi, so a jump of more than pi
-    // between two 20 kHz samples is a whole electrical cycle slipping.
-    if (h->last_valid) {
-        float jump = error - h->last_error;
-        if (jump < -ANGLE_PI_CORRECTION) {
-            h->slips++;
-            h->slip_total++;
-        } else if (jump > ANGLE_PI_CORRECTION) {
-            h->slips--;
-            h->slip_total++;
-        }
+    if (!h->last_valid) {
+        h->drift = 0.0f;
+        h->level = 0;
+    } else {
+        float step = error - h->last_error;
+        if (step > ANGLE_PI_CORRECTION)
+            step -= ANGLE_TAU_CORRECTION;
+        else if (step < -ANGLE_PI_CORRECTION)
+            step += ANGLE_TAU_CORRECTION;
+        h->drift += step;
     }
     h->last_error = error;
     h->last_valid = 1u;
+    while (h->drift > ((float)h->level + 0.5f) * ANGLE_TAU_CORRECTION
+           + SLIP_HYSTERESIS) {
+        h->level++;
+        h->slips++;
+        h->slip_total++;
+    }
+    while (h->drift < ((float)h->level - 0.5f) * ANGLE_TAU_CORRECTION
+           - SLIP_HYSTERESIS) {
+        h->level--;
+        h->slips--;
+        h->slip_total++;
+    }
     float torque = __builtin_fabsf(m->filtered_torque);
     if (!h->samples) {
         h->torque_min = h->torque_max = torque;
-        h->error_min = h->error_max = error;
+        h->error_min = h->error_max = h->drift;
     } else {
         if (torque < h->torque_min)
             h->torque_min = torque;
         if (torque > h->torque_max)
             h->torque_max = torque;
-        if (error < h->error_min)
-            h->error_min = error;
-        if (error > h->error_max)
-            h->error_max = error;
+        if (h->drift < h->error_min)
+            h->error_min = h->drift;
+        if (h->drift > h->error_max)
+            h->error_max = h->drift;
     }
     if (h->samples != UINT32_MAX)
         h->samples++;
@@ -648,7 +665,7 @@ update_stall_state(struct c5_mclib_motor *m, float ia, float ib,
     uint8_t armed = !m->hold_transition && !m->slow
         && m->quarter_count >= 17u;
     m->stall = decision && armed;
-    update_health(m, initial_error, armed);
+    c5_mclib_track_health(m, initial_error, armed);
 }
 
 static void

@@ -331,6 +331,54 @@ test_health_counters(void)
 }
 
 static void
+test_slip_tracking(void)
+{
+    struct c5_mclib_motor m;
+    struct c5_mclib_health h;
+    int i;
+
+    // X/Y in reverse: the error jitters across the +-pi wrap; no slips
+    c5_mclib_init(&m, 0);
+    for (i = 0; i < 2000; i++)
+        c5_mclib_track_health(&m, (i & 1) ? 3.1f : -3.1f, 1);
+    c5_mclib_take_health(&m, &h);
+    CHECK(h.slips == 0 && h.slip_total == 0,
+          "jitter across the wrap must not count slips");
+
+    // a real slip: the error keeps drifting a whole cycle and more
+    c5_mclib_init(&m, 0);
+    float e = 0.0f;
+    for (i = 0; i < 800; i++) {
+        e += 0.01f;
+        if (e > 3.14159265f)
+            e -= 6.2831853f;
+        c5_mclib_track_health(&m, e, 1);
+    }
+    c5_mclib_take_health(&m, &h);
+    CHECK(h.slips == 1 && h.slip_total == 1,
+          "an 8 rad drift must count one cycle");
+    CHECK(h.error_max > 7.9f && h.error_max < 8.1f,
+          "error range must be the unwrapped drift");
+
+    // drifting back the other way cancels out in the net count
+    for (i = 0; i < 800; i++) {
+        e -= 0.01f;
+        if (e < -3.14159265f)
+            e += 6.2831853f;
+        c5_mclib_track_health(&m, e, 1);
+    }
+    c5_mclib_take_health(&m, &h);
+    CHECK(h.slips == -1, "drifting back must count a cycle back");
+
+    // disarming restarts from the new error
+    c5_mclib_track_health(&m, 0.0f, 0);
+    c5_mclib_track_health(&m, 3.0f, 1);
+    c5_mclib_track_health(&m, -3.0f, 1);
+    c5_mclib_take_health(&m, &h);
+    CHECK(h.slips == 0, "rearming must take the error as the new reference");
+}
+
+static void
 test_hold_run_and_current_ramp(void)
 {
     static const uint32_t run_current[8] = {
@@ -789,6 +837,7 @@ main(void)
     test_electrical_cycle();
     test_stall_gating_and_wrap();
     test_health_counters();
+    test_slip_tracking();
     test_hold_run_and_current_ramp();
     test_acquisition();
     test_xy_crossover_resonance_and_limits();
