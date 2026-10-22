@@ -56,7 +56,7 @@ def creator5_start_command(header, footer=""):
     material_header = header
     if len(header) >= 65536 and not header.endswith(("\n", "\r")):
         material_header = header.rpartition("\n")[0]
-    material = "UNKNOWN"
+    materials = ()
     for source in (footer, material_header):
         meta = None
         for candidate in re.finditer(
@@ -64,19 +64,21 @@ def creator5_start_command(header, footer=""):
                 source, re.M):
             meta = candidate
         if meta:
-            materials = meta.group(1).split(";")
-            if tool < len(materials):
-                value = materials[tool].strip()
-                if (len(value) >= 2 and value[0] in "\"'"
-                        and value[-1] == value[0]):
-                    value = value[1:-1].strip()
-                if re.fullmatch(r"[A-Za-z0-9+_./-]+", value):
-                    material = value.upper()
+            materials = meta.group(1).split(";", 4)
             break
     command = "C5_PRINT_START TOOL=%d HOTEND=%g BED=%g" % (tool, hotend, bed or 0.)
     if first_layer is not None:
         command += " FIRST_LAYER_HEIGHT=%g" % first_layer
-    command += " MATERIAL=%s" % material
+    for index in range(4):
+        material = "UNKNOWN"
+        if index < len(materials):
+            value = materials[index].strip()
+            if (len(value) >= 2 and value[0] in "\"'"
+                    and value[-1] == value[0]):
+                value = value[1:-1].strip()
+            if re.fullmatch(r"[A-Za-z0-9+_./-]+", value):
+                material = value.upper()
+        command += " MATERIAL%d=%s" % (index, material)
     return command
 
 
