@@ -127,9 +127,37 @@ class MotionGuardTest(unittest.TestCase):
         self.gcode.respond_raw.assert_called_once()
         self.gcode.run_script.assert_not_called()
 
+    def test_every_new_slip_is_reported(self):
+        g = self.guard()
+        self.start_print(g)
+        for n in (1, 2):
+            self.motors['stepper_x'].answer(slips=1)
+            g._poll(0.)
+            g._poll(0.)
+        g._poll(0.)
+        self.assertEqual(self.gcode.respond_raw.call_count, 2)
+        self.assertIn('2 electrical cycles', g.tripped)
+
+    def test_homing_windows_are_ignored(self):
+        g = self.guard()
+        self.start_print(g)
+        g._homing('rails', True)
+        self.motors['stepper_z'].answer(slips=1)
+        g._poll(0.)
+        g._poll(0.)
+        g._homing('rails', False)
+        g._poll(0.)
+        g._poll(0.)
+        self.assertEqual(g.print_totals['stepper_z']['ignored'], 1)
+        self.assertIsNone(g.tripped)
+
     def test_pause_action(self):
         g = self.guard(action='pause')
         self.start_print(g)
+        self.motors['stepper_x'].answer(slips=1)
+        g._poll(0.)
+        g._poll(0.)
+        self.gcode.run_script.assert_called_once_with('PAUSE')
         self.motors['stepper_x'].answer(slips=1)
         g._poll(0.)
         g._poll(0.)
@@ -159,7 +187,7 @@ class MotionGuardTest(unittest.TestCase):
         self.motors['stepper_z'].answer(stalls=1)
         g._poll(0.)
         g._poll(0.)
-        self.assertEqual(g.tripped, 'stepper_z stalled')
+        self.assertEqual(g.tripped, 'stepper_z stalled (1 so far)')
 
     def test_record_suggests_threshold(self):
         g = self.guard()

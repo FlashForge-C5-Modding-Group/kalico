@@ -37,6 +37,15 @@ class C5MotionGuard:
         self.test_mode = False
         self.timer = None
         self.printer.register_event_handler('klippy:ready', self._ready)
+        # Homing drives into the endstops and probe; skip those windows too
+        self.homing = set()
+        for event, kind, on in (
+                ('homing:home_rails_begin', 'rails', True),
+                ('homing:home_rails_end', 'rails', False),
+                ('homing:homing_move_begin', 'move', True),
+                ('homing:homing_move_end', 'move', False)):
+            self.printer.register_event_handler(
+                event, lambda *a, kind=kind, on=on: self._homing(kind, on))
         for name, func, desc in (
                 ('C5_MOTION_STATUS', self.cmd_STATUS, self.cmd_STATUS_help),
                 ('C5_MOTION_RECORD', self.cmd_RECORD, self.cmd_RECORD_help),
@@ -57,6 +66,9 @@ class C5MotionGuard:
             self.timer = self.reactor.register_timer(
                 self._poll, self.reactor.NOW)
 
+    def _homing(self, kind, on):
+        (self.homing.add if on else self.homing.discard)(kind)
+
     def _send_slip_watch(self):
         return all([motor.set_slip_mode(SLIP_WATCH[self.slip_watch])
                     for motor in self.motors.values()])
@@ -64,6 +76,7 @@ class C5MotionGuard:
     def _reset_totals(self):
         self.print_totals = {a: {'slips': 0, 'stalls': 0, 'ignored': 0}
                              for a in self.motors}
+        self.reported = {}
         self.tripped = None
 
     def _printing(self):
@@ -95,8 +108,9 @@ class C5MotionGuard:
                 motor.query_health()
             return eventtime + self.poll_time
         # Docking pushes the carriage into the dock; skip any window that
-        # overlaps a toolchange.
-        busy = bool(getattr(self.toolchanger, 'busy', False))
+        # overlaps a toolchange or homing.
+        busy = bool(getattr(self.toolchanger, 'busy', False)) or bool(
+            self.homing)
         skip = busy or self.was_busy
         self.was_busy = busy
         for axis, motor in self.motors.items():
@@ -130,18 +144,22 @@ class C5MotionGuard:
                 r[key] = h[key] if r[key] is None else pick(r[key], h[key])
 
     def _check(self, axis, totals):
-        if self.tripped is not None:
+        # Report every time an axis gets worse; pause only the first time
+        slips, stalls = abs(totals['slips']), totals['stalls']
+        reported = self.reported.setdefault(axis, (0, 0))
+        reasons = []
+        if slips >= self.slip_limit and slips != reported[0]:
+            reasons.append("%s skipped steps: %d electrical cycles (%d full "
+                           "steps) so far" % (axis, slips, 4 * slips))
+        if stalls and stalls != reported[1]:
+            reasons.append("%s stalled (%d so far)" % (axis, stalls))
+        if not reasons:
             return
-        reason = None
-        if abs(totals['slips']) >= self.slip_limit:
-            reason = ("%s skipped steps: %d electrical cycles (%d full steps)"
-                      % (axis, abs(totals['slips']), 4 * abs(totals['slips'])))
-        elif totals['stalls']:
-            reason = "%s stalled" % (axis,)
-        if reason is None:
-            return
+        self.reported[axis] = (slips, stalls)
+        reason = "; ".join(reasons)
+        first = self.tripped is None
         self.tripped = reason
-        if self.action == 'pause':
+        if self.action == 'pause' and first:
             self.reactor.register_callback(lambda e: self._pause(reason))
         else:
             self.gcode.respond_raw("!! Motion guard: %s" % (reason,))
@@ -178,7 +196,8 @@ class C5MotionGuard:
             t = self.print_totals.get(axis, {})
             last = motor.last_status or {}
             lines.append(
-                "%s: this print %d slips, %d stalls (%d ignored in toolchanges);"
+                "%s: this print %d slips, %d stalls (%d ignored in toolchanges"
+                " and homing);"
                 " stall flag %s, stall_threshold %.3f" % (
                     axis, t.get('slips', 0), t.get('stalls', 0),
                     t.get('ignored', 0), last.get('stall', '?'),
