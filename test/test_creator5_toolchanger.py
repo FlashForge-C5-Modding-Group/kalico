@@ -69,6 +69,9 @@ class Creator5OffsetTests(unittest.TestCase):
         with open(self.board.test_json_path, 'w') as target:
             target.write('{"generalFirmware": false, "tempOffset": 0.00045, '
                          '"cylinder_x": 28.5, "cylinder_y": 214.5}\n')
+        self.board.toolchange_count_path = os.path.join(
+            self.temp.name, 'toolchanges.txt')
+        self.board.toolchange_counts = [0] * 4
         self.board.measurements = [[15., 215., 1.] for _ in range(4)]
         self.board.docks = [[298., 50. + i * 50.] for i in range(4)]
         self.board.station_x = 29.
@@ -578,6 +581,21 @@ class Creator5OffsetTests(unittest.TestCase):
         heater.get_status.return_value = {'target': 0., 'power': 0.5}
         with self.assertRaisesRegex(RuntimeError, 'Door topDoor is open'):
             self.board._check_chamber_doors(GCmd(), 'Door %s is open')
+
+    def test_toolchange_counter_persists_per_tool_and_total(self):
+        self.board._count_toolchange(2)
+        self.board._count_toolchange(2)
+        self.board._count_toolchange(0)
+        with open(self.board.toolchange_count_path) as source:
+            self.assertEqual(source.read(),
+                             'Total: 3\nT0: 1\nT1: 0\nT2: 2\nT3: 0\n')
+        self.assertEqual(self.board._load_toolchange_counts(), [1, 0, 2, 0])
+
+    def test_toolchange_counter_write_failure_is_not_fatal(self):
+        self.board.toolchange_count_path = os.path.join(
+            self.temp.name, 'missing', 'toolchanges.txt')
+        self.board._count_toolchange(1)
+        self.assertEqual(self.board.toolchange_counts, [0, 1, 0, 0])
 
     def test_unknown_chamber_heater_state_does_not_bypass_open_doors(self):
         self.board.door_buttons = ['topDoor']

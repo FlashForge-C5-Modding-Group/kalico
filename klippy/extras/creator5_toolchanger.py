@@ -101,6 +101,12 @@ class Creator5Toolchanger:
             'test_json_path', '/usr/data/firmwareRes/config/test.json'))
         self.z_adjustments = [0.] * 4
         self._load_zoffset_json()
+        config_dir = os.path.dirname(os.path.abspath(
+            self.printer.get_start_args().get('config_file', 'printer.cfg')))
+        self.toolchange_count_path = os.path.expanduser(config.get(
+            'toolchange_count_path', os.path.join(config_dir,
+                                                  'toolchanges.txt')))
+        self.toolchange_counts = self._load_toolchange_counts()
         self.print_z_baseline = [None] * 4
         self._button_objects = {}
         # UI status may be polled many times per second on a small MIPS host.
@@ -571,6 +577,41 @@ class Creator5Toolchanger:
         self.z_adjustments[tool] = adjustment
         gcmd.respond_info('Saved T%d touchscreen Z adjustment %.4f mm'
                           % (tool, adjustment))
+
+    def _load_toolchange_counts(self):
+        counts = [0] * 4
+        try:
+            with open(self.toolchange_count_path) as source:
+                for line in source:
+                    key, _, value = line.partition(':')
+                    key = key.strip().upper()
+                    if key in ('T0', 'T1', 'T2', 'T3'):
+                        counts[int(key[1])] = max(0, int(value.strip()))
+        except (OSError, ValueError):
+            pass
+        return counts
+
+    def _count_toolchange(self, tool):
+        # A failed write must never stop a print.
+        self.toolchange_counts[tool] += 1
+        counts = self.toolchange_counts
+        temp_path = None
+        try:
+            fd, temp_path = tempfile.mkstemp(
+                prefix='.toolchanges-', suffix='.tmp',
+                dir=os.path.dirname(self.toolchange_count_path) or '.')
+            with os.fdopen(fd, 'w') as target:
+                target.write('Total: %d\n' % sum(counts))
+                for index, count in enumerate(counts):
+                    target.write('T%d: %d\n' % (index, count))
+            os.chmod(temp_path, 0o644)
+            os.replace(temp_path, self.toolchange_count_path)
+            temp_path = None
+        except OSError:
+            logging.exception('Could not save %s', self.toolchange_count_path)
+        finally:
+            if temp_path is not None and os.path.exists(temp_path):
+                os.unlink(temp_path)
 
     def cmd_auto_nozzle_z(self, gcmd):
         tool = gcmd.get_int('T', minval=0, maxval=3)
@@ -1367,6 +1408,7 @@ class Creator5Toolchanger:
             self._pickup(gcmd, tool, raise_z=z_homed)
         self._with_motion(gcmd, change,
                           final_accel=self.post_select_accel)
+        self._count_toolchange(tool)
         self._sync_clog_sensors(tool)
 
     def cmd_dock(self, gcmd):
