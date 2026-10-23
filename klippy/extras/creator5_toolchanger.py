@@ -207,7 +207,7 @@ class Creator5Toolchanger:
         self.purge_max_x = config.getfloat('purge_max_x', 279., maxval=279.)
         self.cooldown_x = config.getfloat('cooldown_x', 266.5)
         self.cooldown_y = config.getfloat('cooldown_y', 13.8)
-        self.cooldown_wipe_z = config.getfloat('cooldown_wipe_z', 2.,
+        self.cooldown_wipe_z = config.getfloat('cooldown_wipe_z', 1.8,
                                                minval=1., maxval=5.)
         self.cooldown_lift_z = config.getfloat('cooldown_lift_z', 10.,
                                                above=self.cooldown_wipe_z)
@@ -1007,6 +1007,19 @@ class Creator5Toolchanger:
         self._move(x=x - 10., feed=self.dock_approach_speed * 60.)
         self._move(x=x, feed=self.dock_approach_speed * 60.)
         self._run('M400')
+        # Release only with the head seated in its holder and the carriage at
+        # the mount. After lost steps the dock position is wrong, and an
+        # unchecked release dropped the head; keep it locked on instead.
+        self._pause_ms(self.toolchange_sensor_settle_ms)
+        if not (self._button(self.dock_buttons[tool], gcmd)
+                and self._button(self.grab_buttons[tool], gcmd)):
+            try:
+                self._run('TURN_OFF_HEATERS')
+            except Exception:
+                logging.exception('Creator 5 heater shutdown failed after dock check')
+            raise gcmd.error(
+                'T%d is not seated in its dock; not releasing it (heaters '
+                'off). XY may have lost steps: re-home before docking' % tool)
         self._run('MOTOR_RELEASE')
         self._pause_ms(self.release_latch_wait_ms)
         self._move(x=self.approach_x,

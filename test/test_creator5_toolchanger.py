@@ -661,6 +661,45 @@ class Creator5OffsetTests(unittest.TestCase):
         self.assertFalse(any(' Z=0 ' in call.args[0] for call in
                              board._run.call_args_list))
 
+    def _dock_board(self, seated, at_mount):
+        board = self.board
+        board.approach_x = 250.
+        board.clear_travel_speed = 600.
+        board.dock_approach_speed = 25.
+        board.dock_predock_offset = 20.
+        board.departure_speed = 90.
+        board.release_latch_wait_ms = 50
+        board.toolchange_sensor_settle_ms = 20
+        board.dock_buttons = ['d0', 'd1', 'd2', 'd3']
+        board.grab_buttons = ['g0', 'g1', 'g2', 'g3']
+        board._move = mock.Mock()
+        board._run = mock.Mock()
+        board._pause_ms = mock.Mock()
+        board._verify = mock.Mock()
+        board._travel_to_lane = mock.Mock()
+        board._button = lambda name, gcmd: {'d0': seated, 'g0': at_mount}.get(name, False)
+        board.z_adjustments = [0.] * 4
+        board.printer.lookup_object.return_value.get_status.return_value = {
+            'homing_origin': (0., 0., 2., 0.)}
+        return board
+
+    def test_dock_releases_only_when_seated_at_mount(self):
+        board = self._dock_board(seated=True, at_mount=True)
+        board._dock(GCmd(), 0, raise_z=False)
+        board._run.assert_any_call('MOTOR_RELEASE')
+        board._verify.assert_called_once_with(mock.ANY, None, parked=0)
+
+    def test_dock_keeps_head_locked_when_not_seated(self):
+        for seated, at_mount in ((False, True), (True, False), (False, False)):
+            with self.subTest(seated=seated, at_mount=at_mount):
+                board = self._dock_board(seated, at_mount)
+                with self.assertRaisesRegex(RuntimeError, 'not seated in its dock'):
+                    board._dock(GCmd(), 0, raise_z=False)
+                commands = [c.args[0] for c in board._run.call_args_list]
+                self.assertNotIn('MOTOR_RELEASE', commands)
+                self.assertIn('TURN_OFF_HEATERS', commands)
+                board._verify.assert_not_called()
+
     def test_pickup_speeds_come_from_config(self):
         board = self.board
         board.approach_x = 250.
