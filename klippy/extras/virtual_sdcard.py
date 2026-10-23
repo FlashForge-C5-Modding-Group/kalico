@@ -19,7 +19,7 @@ DEFAULT_ERROR_GCODE = """
 """
 
 
-def creator5_start_command(header):
+def creator5_start_command(header, footer=""):
     if re.search(r"^\s*C5_PRINT_START\b", header, re.I | re.M):
         return None
     tool = 0
@@ -53,9 +53,32 @@ def creator5_start_command(header):
     if hotend is None:
         raise ValueError("No hotend temperature found in G-code header; "
                          "add C5_PRINT_START TOOL=n HOTEND=n BED=n")
+    material_header = header
+    if len(header) >= 65536 and not header.endswith(("\n", "\r")):
+        material_header = header.rpartition("\n")[0]
+    materials = ()
+    for source in (footer, material_header):
+        meta = None
+        for candidate in re.finditer(
+                r"^[ \t]*;[ \t]*filament_type[ \t]*=[ \t]*([^\r\n]*)",
+                source, re.M):
+            meta = candidate
+        if meta:
+            materials = meta.group(1).split(";", 4)
+            break
     command = "C5_PRINT_START TOOL=%d HOTEND=%g BED=%g" % (tool, hotend, bed or 0.)
     if first_layer is not None:
         command += " FIRST_LAYER_HEIGHT=%g" % first_layer
+    for index in range(4):
+        material = "UNKNOWN"
+        if index < len(materials):
+            value = materials[index].strip()
+            if (len(value) >= 2 and value[0] in "\"'"
+                    and value[-1] == value[0]):
+                value = value[1:-1].strip()
+            if re.fullmatch(r"[A-Za-z0-9+_./-]+", value):
+                material = value.upper()
+        command += " MATERIAL%d=%s" % (index, material)
     return command
 
 
@@ -401,6 +424,16 @@ class VirtualSD:
                 and not self.file_position):
             try:
                 header = self.current_file.read(65536)
+                # Read bytes so a tail offset inside UTF-8 cannot corrupt
+                # the text decoder used to execute the print afterward.
+                footer_offset = max(0, self.file_size - 65536)
+                self.current_file.buffer.seek(max(0, footer_offset - 1))
+                at_line_start = (not footer_offset
+                                 or self.current_file.buffer.read(1) == b"\n")
+                footer = self.current_file.buffer.read(65536).decode(
+                    errors="replace")
+                if not at_line_start:
+                    footer = footer.partition("\n")[2]
                 self.current_file.seek(0)
                 definitions = creator5_object_definitions(header)
                 if (definitions and self._run_worker_script(
@@ -411,7 +444,7 @@ class VirtualSD:
                             break
                         self.creator5_preloaded_definitions.add(offset)
                 if not self.must_pause_work:
-                    start_command = creator5_start_command(header)
+                    start_command = creator5_start_command(header, footer)
                     self.creator5_start_done = True
                     if (start_command is not None
                             and not self._run_worker_script(start_command)):
