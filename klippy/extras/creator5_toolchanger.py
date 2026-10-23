@@ -93,6 +93,8 @@ class Creator5Toolchanger:
         self.extruder_json_path = os.path.expanduser(config.get(
             'extruder_json_path', '/usr/data/firmwareRes/config/extruder.json'))
         self._load_extruder_json()
+        # The fixture reference the saved head measurements were taken against
+        self._measure_ref = (self.station_x, self.station_y)
         self.zoffset_json_path = os.path.expanduser(config.get(
             'zoffset_json_path', '/usr/data/firmwareRes/config/zoffset.json'))
         self.test_json_path = os.path.expanduser(config.get(
@@ -670,6 +672,7 @@ class Creator5Toolchanger:
                     os.unlink(temp_path)
         except (OSError, ValueError, TypeError) as exc:
             raise gcmd.error('Could not save extruder offsets: %s' % exc)
+        self._measure_ref = (self.station_x, self.station_y)
         gcmd.respond_info('Saved offsets to %s (backup: %s)' % (
             self.extruder_json_path, backup))
 
@@ -1436,6 +1439,15 @@ class Creator5Toolchanger:
     def _calibrate_tool_xy(self, gcmd, tool, scan_height=None):
         cx = self.station_x + self.tool_fixture_shift_x
         cy = self.station_y
+        # Start where this head's nozzle was last found against the fixture:
+        # heads sit up to a few mm apart, and each edge is only scan_span away
+        # from the start, so a head off-center in Y missed its far edge.
+        ref = getattr(self, '_measure_ref', None)
+        if ref is not None:
+            lim = self.max_offset_correction
+            old = self.measurements[tool]
+            cx += max(-lim, min(lim, old[0] - (ref[0] + self.tool_fixture_shift_x)))
+            cy += max(-lim, min(lim, old[1] - ref[1]))
         if scan_height is None:
             scan_height = self.scan_height
         x, y = self._scan_xy(gcmd, cx, cy, scan_height)

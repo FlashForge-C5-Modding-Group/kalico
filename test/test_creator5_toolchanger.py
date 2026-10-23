@@ -1010,6 +1010,25 @@ class Creator5OffsetTests(unittest.TestCase):
             mock.call('X', 21., mock.ANY),
             mock.call('Y', 207., mock.ANY)])
 
+    def test_head_scan_starts_at_its_last_measured_center(self):
+        self.board.station_x, self.board.station_y = 28.8, 213.9
+        self.board._measure_ref = (28.8, 215.1)
+        self.board.tool_fixture_shift_x = -12.5
+        self.board.max_offset_correction = 3.
+        self.board.measurements = [[16.3, 215.1, 1.4], [15.5, 217.6, 1.4],
+                                   [16.3, 225., 1.4], [16.3, 215.1, 1.4]]
+        self.board._scan_xy = mock.Mock(return_value=(15.5, 216.4))
+        self.board._calibrate_tool_xy(GCmd(), 1, 2.)
+        x, y = self.board._scan_xy.call_args.args[1:3]
+        self.assertAlmostEqual(x, 15.5)
+        self.assertAlmostEqual(y, 216.4)
+        # A wild old measurement only moves the start by the correction limit
+        # (and the existing deviation limit still rejects the result)
+        self.board._scan_xy = mock.Mock(return_value=(16.3, 216.9))
+        with self.assertRaisesRegex(RuntimeError, 'deviation exceeds'):
+            self.board._calibrate_tool_xy(GCmd(), 2, 2.)
+        self.assertAlmostEqual(self.board._scan_xy.call_args.args[2], 216.9)
+
     def test_single_offset_docks_checks_plate_references_then_selects(self):
         self.board.scan_height = None
         self.board._preflight = mock.Mock(side_effect=[
