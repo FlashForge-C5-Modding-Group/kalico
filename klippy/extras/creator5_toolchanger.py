@@ -776,6 +776,10 @@ class Creator5Toolchanger:
                              % (offset, attached))
 
     def _chamber_heater_active(self, gcmd):
+        # The Creator 5 (non-Pro) has no chamber heater.
+        if self.printer.lookup_object('heater_generic chamber_heater',
+                                      None) is None:
+            return False
         try:
             heater = self.printer.lookup_object('heaters').lookup_heater(
                 'chamber_heater')

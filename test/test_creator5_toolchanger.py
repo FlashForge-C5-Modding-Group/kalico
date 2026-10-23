@@ -581,10 +581,21 @@ class Creator5OffsetTests(unittest.TestCase):
 
     def test_unknown_chamber_heater_state_does_not_bypass_open_doors(self):
         self.board.door_buttons = ['topDoor']
-        self.board.printer.lookup_object.return_value = None
+        heaters = mock.Mock()
+        heaters.lookup_heater.side_effect = Exception('lookup failed')
+        self.board.printer.lookup_object.side_effect = (
+            lambda name, *default: heaters if name == 'heaters'
+            else mock.Mock())
         with self.assertRaisesRegex(RuntimeError,
                                     'Cannot verify chamber heater state'):
             self.board._check_chamber_doors(GCmd(), 'Door %s is open')
+
+    def test_open_door_allowed_without_a_chamber_heater(self):
+        self.board.door_buttons = ['topDoor']
+        self.board._button = lambda name, gcmd: False
+        self.board.printer.lookup_object.side_effect = (
+            lambda name, *default: default[0] if default else mock.Mock())
+        self.board._check_chamber_doors(GCmd(), 'Door %s is open')
 
     def test_attached_tool_and_status_use_only_dock_grab_pins(self):
         states = {'dock0': 'PRESSED', 'dock1': 'PRESSED',
