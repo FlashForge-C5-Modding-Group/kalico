@@ -27,7 +27,7 @@ class PrinterHeaterFanThrottled:
         self.near_target_power = config.getfloat(
             "near_target_power", 0.3, minval=0., maxval=1.)
         self.run_while_cooling = config.getboolean("run_while_cooling", True)
-        # Optional virtual output_pin: on = full speed whenever the heater is
+        # Optional virtual output_pin: on = fan_speed whenever the heater is
         # on, off = the near-target throttling below.
         self.full_speed_switch = None
         switch_name = config.get("full_speed_switch", None)
@@ -69,7 +69,7 @@ class PrinterHeaterFanThrottled:
             full_speed = (self.full_speed_switch is not None
                           and self.full_speed_switch.enabled)
             if full_speed:
-                speed = max(speed, 1.)
+                speed = max(speed, self.fan_speed)
             elif near_target:
                 # Close enough to target, and the heater has backed off
                 # its own power to hold it -- full airflow would mostly

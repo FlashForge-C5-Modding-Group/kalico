@@ -120,14 +120,14 @@ class HeaterFanThrottledTests(unittest.TestCase):
             printer.lookup_object('output_pin chamber_heat_fan_full')
             .get_status(0.), {'value': 0.})
 
-    def test_switch_on_runs_full_speed_while_heating(self):
+    def test_switch_on_runs_fan_speed_while_heating(self):
         printer, fan = self.make_fan(full_speed_switch='chamber_heat_fan_full')
         fan.full_speed_switch.enabled = True
         fan.heaters = [Heater(59., 60., 0.1)]
         fan.callback(0.)
         fan.heaters = [Heater(30., 60., 1.)]
         fan.callback(1.)
-        self.assertEqual(fan.fan.speeds, [1.])
+        self.assertEqual(fan.fan.speeds, [0.9])
 
     def test_switch_on_still_stops_when_the_heater_is_off(self):
         printer, fan = self.make_fan(full_speed_switch='chamber_heat_fan_full',
