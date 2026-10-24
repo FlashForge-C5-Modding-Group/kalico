@@ -79,7 +79,35 @@ def creator5_start_command(header, footer=""):
             if re.fullmatch(r"[A-Za-z0-9+_./-]+", value):
                 material = value.upper()
         command += " MATERIAL%d=%s" % (index, material)
+    used = creator5_slot_list(r"filament used \[mm\]", footer, material_header)
+    tools = [index for index, value in enumerate(used[:4]) if value > 0]
+    if tools:
+        command += " USED_TOOLS=%s" % ",".join(map(str, tools))
+    idle = creator5_slot_list(r"idle_temperature", footer, material_header)
+    for index, value in enumerate(idle[:4]):
+        if value > 0:
+            command += " IDLE%d=%g" % (index, value)
     return command
+
+
+def creator5_slot_list(key, *sources):
+    """Orca's '; <key> = a,b,...' per-filament numbers, from the first source
+    that has the line (its last occurrence)."""
+    for source in sources:
+        meta = None
+        for candidate in re.finditer(
+                r"^[ \t]*;[ \t]*" + key + r"[ \t]*=[ \t]*([^\r\n]*)",
+                source, re.M):
+            meta = candidate
+        if meta:
+            values = []
+            for value in meta.group(1).split(","):
+                try:
+                    values.append(float(value))
+                except ValueError:
+                    values.append(0.)
+            return values
+    return []
 
 
 def creator5_slicer_z_offset(line):

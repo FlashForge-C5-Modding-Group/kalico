@@ -385,6 +385,23 @@ class VirtualSDEOFTests(unittest.TestCase):
         self.assertEqual(sd.file_position, sd.file_size)
         sd.print_stats.note_complete.assert_called_once()
 
+    def test_automatic_start_passes_used_tools_and_idle_temperatures(self):
+        text = ('M109 S220\nT0\nG1 X10\n;' + 'x' * 70000
+                + '\n; filament used [mm] = 3745.08, 0.00, 0.00, 650.04\n'
+                '; CONFIG_BLOCK_START\n'
+                '; idle_temperature = 0,150,0,170\n'
+                '; CONFIG_BLOCK_END\n')
+        sd = self.make_sd(text)
+        sd.auto_creator5_start = True
+        sd.work_handler(0.)
+        commands = [c.args[0] for c in sd.gcode.run_script.call_args_list]
+        self.assertEqual(
+            commands[0],
+            'C5_PRINT_START TOOL=0 HOTEND=220 BED=0 '
+            'MATERIAL0=UNKNOWN MATERIAL1=UNKNOWN '
+            'MATERIAL2=UNKNOWN MATERIAL3=UNKNOWN '
+            'USED_TOOLS=0,3 IDLE1=150 IDLE3=170')
+
     def test_footer_material_overrides_prefix_even_when_windows_overlap(self):
         for value, material in (('PETG', 'PETG'), ('', 'UNKNOWN'),
                                 ('PLA HOTEND=999', 'UNKNOWN')):
