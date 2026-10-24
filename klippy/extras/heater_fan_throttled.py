@@ -27,6 +27,15 @@ class PrinterHeaterFanThrottled:
         self.near_target_power = config.getfloat(
             "near_target_power", 0.3, minval=0., maxval=1.)
         self.run_while_cooling = config.getboolean("run_while_cooling", True)
+        # Optional virtual output_pin: on = full speed whenever the heater is
+        # on, off = the near-target throttling below.
+        self.full_speed_switch = None
+        switch_name = config.get("full_speed_switch", None)
+        if switch_name:
+            from .creator5_toolchanger import Creator5MiscSwitch
+            self.full_speed_switch = Creator5MiscSwitch(
+                self.printer, self.printer.lookup_object('gcode'), switch_name,
+                config.getboolean("full_speed_default", False))
         self.last_speed = 0.
     def handle_ready(self):
         pheaters = self.printer.lookup_object('heaters')
@@ -57,7 +66,11 @@ class PrinterHeaterFanThrottled:
             # happened to read close for a moment.
             near_target = (target_temp - current_temp <= self.near_target_delta
                           and heater.last_pwm_value <= self.near_target_power)
-            if near_target:
+            full_speed = (self.full_speed_switch is not None
+                          and self.full_speed_switch.enabled)
+            if full_speed:
+                speed = max(speed, 1.)
+            elif near_target:
                 # Close enough to target, and the heater has backed off
                 # its own power to hold it -- full airflow would mostly
                 # just overshoot/hunt -- maintain with less air instead.
