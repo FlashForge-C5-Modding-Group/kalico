@@ -582,6 +582,45 @@ class Creator5OffsetTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'Door topDoor is open'):
             self.board._check_chamber_doors(GCmd(), 'Door %s is open')
 
+    def _holder_measure_setup(self, x_trigger, y_trigger):
+        self.board.max_mount_correction = 2.
+        self.board.pullback_slow_distance = 20.
+        self.board.pullback_speed = 80.
+        self.board.pickup_latch_wait_ms = 0
+        self.board.sensor_settle_ms = 0
+        self.board.docks[1] = [298., 100.]
+        self.board._run = mock.Mock()
+        self.board._move = mock.Mock()
+        self.board._pause_ms = mock.Mock()
+        self.board._button = lambda name, gcmd: name == 'grab1'
+        x_home, y_home = mock.Mock(), mock.Mock()
+        x_home.measure_axis.return_value = x_trigger
+        y_home.measure_axis.return_value = y_trigger
+        self.board.printer.lookup_object.side_effect = (
+            lambda name, *default: {'hd_home X': x_home,
+                                    'hd_home Y': y_home}[name])
+        return x_home, y_home
+
+    def test_holder_measure_travels_fast_to_short_of_saved_dock(self):
+        # T1: Y reference 130; saved dock X298 Y100 puts the endstops at
+        # X-3 and Y30, so travel stops 10 mm short of each.
+        self._holder_measure_setup(-3.5, 29.8)
+        x, y = self.board._measure_holder_position(GCmd(), 1)
+        self.assertAlmostEqual(x, 298.5)
+        self.assertAlmostEqual(y, 100.2)
+        self.assertEqual(self.board._move.call_args_list[1:], [
+            mock.call(x=240., feed=12000),
+            mock.call(x=7., feed=12000),
+            mock.call(y=40., feed=12000)])
+
+    def test_holder_measure_margin_stays_wider_than_correction_limit(self):
+        self._holder_measure_setup(-3., 30.)
+        self.board.max_mount_correction = 8.
+        self.board._measure_holder_position(GCmd(), 1)
+        self.assertEqual(self.board._move.call_args_list[2:], [
+            mock.call(x=10., feed=12000),
+            mock.call(y=43., feed=12000)])
+
     def test_toolchange_counter_persists_per_tool_and_total(self):
         self.board._count_toolchange(2)
         self.board._count_toolchange(2)

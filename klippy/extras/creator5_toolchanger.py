@@ -1884,14 +1884,23 @@ class Creator5Toolchanger:
                 or not self._button(self.grab_buttons[tool], gcmd)):
             raise gcmd.error('T%d did not leave its holder with the '
                              'carriage; calibration stopped' % tool)
-        self._move(x=240., feed=6000)
+        # Travel fast to just short of where the saved dock position puts
+        # each endstop, then measure slowly from there. The margin stays
+        # wider than the correction limit, so a holder that is still within
+        # it can never be driven into at travel speed.
+        old_x, old_y = self.docks[tool]
+        approach = max(10., self.max_mount_correction + 5.)
+        self._move(x=240., feed=12000)
+        self._move(x=min(240., HOLDER_REFERENCE_X - old_x + approach),
+                   feed=12000)
         x_result = x_home.measure_axis(-5.)
+        self._move(y=min(y_reference, y_reference - old_y + approach),
+                   feed=12000)
         y_result = y_home.measure_axis(0.)
         x = abs(HOLDER_REFERENCE_X - x_result)
         y = y_reference - y_result
         if not all(math.isfinite(value) for value in (x, y)):
             raise gcmd.error('Non-finite holder measurement')
-        old_x, old_y = self.docks[tool]
         if (abs(x - old_x) > self.max_mount_correction
                 or abs(y - old_y) > self.max_mount_correction):
             raise gcmd.error('T%d holder X=%.4f Y=%.4f exceeds the '
