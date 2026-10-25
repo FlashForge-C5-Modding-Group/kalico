@@ -240,9 +240,11 @@ class LookAheadQueue:
 
 BUFFER_TIME_HIGH = 2.0
 BUFFER_TIME_START = 0.250
-# Maximum host time moves may accumulate in "NeedPrime"/"Priming" while
-# G-code keeps arriving (matches the 0.100s idle priming timeout).
-PRIME_FLUSH_WALL_TIME = 0.100
+# Maximum host time between lookahead releases while G-code keeps arriving
+# and less than BUFFER_TIME_HIGH is buffered (matches the 0.100s idle
+# priming timeout). Without it a slow host can parse for seconds before the
+# move-time based lookahead budget releases anything.
+LOOKAHEAD_WALL_FLUSH_TIME = 0.100
 
 
 # Main code to track events (and their timing) on the printer toolhead
@@ -283,7 +285,7 @@ class ToolHead:
         self.print_time = 0.0
         self.special_queuing_state = "NeedPrime"
         self.priming_timer = None
-        self.prime_flush_deadline = None
+        self.wall_flush_deadline = None
 
         # Setup for generating moves
         self.motion_queuing = self.printer.load_object(config, "motion_queuing")
@@ -350,11 +352,11 @@ class ToolHead:
     def _advance_move_time(self, next_print_time):
         self.print_time = max(self.print_time, next_print_time)
 
-    def _calc_print_time(self):
+    def _calc_print_time(self, start_lead=BUFFER_TIME_START):
         curtime = self.reactor.monotonic()
         est_print_time = self.mcu.estimated_print_time(curtime)
         kin_time = self.motion_queuing.calc_step_gen_restart(est_print_time)
-        min_print_time = max(est_print_time + BUFFER_TIME_START, kin_time)
+        min_print_time = max(est_print_time + start_lead, kin_time)
         if min_print_time > self.print_time:
             self.print_time = min_print_time
             self.printer.send_event(
@@ -374,8 +376,23 @@ class ToolHead:
             # Transition from "NeedPrime"/"Priming" state to main state
             self.special_queuing_state = ""
             self.need_check_pause = -1.0
-            self.prime_flush_deadline = None
-            self._calc_print_time()
+            self.wall_flush_deadline = None
+            start_lead = BUFFER_TIME_START
+            if lazy and self.can_pause:
+                # A lazy flush holds moves back, so the head is still moving
+                # at the end of this batch. If the batch plus lead is shorter
+                # than the step generation window, the first background flush
+                # sees a run-out and stops the head. Start later instead.
+                batch_time = sum(
+                    m.accel_t + m.cruise_t + m.decel_t for m in moves
+                )
+                start_lead = max(
+                    start_lead,
+                    self.motion_queuing.get_runout_lead()
+                    + LOOKAHEAD_WALL_FLUSH_TIME
+                    - batch_time,
+                )
+            self._calc_print_time(start_lead)
         # Queue moves into trapezoid motion queue (trapq)
         next_move_time = self.print_time
         for move in moves:
@@ -418,7 +435,7 @@ class ToolHead:
         prev_print_time = self.print_time
         self._process_lookahead()
         self.special_queuing_state = "NeedPrime"
-        self.prime_flush_deadline = None
+        self.wall_flush_deadline = None
         self.need_check_pause = -1.0
         self.lookahead.set_flush_time(BUFFER_TIME_HIGH)
         self.check_stall_time = 0.0
@@ -520,16 +537,22 @@ class ToolHead:
                 ea.check_move(move, e_index + 3)
         self.commanded_pos[:] = move.end_pos
         want_flush = self.lookahead.add_move(move)
-        if self.can_pause and self.special_queuing_state in ("NeedPrime", "Priming"):
-            # Bound host time spent accumulating moves before motion starts;
-            # on a slow host the move-time budget alone can take seconds.
+        if self.can_pause and self.special_queuing_state != "Drip":
+            # Bound host time between lookahead releases until enough motion
+            # is buffered; on a slow host the move-time budget alone can take
+            # seconds while the head idles or the buffer runs out.
             now = self.reactor.monotonic()
-            if self.prime_flush_deadline is None:
-                self.prime_flush_deadline = now + PRIME_FLUSH_WALL_TIME
-            elif now >= self.prime_flush_deadline:
-                want_flush = True
+            if self.wall_flush_deadline is None:
+                self.wall_flush_deadline = now + LOOKAHEAD_WALL_FLUSH_TIME
+            elif now >= self.wall_flush_deadline:
                 # Retry later (not every move) if lazy flush finds no cut point
-                self.prime_flush_deadline = now + PRIME_FLUSH_WALL_TIME
+                self.wall_flush_deadline = now + LOOKAHEAD_WALL_FLUSH_TIME
+                if (
+                    self.special_queuing_state
+                    or self.print_time - self.mcu.estimated_print_time(now)
+                    < BUFFER_TIME_HIGH
+                ):
+                    want_flush = True
         if want_flush:
             self._process_lookahead(lazy=True)
         if self.print_time > self.need_check_pause:
