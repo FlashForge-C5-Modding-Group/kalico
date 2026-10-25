@@ -286,6 +286,7 @@ class ToolHead:
         self.special_queuing_state = "NeedPrime"
         self.priming_timer = None
         self.wall_flush_deadline = None
+        self.wall_flush_start = 0.0
         self.step_flush_ran_out = False
 
         # Setup for generating moves
@@ -367,31 +368,43 @@ class ToolHead:
                 self.print_time,
             )
 
-    def _process_lookahead(self, lazy=False):
+    def _process_lookahead(self, lazy=False, wall_restart=False):
+        flush_time = self.lookahead.junction_flush
         moves = self.lookahead.flush(lazy=lazy)
         if not moves:
             return
         # Resync print_time if necessary
         if self.special_queuing_state:
-            # Transition from "NeedPrime"/"Priming" state to main state
-            self.special_queuing_state = ""
-            self.need_check_pause = -1.0
-            self.wall_flush_deadline = None
             start_lead = BUFFER_TIME_START
             if lazy and self.can_pause:
+                batch_time = sum(
+                    m.accel_t + m.cruise_t + m.decel_t for m in moves
+                )
+                if wall_restart and (
+                    batch_time
+                    < self.reactor.monotonic() - self.wall_flush_start
+                ):
+                    # The G-code input is slower than the motion it produces,
+                    # so an early start would run out mid-path. Keep the moves
+                    # and wait for the move-time budget, as upstream does.
+                    self.lookahead.queue[0:0] = moves
+                    self.lookahead.set_flush_time(flush_time)
+                    self.wall_flush_deadline = self.reactor.NEVER
+                    return
                 # A lazy flush holds moves back, so the head is still moving
                 # at the end of this batch. If the batch plus lead is shorter
                 # than the run-out lead, background flushing reaches its end
                 # and stops the head. Start later instead. This covers the
                 # first flush pass only: the next one (~0.25s later) still
                 # needs a newer batch, which move() releases every 0.1s.
-                batch_time = sum(
-                    m.accel_t + m.cruise_t + m.decel_t for m in moves
-                )
                 start_lead = max(
                     start_lead,
                     self.motion_queuing.get_runout_lead() - batch_time,
                 )
+            # Transition from "NeedPrime"/"Priming" state to main state
+            self.special_queuing_state = ""
+            self.need_check_pause = -1.0
+            self.wall_flush_deadline = None
             self._calc_print_time(start_lead)
         # Queue moves into trapezoid motion queue (trapq)
         next_move_time = self.print_time
@@ -545,13 +558,16 @@ class ToolHead:
             # seconds while the head idles or the buffer runs out.
             now = self.reactor.monotonic()
             if self.wall_flush_deadline is None:
+                self.wall_flush_start = now
                 self.wall_flush_deadline = now + LOOKAHEAD_WALL_FLUSH_TIME
             elif now >= self.wall_flush_deadline:
                 # Retry later (not every move) if lazy flush finds no cut point
                 self.wall_flush_deadline = now + LOOKAHEAD_WALL_FLUSH_TIME
-                if (
-                    self.special_queuing_state
-                    or self.print_time - self.mcu.estimated_print_time(now)
+                if self.special_queuing_state:
+                    if not want_flush:
+                        self._process_lookahead(lazy=True, wall_restart=True)
+                elif (
+                    self.print_time - self.mcu.estimated_print_time(now)
                     < BUFFER_TIME_HIGH
                 ):
                     want_flush = True

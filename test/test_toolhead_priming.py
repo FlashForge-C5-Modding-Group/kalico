@@ -119,6 +119,7 @@ def make_toolhead():
     th.special_queuing_state = "NeedPrime"
     th.priming_timer = None
     th.wall_flush_deadline = None
+    th.wall_flush_start = 0.
     th.step_flush_ran_out = False
     th.motion_queuing = mq
     mq.register_flush_callback(th._handle_step_flush, can_add_trapq=True)
@@ -194,9 +195,12 @@ def test_restarts_after_m400_or_idle_input_keep_the_fast_path():
     assert th.print_stall == 0
 
 
-def test_parser_slower_than_real_time_pauses_once_not_repeatedly():
-    # ~0.6x real time: the buffer has to run out, but restarting on the 0.1s
-    # host-time deadline after each run-out stopped the head ~30 times.
+def test_parser_slower_than_real_time_waits_instead_of_stopping_mid_path():
+    # ~0.6x real time: starting early would run out of moves part-way along
+    # the path and leave the head standing there.
     th = make_toolhead()
     stream_segments(th, 1500, host_ms=10.)
-    assert len(full_stops(th)) <= 1
+    th.wait_moves()
+    assert len(th.appended) == 1500
+    assert full_stops(th) == [th.appended[-1]]  # only at the end of input
+    assert th.printer.shutdowns == []
