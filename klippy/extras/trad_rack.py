@@ -2391,6 +2391,8 @@ class TradRackToolHead(toolhead.ToolHead, object):
         self.print_time = 0.0
         self.special_queuing_state = "NeedPrime"
         self.priming_timer = None
+        self.wall_flush_deadline = None
+        self.step_flush_ran_out = False
         # Setup for generating moves
         self.motion_queuing = self.printer.load_object(config, "motion_queuing")
         self.motion_queuing.register_flush_callback(

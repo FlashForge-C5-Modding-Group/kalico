@@ -132,6 +132,14 @@ class PrinterMotionQueuing:
     def get_kin_flush_delay(self):
         return self.kin_flush_delay
 
+    def get_runout_lead(self):
+        # Buffered motion that keeps _flush_handler from generating steps up
+        # to the end of the queued moves (which the toolhead treats as a
+        # run-out) for at least one flush batch.
+        return (
+            2.0 * BGFLUSH_SG_HIGH_TIME - BGFLUSH_SG_LOW_TIME + self.kin_flush_delay
+        )
+
     def check_step_generation_scan_windows(self):
         ffi_main, ffi_lib = chelper.get_ffi()
         kin_flush_delay = SDS_CHECK_TIME
