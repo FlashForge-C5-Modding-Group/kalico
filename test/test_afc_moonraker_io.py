@@ -31,6 +31,8 @@ from urllib.request import Request, urlopen
 
 import pytest
 
+from klippy.extras.latest_file_writer import LatestFileWriter
+
 # These dependencies are consumed by the AST-executed production classes.
 AST_DEPENDENCIES = {
     "os": os,
@@ -44,6 +46,7 @@ AST_DEPENDENCIES = {
     "urljoin": urljoin,
     "Request": Request,
     "urlopen": urlopen,
+    "LatestFileWriter": LatestFileWriter,
 }
 
 

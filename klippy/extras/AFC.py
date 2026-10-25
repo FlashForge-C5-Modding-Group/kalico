@@ -52,6 +52,9 @@ except: raise error(ERROR_STR.format(import_lib="AFC_utils", trace=traceback.for
 try: from extras.AFC_stats import AFCStats
 except: raise error(ERROR_STR.format(import_lib="AFC_stats", trace=traceback.format_exc()))
 
+try: from klippy.extras.latest_file_writer import LatestFileWriter
+except: raise error(ERROR_STR.format(import_lib="latest_file_writer", trace=traceback.format_exc()))
+
 AFC_VERSION="1.2.0"
 
 # Class for holding different states so its clear what all valid states are
@@ -178,6 +181,7 @@ class afc:
         self.VarFile                = os.path.expanduser(config.get(
             'VarFile', '../printer_data/config/AFC/AFC.var'))
         self.cfgloc                 = self._remove_after_last(self.VarFile,"/")
+        self.var_unit_writer        = LatestFileWriter(self.VarFile + '.unit', 'afc_vars')
         self.default_material_temps = config.getlists("default_material_temps",
                                                       ("default: 235", "PLA:210", "PETG:235", "ABS:235", "ASA:235"))# Default temperature to set extruder when loading/unloading lanes. Material needs to be either manually set or uses material from spoolman if extruder temp is not set in spoolman.
         self.default_material_temps = list(self.default_material_temps) if self.default_material_temps is not None else None
@@ -415,6 +419,7 @@ class afc:
 
     def _handle_disconnect(self) -> None:
         """Attempt admitted statistics work after the reactor stops."""
+        self.var_unit_writer.close()
         if self.moonraker is not None:
             self.moonraker.join_thread()
 
@@ -1338,12 +1343,7 @@ class afc:
             str["system"]["extruders"][cur_extruder.name]={}
             str["system"]["extruders"][cur_extruder.name]['lane_loaded'] = cur_extruder.lane_loaded
 
-        try:
-            with open(self.VarFile+ '.unit', 'w') as f:
-                f.write(json.dumps(str, indent=4))
-        except Exception as e:
-            self.logger.error("Error happened when trying to save variables, check AFC.log for error")
-            self.logger.debug(f"Error:{e}\n{traceback.format_exc()}", only_debug=True)
+        self.var_unit_writer.submit(json.dumps(str, indent=4))
 
     # HUB COMMANDS
     cmd_HUB_LOAD_help = "Load lane into hub"
