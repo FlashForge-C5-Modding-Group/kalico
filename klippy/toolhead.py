@@ -372,7 +372,6 @@ class ToolHead:
         if not moves:
             return
         # Resync print_time if necessary
-        restarting = bool(self.special_queuing_state)
         if self.special_queuing_state:
             # Transition from "NeedPrime"/"Priming" state to main state
             self.special_queuing_state = ""
@@ -425,14 +424,6 @@ class ToolHead:
         # Generate steps for moves
         self._advance_move_time(next_move_time)
         self.motion_queuing.note_mcu_movequeue_activity(next_move_time)
-        if restarting and self.can_pause:
-            # Generate the first steps now instead of waiting for the reactor
-            # to run the flush timer: the G-code input may not yield before
-            # the BUFFER_TIME_START lead expires. A short non-lazy restart
-            # (M400, priming timer) can hit the run-out check here, nested
-            # in _flush_lookahead; the head stops there anyway, and the outer
-            # call resets the queuing state afterwards.
-            self.motion_queuing.flush_due_steps()
 
     def _flush_lookahead(self, is_runout=False):
         # Transit from "NeedPrime"/"Priming"/main state to "NeedPrime"
