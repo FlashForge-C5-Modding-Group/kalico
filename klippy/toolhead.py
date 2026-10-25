@@ -383,7 +383,9 @@ class ToolHead:
                 # A lazy flush holds moves back, so the head is still moving
                 # at the end of this batch. If the batch plus lead is shorter
                 # than the run-out lead, background flushing reaches its end
-                # and stops the head. Start later instead.
+                # and stops the head. Start later instead. This covers the
+                # first flush pass only: the next one (~0.25s later) still
+                # needs a newer batch, which move() releases every 0.1s.
                 batch_time = sum(
                     m.accel_t + m.cruise_t + m.decel_t for m in moves
                 )
@@ -426,7 +428,10 @@ class ToolHead:
         if restarting and self.can_pause:
             # Generate the first steps now instead of waiting for the reactor
             # to run the flush timer: the G-code input may not yield before
-            # the BUFFER_TIME_START lead expires.
+            # the BUFFER_TIME_START lead expires. A short non-lazy restart
+            # (M400, priming timer) can hit the run-out check here, nested
+            # in _flush_lookahead; the head stops there anyway, and the outer
+            # call resets the queuing state afterwards.
             self.motion_queuing.flush_due_steps()
 
     def _flush_lookahead(self, is_runout=False):
@@ -543,7 +548,7 @@ class ToolHead:
                 ea.check_move(move, e_index + 3)
         self.commanded_pos[:] = move.end_pos
         want_flush = self.lookahead.add_move(move)
-        if self.can_pause and self.special_queuing_state != "Drip":
+        if self.can_pause:
             # Bound host time between lookahead releases until enough motion
             # is buffered; on a slow host the move-time budget alone can take
             # seconds while the head idles or the buffer runs out.
