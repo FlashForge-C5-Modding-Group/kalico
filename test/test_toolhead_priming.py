@@ -119,6 +119,7 @@ def make_toolhead():
     th.special_queuing_state = "NeedPrime"
     th.priming_timer = None
     th.wall_flush_deadline = None
+    th.step_flush_ran_out = False
     th.motion_queuing = mq
     mq.register_flush_callback(th._handle_step_flush, can_add_trapq=True)
     th.trapq = mq.allocate_trapq()
@@ -172,6 +173,25 @@ def test_slow_parser_starts_motion_quickly_and_never_stops_the_head():
     assert full_stops(th) == []
     assert th.print_stall == 0
     assert th.printer.shutdowns == []
+
+
+def test_restarts_after_m400_or_idle_input_keep_the_fast_path():
+    # Each block starts with the head stopped, by M400 or because input went
+    # idle and the motion ran out. Neither means the parser is slow.
+    th = make_toolhead()
+    latencies = []
+    for block in range(6):
+        start = th.reactor.now
+        moved = len(th.appended)
+        stream_segments(th, 200, host_ms=5.)
+        latencies.append(th.appended[moved][0] - start)
+        if block % 2:
+            th.wait_moves()
+        else:
+            th.reactor.pause(th.reactor.now + 3.)
+    assert max(latencies) <= th_mod.LOOKAHEAD_WALL_FLUSH_TIME + 0.02
+    assert len(full_stops(th)) == 6  # one at the end of each block
+    assert th.print_stall == 0
 
 
 def test_parser_slower_than_real_time_pauses_once_not_repeatedly():

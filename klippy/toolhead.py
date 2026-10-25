@@ -286,6 +286,7 @@ class ToolHead:
         self.special_queuing_state = "NeedPrime"
         self.priming_timer = None
         self.wall_flush_deadline = None
+        self.step_flush_ran_out = False
 
         # Setup for generating moves
         self.motion_queuing = self.printer.load_object(config, "motion_queuing")
@@ -381,16 +382,14 @@ class ToolHead:
             if lazy and self.can_pause:
                 # A lazy flush holds moves back, so the head is still moving
                 # at the end of this batch. If the batch plus lead is shorter
-                # than the step generation window, the first background flush
-                # sees a run-out and stops the head. Start later instead.
+                # than the run-out lead, background flushing reaches its end
+                # and stops the head. Start later instead.
                 batch_time = sum(
                     m.accel_t + m.cruise_t + m.decel_t for m in moves
                 )
                 start_lead = max(
                     start_lead,
-                    self.motion_queuing.get_runout_lead()
-                    + LOOKAHEAD_WALL_FLUSH_TIME
-                    - batch_time,
+                    self.motion_queuing.get_runout_lead() - batch_time,
                 )
             self._calc_print_time(start_lead)
         # Queue moves into trapezoid motion queue (trapq)
@@ -436,6 +435,7 @@ class ToolHead:
         self._process_lookahead()
         self.special_queuing_state = "NeedPrime"
         self.wall_flush_deadline = None
+        self.step_flush_ran_out = False
         self.need_check_pause = -1.0
         self.lookahead.set_flush_time(BUFFER_TIME_HIGH)
         self.check_stall_time = 0.0
@@ -463,6 +463,11 @@ class ToolHead:
                 # Was in "NeedPrime" state and got there from idle input
                 if est_print_time < self.check_stall_time:
                     self.print_stall += 1
+                    if self.step_flush_ran_out:
+                        # G-code input fell behind the motion: restart on the
+                        # move-time budget (as upstream) so a slow parser
+                        # causes one pause, not many.
+                        self.wall_flush_deadline = self.reactor.NEVER
                 self.check_stall_time = 0.0
             # Transition from "NeedPrime"/"Priming" state to "Priming" state
             self.special_queuing_state = "Priming"
@@ -506,9 +511,7 @@ class ToolHead:
         kin_flush_delay = self.motion_queuing.get_kin_flush_delay()
         if step_gen_time >= self.print_time - kin_flush_delay:
             self._flush_lookahead(is_runout=True)
-            # G-code input is not keeping up: restart on the move-time budget
-            # (as upstream) so a slow parser causes one pause, not many.
-            self.wall_flush_deadline = self.reactor.NEVER
+            self.step_flush_ran_out = True
 
     # Movement commands
     def get_position(self):
