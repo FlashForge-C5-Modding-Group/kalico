@@ -828,7 +828,7 @@ class AFCSpool:
             and self.afc.moonraker is not None):
             if SpoolID not in ('', None):
                 try:
-                    result = self.afc.moonraker.get_spool(SpoolID)
+                    result = self.afc.moonraker.get_spool(int(SpoolID))
                     if (self.afc.lanes.get(cur_lane.name) is not cur_lane
                         or generation != cur_lane._spool_request_generation):
                         return False
@@ -877,6 +877,9 @@ class AFCSpool:
                     if invalid_weight:
                         self.afc.error.AFC_error("Invalid weight for spoolID: {}. Please check remaining weight before assigning.".format(SpoolID), False)
                         self.clear_values(cur_lane)
+                        self.set_snapmaker_filament_params(cur_lane)
+                        if save_vars:
+                            self.afc.save_vars()
                         return True
 
                     # No operation in this commit yields: later publication is queued.

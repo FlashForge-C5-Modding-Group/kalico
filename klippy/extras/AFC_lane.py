@@ -2008,7 +2008,11 @@ class AFCLane:
             # lane's own send_lane_data() call is responsible for it.
             still_claimed = any(key in lane.map for lane in self.afc.lanes.values())
             if not still_claimed:
-                self.afc.moonraker.remove_database_entry("lane_data", key)
+                try:
+                    self.afc.moonraker.remove_database_entry("lane_data", key)
+                except Exception as e:
+                    # Kalico waits for this delete; a failure must not fail the G-code command.
+                    self.logger.debug(f"Could not remove lane_data {key}: {e}")
 
         scan_time = self.td1_data['scan_time'] if 'scan_time' in self.td1_data else ""
         td        = self.td1_data['td']        if 'td'        in self.td1_data else ""

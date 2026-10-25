@@ -118,7 +118,7 @@ class Creator5OffsetTests(unittest.TestCase):
     def _afc_tool_fixture(self, t0_alias='extruder0'):
         afc = types.SimpleNamespace(
             tools={}, lanes={}, current=t0_alias, in_toolchange=False,
-            error_state=False, error=mock.Mock(),
+            error_state=False, error=mock.Mock(), position_saved=False,
             function=types.SimpleNamespace(
                 is_printing=lambda: True, is_paused=lambda: True))
         for tool in range(4):
@@ -217,6 +217,25 @@ class Creator5OffsetTests(unittest.TestCase):
                     self.assertFalse(pause.is_paused)
                     self.board._run.assert_called_once_with(
                         'SET_HEATER_TEMPERATURE HEATER=%s TARGET=0' % heater)
+
+    def test_runout_switch_keeps_the_position_saved_by_the_runout_pause(self):
+        # restore_pos only returns to the print if position_saved is still set.
+        afc = self._afc_tool_fixture()
+        afc.current = 'extruder1'
+        afc.position_saved = True
+        afc.error.reset_failure.side_effect = (
+            lambda: setattr(afc, 'position_saved', False))
+        seen = []
+        afc.lanes['extruder1']._perform_creator5_infinite_runout = mock.Mock(
+            side_effect=lambda *args, **kwargs: seen.append(afc.position_saved))
+        objects = {'AFC': afc, 'pause_resume': types.SimpleNamespace(is_paused=True)}
+        self.board.printer.lookup_object.side_effect = (
+            lambda name, default=None: objects.get(name, default))
+        self.board._run = mock.Mock()
+
+        self.board.cmd_runout_switch(GCmd(TOOL=1, TO=0, TEMP=215.))
+
+        self.assertEqual(seen, [True])
 
     def test_offset_reference_unselects_afc_owned_t0_alias(self):
         for alias in ('extruder0', 'extruder'):
