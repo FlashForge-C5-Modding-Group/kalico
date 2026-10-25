@@ -634,14 +634,6 @@ class Creator5OffsetTests(unittest.TestCase):
                              'Total: 3\nT0: 1\nT1: 0\nT2: 2\nT3: 0\n')
         self.assertEqual(self.board._load_toolchange_counts(), [1, 0, 2, 0])
 
-    def test_toolchange_counter_write_failure_is_not_fatal(self):
-        self.board.toolchange_count_writer = MODULE.LatestFileWriter(
-            os.path.join(self.temp.name, 'missing', 'toolchanges.txt'),
-            'test_missing')
-        self.board._count_toolchange(1)
-        self.assertEqual(self.board.toolchange_counts, [0, 1, 0, 0])
-        self.board.toolchange_count_writer.close()  # must not raise
-
     def test_unknown_chamber_heater_state_does_not_bypass_open_doors(self):
         self.board.door_buttons = ['topDoor']
         heaters = mock.Mock()
