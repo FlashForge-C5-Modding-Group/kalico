@@ -95,6 +95,7 @@ class afc:
         self.printer.register_event_handler("klippy:connect",self.handle_connect)
         self.printer.register_event_handler("klippy:ready", self.handle_ready)
         self.printer.register_event_handler("klippy:disconnect", self._handle_disconnect)
+        self.var_unit_writer: Optional[LatestFileWriter] = None  # set once VarFile is read
         self.logger  = AFC_logger(self.printer, self)
 
         self.spool: AFCSpool = self.printer.load_object(config, 'AFC_spool')
@@ -181,7 +182,8 @@ class afc:
         self.VarFile                = os.path.expanduser(config.get(
             'VarFile', '../printer_data/config/AFC/AFC.var'))
         self.cfgloc                 = self._remove_after_last(self.VarFile,"/")
-        self.var_unit_writer        = LatestFileWriter(self.VarFile + '.unit', 'afc_vars')
+        self.var_unit_writer        = LatestFileWriter(self.VarFile + '.unit', 'afc_vars',
+                                                       on_error=self._var_unit_write_failed)
         self.default_material_temps = config.getlists("default_material_temps",
                                                       ("default: 235", "PLA:210", "PETG:235", "ABS:235", "ASA:235"))# Default temperature to set extruder when loading/unloading lanes. Material needs to be either manually set or uses material from spoolman if extruder temp is not set in spoolman.
         self.default_material_temps = list(self.default_material_temps) if self.default_material_temps is not None else None
@@ -419,7 +421,8 @@ class afc:
 
     def _handle_disconnect(self) -> None:
         """Attempt admitted statistics work after the reactor stops."""
-        self.var_unit_writer.close()
+        if self.var_unit_writer is not None:
+            self.var_unit_writer.close()
         if self.moonraker is not None:
             self.moonraker.join_thread()
 
@@ -1344,6 +1347,17 @@ class afc:
             str["system"]["extruders"][cur_extruder.name]['lane_loaded'] = cur_extruder.lane_loaded
 
         self.var_unit_writer.submit(json.dumps(str, indent=4))
+
+    def _var_unit_write_failed(self, exc):
+        """
+        Called on the writer thread when saving the var file fails. AFC's console
+        logger is not thread safe, so the report is handed to the reactor thread.
+        """
+        detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        def report(eventtime):
+            self.logger.error("Error happened when trying to save variables, check AFC.log for error")
+            self.logger.debug(f"Error:{exc}\n{detail}", only_debug=True)
+        self.reactor.register_async_callback(report)
 
     # HUB COMMANDS
     cmd_HUB_LOAD_help = "Load lane into hub"
