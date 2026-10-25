@@ -368,10 +368,14 @@ class ToolHead:
                 self.print_time,
             )
 
-    def _process_lookahead(self, lazy=False, wall_restart=False):
+    def _process_lookahead(self, lazy=False, wall_flush=False):
         flush_time = self.lookahead.junction_flush
         moves = self.lookahead.flush(lazy=lazy)
         if not moves:
+            if wall_flush:
+                # flush() resets the move-time budget; a host-time attempt
+                # that found no cut point must not shorten it.
+                self.lookahead.set_flush_time(flush_time)
             return
         # Resync print_time if necessary
         if self.special_queuing_state:
@@ -380,7 +384,7 @@ class ToolHead:
                 batch_time = sum(
                     m.accel_t + m.cruise_t + m.decel_t for m in moves
                 )
-                if wall_restart and (
+                if wall_flush and (
                     batch_time
                     < self.reactor.monotonic() - self.wall_flush_start
                 ):
@@ -563,14 +567,12 @@ class ToolHead:
             elif now >= self.wall_flush_deadline:
                 # Retry later (not every move) if lazy flush finds no cut point
                 self.wall_flush_deadline = now + LOOKAHEAD_WALL_FLUSH_TIME
-                if self.special_queuing_state:
-                    if not want_flush:
-                        self._process_lookahead(lazy=True, wall_restart=True)
-                elif (
-                    self.print_time - self.mcu.estimated_print_time(now)
+                if not want_flush and (
+                    self.special_queuing_state
+                    or self.print_time - self.mcu.estimated_print_time(now)
                     < BUFFER_TIME_HIGH
                 ):
-                    want_flush = True
+                    self._process_lookahead(lazy=True, wall_flush=True)
         if want_flush:
             self._process_lookahead(lazy=True)
         if self.print_time > self.need_check_pause:
