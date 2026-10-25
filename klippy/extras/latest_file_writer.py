@@ -12,12 +12,17 @@ class LatestFileWriter:
     eMMC writes, renames and fsyncs on the Creator 5 host can stall for
     hundreds of ms; on the reactor thread that starves step generation.
     Only the newest text matters, so it replaces any unwritten older text.
-    Each write goes to '<path>.tmp', is fsynced, then atomically replaces
-    the target, so readers never see a truncated file.
+    Each write goes to a hidden '.<name>.tmp' beside the target, is fsynced,
+    then atomically replaces the target, so readers never see a truncated file.
+
+    Failures are logged and never raised. If given, on_error(exc) is called
+    from the thread that did the write (usually the writer thread), so it
+    must hand off to the reactor before touching printer state.
     """
 
-    def __init__(self, path, name):
+    def __init__(self, path, name, on_error=None):
         self.path = path
+        self._on_error = on_error
         self._lock = threading.Lock()  # guards _pending, _seq, _closed
         self._file_lock = threading.Lock()  # serializes writes to path
         self._wanted = threading.Event()
@@ -71,20 +76,28 @@ class LatestFileWriter:
                 return
 
     def _write(self, seq, text):
+        error = None
         with self._file_lock:
             if seq <= self._written_seq:
                 return  # a newer text was already written
             self._written_seq = seq
-            tmp_path = self.path + ".tmp"
+            directory, name = os.path.split(self.path)
+            tmp_path = os.path.join(directory, "." + name + ".tmp")
             try:
                 with open(tmp_path, "w") as f:
                     f.write(text)
                     f.flush()
                     os.fsync(f.fileno())
                 os.replace(tmp_path, self.path)
-            except OSError:
+            except Exception as exc:  # a dead writer thread would lose saves
+                error = exc
                 logging.exception("Could not write %s", self.path)
                 try:
                     os.unlink(tmp_path)
                 except OSError:
                     pass
+        if error is not None and self._on_error is not None:
+            try:
+                self._on_error(error)
+            except Exception:
+                logging.exception("Error handler failed for %s", self.path)
