@@ -367,6 +367,22 @@ class ToolHead:
                 self.print_time,
             )
 
+    def _input_keeps_up(self, moves):
+        # Whether queuing these moves took no longer than printing them. The
+        # first move's queuing time isn't known, so it is left out. So is the
+        # longest move with its queuing time: one travel would otherwise hide
+        # slow input around it.
+        if len(moves) < 3:
+            return True
+        motion = [m.accel_t + m.cruise_t + m.decel_t for m in moves]
+        queued = [m.queue_time for m in moves]
+        longest = max(range(1, len(moves)), key=motion.__getitem__)
+        motion_time = sum(motion[1:]) - motion[longest]
+        queue_time = (
+            queued[-1] - queued[0] - (queued[longest] - queued[longest - 1])
+        )
+        return motion_time >= queue_time
+
     def _process_lookahead(self, lazy=False, wall_flush=False):
         flush_time = self.lookahead.junction_flush
         moves = self.lookahead.flush(lazy=lazy)
@@ -383,16 +399,9 @@ class ToolHead:
                 batch_time = sum(
                     m.accel_t + m.cruise_t + m.decel_t for m in moves
                 )
-                if wall_flush and (
-                    batch_time - moves[0].accel_t - moves[0].cruise_t
-                    - moves[0].decel_t
-                    < moves[-1].queue_time - moves[0].queue_time
-                ):
-                    # Parsing the released moves took longer than the motion
-                    # they produce (the first move's parse time isn't known,
-                    # so its motion isn't counted). Starting now would run
-                    # out mid-path; keep the moves and wait for the move-time
-                    # budget, as upstream does.
+                if wall_flush and not self._input_keeps_up(moves):
+                    # Starting now would run out mid-path; keep the moves and
+                    # wait for the move-time budget, as upstream does.
                     self.lookahead.queue[0:0] = moves
                     self.lookahead.set_flush_time(flush_time)
                     self.wall_flush_deadline = self.reactor.NEVER
