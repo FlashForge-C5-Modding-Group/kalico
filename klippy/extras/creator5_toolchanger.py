@@ -10,6 +10,8 @@ import tempfile
 from contextlib import contextmanager
 from datetime import datetime
 
+from klippy.extras.latest_file_writer import LatestFileWriter
+
 
 # Config::initExtruderConfig() in the factory firmwareExe binary.  These are
 # nominal positions; saved measurements in the printer's config take priority.
@@ -105,6 +107,10 @@ class Creator5Toolchanger:
             'toolchange_count_path', os.path.join(config_dir,
                                                   'toolchanges.txt')))
         self.toolchange_counts = self._load_toolchange_counts()
+        self.toolchange_count_writer = LatestFileWriter(
+            self.toolchange_count_path, 'c5_toolchanges')
+        self.printer.register_event_handler(
+            'klippy:disconnect', self.toolchange_count_writer.close)
         self.print_z_baseline = [None] * 4
         self._button_objects = {}
         # UI status may be polled many times per second on a small MIPS host.
@@ -590,26 +596,12 @@ class Creator5Toolchanger:
         return counts
 
     def _count_toolchange(self, tool):
-        # A failed write must never stop a print.
+        # A failed write must never stop a print; the writer logs failures.
         self.toolchange_counts[tool] += 1
         counts = self.toolchange_counts
-        temp_path = None
-        try:
-            fd, temp_path = tempfile.mkstemp(
-                prefix='.toolchanges-', suffix='.tmp',
-                dir=os.path.dirname(self.toolchange_count_path) or '.')
-            with os.fdopen(fd, 'w') as target:
-                target.write('Total: %d\n' % sum(counts))
-                for index, count in enumerate(counts):
-                    target.write('T%d: %d\n' % (index, count))
-            os.chmod(temp_path, 0o644)
-            os.replace(temp_path, self.toolchange_count_path)
-            temp_path = None
-        except OSError:
-            logging.exception('Could not save %s', self.toolchange_count_path)
-        finally:
-            if temp_path is not None and os.path.exists(temp_path):
-                os.unlink(temp_path)
+        text = 'Total: %d\n' % sum(counts) + ''.join(
+            'T%d: %d\n' % (index, count) for index, count in enumerate(counts))
+        self.toolchange_count_writer.submit(text)
 
     def cmd_auto_nozzle_z(self, gcmd):
         tool = gcmd.get_int('T', minval=0, maxval=3)
