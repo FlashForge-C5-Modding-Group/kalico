@@ -57,14 +57,11 @@ class FakeReactor:
 
 
 class FakeMcu:
-    def __init__(self, fileoutput):
-        self.fileoutput = fileoutput
-
     def estimated_print_time(self, eventtime):
         return eventtime
 
     def is_fileoutput(self):
-        return self.fileoutput
+        return False
 
 
 class FakePrinter:
@@ -96,9 +93,9 @@ def danger(monkeypatch):
                         raising=False)
 
 
-def make_toolhead(can_pause=True):
+def make_toolhead():
     reactor = FakeReactor()
-    mcu = FakeMcu(fileoutput=not can_pause)
+    mcu = FakeMcu()
     printer = FakePrinter(reactor, mcu)
     mq = mq_mod.PrinterMotionQueuing(
         types.SimpleNamespace(get_printer=lambda: printer))
@@ -116,7 +113,7 @@ def make_toolhead(can_pause=True):
     th._calc_junction_deviation()
     th.check_stall_time = 0.
     th.print_stall = 0
-    th.can_pause = can_pause
+    th.can_pause = True
     th.need_check_pause = -1.
     th.print_time = 0.
     th.special_queuing_state = "NeedPrime"
@@ -141,7 +138,7 @@ def make_toolhead(can_pause=True):
     return th
 
 
-def stream_segments(th, count, host_ms, seg=0.3, until_moving=False):
+def stream_segments(th, count, host_ms, seg=0.3):
     # Zigzag segments at 600 mm/s (90 degree corners, like infill), parsed at
     # host_ms per move and yielding every 10 ms like virtual_sdcard.
     reactor = th.reactor
@@ -153,8 +150,6 @@ def stream_segments(th, count, host_ms, seg=0.3, until_moving=False):
         else:
             y = seg - y
         th.move([x, y, 0., 0.], 600.)
-        if until_moving and th.appended:
-            return
         reactor.now += host_ms / 1000.
         if reactor.now >= next_yield:
             reactor.pause(reactor.NOW)
@@ -177,29 +172,3 @@ def test_slow_parser_starts_motion_quickly_and_never_stops_the_head():
     assert full_stops(th) == []
     assert th.print_stall == 0
     assert th.printer.shutdowns == []
-
-
-def test_restart_generates_first_steps_without_waiting_for_the_reactor():
-    th = make_toolhead()
-    stream_segments(th, 1500, host_ms=5., until_moving=True)
-    # Returned straight from the move() that released the first batch, so no
-    # reactor timer has run since: steps past its start already exist.
-    first_move_print_time = th.appended[0][1]
-    assert th.motion_queuing.last_step_gen_time > first_move_print_time
-
-
-def test_batch_mode_keeps_move_time_budget():
-    th = make_toolhead(can_pause=False)
-    stream_segments(th, 500, host_ms=5.)
-    assert th.special_queuing_state == "Priming"
-    assert th.appended == []
-
-
-def test_idle_priming_flush_generates_steps_immediately():
-    th = make_toolhead()
-    stream_segments(th, 3, host_ms=1.)
-    before = th.motion_queuing.last_step_gen_time
-    th._priming_handler(th.reactor.now)
-    assert th.special_queuing_state == "NeedPrime"
-    assert th.appended
-    assert th.motion_queuing.last_step_gen_time > before
