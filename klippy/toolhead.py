@@ -369,16 +369,20 @@ class ToolHead:
 
     def _input_keeps_up(self, moves):
         # Whether queuing these moves took no longer than printing them. The
-        # first move's queuing time isn't known, so it is left out. So is any
-        # move whose motion alone outlasts the whole sample, with its queuing
-        # time: a travel would otherwise hide slow input around it.
+        # first move's queuing time isn't known, so it is left out. So are
+        # the longest move and any move whose motion alone outlasts the whole
+        # sample, each with its queuing time: travels would otherwise hide
+        # slow input around them.
+        if len(moves) < 3:
+            return True
+        motion = [m.accel_t + m.cruise_t + m.decel_t for m in moves]
+        longest = max(range(1, len(moves)), key=motion.__getitem__)
         span = moves[-1].queue_time - moves[0].queue_time
         motion_time = queue_time = 0.0
-        for prev, move in zip(moves, moves[1:]):
-            move_t = move.accel_t + move.cruise_t + move.decel_t
-            if move_t <= span:
-                motion_time += move_t
-                queue_time += move.queue_time - prev.queue_time
+        for i in range(1, len(moves)):
+            if i != longest and motion[i] <= span:
+                motion_time += motion[i]
+                queue_time += moves[i].queue_time - moves[i - 1].queue_time
         return motion_time >= queue_time
 
     def _process_lookahead(self, lazy=False, wall_flush=False):
