@@ -286,7 +286,6 @@ class ToolHead:
         self.special_queuing_state = "NeedPrime"
         self.priming_timer = None
         self.wall_flush_deadline = None
-        self.wall_flush_start = 0.0
         self.step_flush_ran_out = False
 
         # Setup for generating moves
@@ -385,12 +384,15 @@ class ToolHead:
                     m.accel_t + m.cruise_t + m.decel_t for m in moves
                 )
                 if wall_flush and (
-                    batch_time
-                    < self.reactor.monotonic() - self.wall_flush_start
+                    batch_time - moves[0].accel_t - moves[0].cruise_t
+                    - moves[0].decel_t
+                    < moves[-1].queue_time - moves[0].queue_time
                 ):
-                    # The G-code input is slower than the motion it produces,
-                    # so an early start would run out mid-path. Keep the moves
-                    # and wait for the move-time budget, as upstream does.
+                    # Parsing the released moves took longer than the motion
+                    # they produce (the first move's parse time isn't known,
+                    # so its motion isn't counted). Starting now would run
+                    # out mid-path; keep the moves and wait for the move-time
+                    # budget, as upstream does.
                     self.lookahead.queue[0:0] = moves
                     self.lookahead.set_flush_time(flush_time)
                     self.wall_flush_deadline = self.reactor.NEVER
@@ -561,8 +563,8 @@ class ToolHead:
             # is buffered; on a slow host the move-time budget alone can take
             # seconds while the head idles or the buffer runs out.
             now = self.reactor.monotonic()
+            move.queue_time = now
             if self.wall_flush_deadline is None:
-                self.wall_flush_start = now
                 self.wall_flush_deadline = now + LOOKAHEAD_WALL_FLUSH_TIME
             elif now >= self.wall_flush_deadline:
                 # Retry later (not every move) if lazy flush finds no cut point

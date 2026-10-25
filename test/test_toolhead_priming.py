@@ -119,7 +119,6 @@ def make_toolhead():
     th.special_queuing_state = "NeedPrime"
     th.priming_timer = None
     th.wall_flush_deadline = None
-    th.wall_flush_start = 0.
     th.step_flush_ran_out = False
     th.motion_queuing = mq
     mq.register_flush_callback(th._handle_step_flush, can_add_trapq=True)
