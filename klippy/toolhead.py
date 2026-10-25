@@ -506,6 +506,9 @@ class ToolHead:
         kin_flush_delay = self.motion_queuing.get_kin_flush_delay()
         if step_gen_time >= self.print_time - kin_flush_delay:
             self._flush_lookahead(is_runout=True)
+            # G-code input is not keeping up: restart on the move-time budget
+            # (as upstream) so a slow parser causes one pause, not many.
+            self.wall_flush_deadline = self.reactor.NEVER
 
     # Movement commands
     def get_position(self):

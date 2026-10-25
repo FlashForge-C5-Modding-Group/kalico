@@ -172,3 +172,11 @@ def test_slow_parser_starts_motion_quickly_and_never_stops_the_head():
     assert full_stops(th) == []
     assert th.print_stall == 0
     assert th.printer.shutdowns == []
+
+
+def test_parser_slower_than_real_time_pauses_once_not_repeatedly():
+    # ~0.6x real time: the buffer has to run out, but restarting on the 0.1s
+    # host-time deadline after each run-out stopped the head ~30 times.
+    th = make_toolhead()
+    stream_segments(th, 1500, host_ms=10.)
+    assert len(full_stops(th)) <= 1
