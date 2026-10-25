@@ -284,6 +284,14 @@ class PrinterMotionQueuing:
             self.do_kick_flush_timer = False
             self.reactor.update_timer(self.flush_timer, self.reactor.NOW)
 
+    def flush_due_steps(self):
+        # Run one background-flush pass immediately (used when motion
+        # restarts from idle) and reschedule the timer from its result.
+        if not self.can_pause:
+            return
+        waketime = self._flush_handler(self.reactor.monotonic())
+        self.reactor.update_timer(self.flush_timer, waketime)
+
     def drip_update_time(self, start_time, end_time, drip_completion):
         self._await_flush_time(start_time)
         # Disable background flushing from timer
