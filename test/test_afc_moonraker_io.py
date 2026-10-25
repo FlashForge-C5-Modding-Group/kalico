@@ -735,7 +735,8 @@ lane_types = load_classes('AFC_lane.py', [
 AFCLane = lane_types.AFCLane
 AFC_PrintFileMetaData = load_classes('AFC_utils.py',
                                    ['AFC_PrintFileMetaData']).AFC_PrintFileMetaData
-owner_types = load_classes('AFC.py', ['State', 'afc'], vars(lane_types))
+owner_types = load_classes('AFC.py', ['State', 'afc'],
+                           {**vars(lane_types), 'AFC_VERSION': 'test'})
 AFC = owner_types.afc
 
 
@@ -754,7 +755,7 @@ class Config:
     def get(self, key, default=None, **kwargs):
         return self.values.get(key, default)
 
-    getint = getfloat = getboolean = getlists = get
+    getint = getfloat = getboolean = getlist = getlists = get
 
     def error(self, message):
         return ValueError(message)
@@ -2273,7 +2274,7 @@ class TestSpoolCommandCompletionBoundaries:
         obj.moonraker = io.client
         obj.function.get_current_lane.return_value = lane.name
         obj.units[lane.unit] = lane.unit_obj
-        lane.unit_obj._get_lane_color = Mock(return_value="#FFFFFF")
+        lane.unit_obj.lane_loaded = Mock()
         spool.set_active_spool = Mock()
         io.responses[0] = {"filament": {"material": "PLA", "color_hex": "FFFFFF"},
                            "remaining_weight": 100}
@@ -2282,7 +2283,7 @@ class TestSpoolCommandCompletionBoundaries:
                                             key, default))
         spool.cmd_SET_SPOOL_ID(command)
         assert lane.spool_id == 8
-        obj.function.afc_led.assert_called_once_with("#FFFFFF", lane.led_index)
+        lane.unit_obj.lane_loaded.assert_called_once_with(lane, force=True)
         spool.set_active_spool.assert_called_once_with(8)
         lane.send_lane_data.assert_called_once()
 

@@ -1,4 +1,4 @@
-# Armored Turtle Automated Filament Changer
+# AFCProject Automated Filament Changer Software
 #
 # Copyright (C) 2024-2026 Armored Turtle
 # Copyright (C) 2026 AFCProject
@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import re
 import threading
 import traceback
 from datetime import datetime
@@ -25,16 +26,32 @@ if TYPE_CHECKING:
     from configfile import ConfigWrapper
     from extras.AFC_logger import AFC_logger
     from extras.filament_switch_sensor import SwitchSensor
+    from extras.idle_timeout import IdleTimeout
     from extras.pause_resume import PauseResume
     from gcode import GCodeCommand, GCodeDispatch
+    from pins import PrinterPins
 
     from klippy import Printer
     from klippy.reactor import Reactor
 
 ERROR_STR = "Error trying to import {import_lib}, please rerun install-afc.sh script in your AFC-Klipper-Add-On directory then restart klipper\n\n{trace}"
 
+_NATURAL_SORT_RE = re.compile(r'(\d+)')
+
+def natural_sort_key(value: str) -> list[Union[int, str]]:
+    """
+    Splits a string into digit/non-digit chunks so lists of e.g. T(n) macros
+    sort numerically (T2 before T10) rather than lexicographically (T10
+    before T2).
+
+    :param value: String to build a sort key for, e.g. "T10"
+    :return list: Chunks with digit runs converted to int for numeric ordering
+    """
+    return [int(chunk) if chunk.isdigit() else chunk.lower()
+            for chunk in _NATURAL_SORT_RE.split(value)]
+
 def add_filament_switch(switch_name: str, switch_pin: str, printer: Printer,
-                        show_sensor: bool=True, runout_callback: Callable = None,
+                        show_sensor: bool=True, runout_callback: Optional[Callable[..., Any]] = None,
                         enable_runout: bool=False, debounce_delay: float=0.
                         ) -> tuple[SwitchSensor, DebounceButton]:
     """
@@ -57,13 +74,13 @@ def add_filament_switch(switch_name: str, switch_pin: str, printer: Printer,
     import configparser
     import configfile
     new_switch_name = f"filament_switch_sensor {switch_name}"
-    ppins = printer.lookup_object('pins')
-    ppins.allow_multi_use_pin(switch_pin.strip("!^"))
+    ppins: PrinterPins = printer.lookup_object('pins')
+    ppins.allow_multi_use_pin(switch_pin.strip("!^~"))
     filament_switch_config = configparser.RawConfigParser()
     filament_switch_config.add_section( new_switch_name )
     filament_switch_config.set( new_switch_name, 'switch_pin', switch_pin)
     filament_switch_config.set( new_switch_name, 'pause_on_runout', 'False')
-    filament_switch_config.set( new_switch_name, 'debounce_delay', 0.0)
+    filament_switch_config.set( new_switch_name, 'debounce_delay', str(0.0))
 
     # Following needs to be added for Snapmaker U1 klipper version, does not hurt to always
     # have here for non U1 klipper versions.
@@ -71,7 +88,7 @@ def add_filament_switch(switch_name: str, switch_pin: str, printer: Printer,
 
     cfg_wrap = configfile.ConfigWrapper( printer, filament_switch_config, {}, new_switch_name)
 
-    fila = printer.load_object(cfg_wrap, new_switch_name)
+    fila: SwitchSensor = printer.load_object(cfg_wrap, new_switch_name)
 
     # Commence the hacky stuff for delayed runout
     if not show_sensor:
@@ -83,7 +100,7 @@ def add_filament_switch(switch_name: str, switch_pin: str, printer: Printer,
     fila.runout_helper.sensor_enabled = enable_runout
     fila.runout_helper.runout_pause = False                 # AFC will deal with pause
 
-    filament_switch_config.set( new_switch_name, 'debounce_delay', debounce_delay)
+    filament_switch_config.set( new_switch_name, 'debounce_delay', str(debounce_delay))
     # Using our own DebounceButton so that callback functions can be overridden to work correctly
     debounce_button = DebounceButton(cfg_wrap, fila)
 
@@ -96,7 +113,7 @@ def add_filament_switch(switch_name: str, switch_pin: str, printer: Printer,
     return fila, debounce_button
 
 
-def check_and_return( value_str:str, data_values:dict ) -> str:
+def check_and_return( value_str:str, data_values:dict[str, Any] ) -> str:
     """
     Common function to check if value exists in dictionary and returns value if it does.
 
@@ -111,7 +128,7 @@ def check_and_return( value_str:str, data_values:dict ) -> str:
 
     return value
 
-def section_in_config(config: ConfigWrapper, name: str):
+def section_in_config(config: ConfigWrapper, name: str) -> bool:
     """
     Helper function for searching through config file to see if a config section exists
 
@@ -129,15 +146,24 @@ def section_in_config(config: ConfigWrapper, name: str):
 
 # Copied from klipper for kalico and older klipper support
 class DebounceButton:
-    def __init__(self, config, filament_sensor):
+    def __init__(self, config: ConfigWrapper, filament_sensor: SwitchSensor) -> None:
+        """
+        Overrides a filament switch sensor's note_filament_present with a
+        debounced handler, picking the override signature that matches the
+        sensor's own klipper/kalico/older-klipper note_filament_present
+        signature so the override is called correctly.
+
+        :param config: Klipper config wrapper for this filament switch sensor
+        :param filament_sensor: filament switch sensor object to debounce
+        """
         self.printer = config.get_printer()
         self.reactor = self.printer.get_reactor()
         self.gcode: GCodeDispatch = self.printer.lookup_object('gcode')
         sig = inspect.signature(filament_sensor.runout_helper.note_filament_present)
         # Saving reference to normal function
-        self._old_note_filament_present = filament_sensor.runout_helper.note_filament_present
+        self._old_note_filament_present: Callable[..., Any] = filament_sensor.runout_helper.note_filament_present
         # Setting action callback to normal filament sensor not filament present
-        self.button_action = self._old_note_filament_present
+        self.button_action: Callable[..., Any] = self._old_note_filament_present
         # Overriding filament sensor filament present to button handler in this class
         # Checking parameter length since kalico's note_filament_present function is different
         # and also checking for older klipper versions before hash 272e8155
@@ -146,22 +172,36 @@ class DebounceButton:
         param_keys = list(sig.parameters.keys())
         if param_keys == expected_params:
             # Exact match for the expected signature
-            filament_sensor.runout_helper.note_filament_present = self._button_handler
+            filament_sensor.runout_helper.note_filament_present = self._button_handler  # type: ignore[method-assign,assignment]
         elif param_keys == snapmaker_expected:
-            filament_sensor.runout_helper.note_filament_present = self.button_handler
-        elif len(sig.parameters) > 2 or len(sig.parameters) == 1:
-            filament_sensor.runout_helper.note_filament_present = self.button_handler
+            filament_sensor.runout_helper.note_filament_present = self.button_handler  # type: ignore[method-assign,assignment]
+        elif (len(sig.parameters) > 2
+              or len(sig.parameters) == 1):
+            filament_sensor.runout_helper.note_filament_present = self.button_handler  # type: ignore[method-assign,assignment]
         else:
-            filament_sensor.runout_helper.note_filament_present = self._button_handler
+            filament_sensor.runout_helper.note_filament_present = self._button_handler  # type: ignore[method-assign,assignment]
         self.debounce_delay = config.getfloat('debounce_delay', 0., minval=0.)
-        self.logical_state = None
-        self.physical_state = None
-        self.latest_eventtime = None
+        self.logical_state: Optional[bool] = None
+        self.physical_state: Optional[bool] = None
+        self.latest_eventtime: float = 0.0
 
-    def button_handler(self, state):
+    def button_handler(self, state: bool) -> None:
+        """
+        Kalico/snapmaker-style entry point: no eventtime is passed in, so the
+        current reactor time is used instead.
+
+        :param state: New filament-present state
+        """
         self._button_handler(self.reactor.monotonic(), state)
 
-    def _button_handler(self, eventtime, state):
+    def _button_handler(self, eventtime: float, state: bool) -> None:
+        """
+        Records a raw (not yet debounced) filament-present state change and
+        schedules the debounced event to run after debounce_delay.
+
+        :param eventtime: Reactor time the state change was observed at
+        :param state: New filament-present state
+        """
         self.physical_state = state
         self.latest_eventtime = eventtime
         # if there would be no state transition, ignore the event:
@@ -170,11 +210,19 @@ class DebounceButton:
         trigger_time = eventtime + self.debounce_delay
         self.reactor.register_callback(self._debounce_event, trigger_time)
 
-    def _debounce_event(self, eventtime):
+    def _debounce_event(self, eventtime: float) -> None:
+        """
+        Applies a debounced state transition once debounce_delay has
+        elapsed with no more recent event superseding it, then calls
+        button_action with the new state.
+
+        :param eventtime: Reactor time this debounce callback was fired at
+        """
         # if there would be no state transition, ignore the event:
         if self.logical_state == self.physical_state:
             return
         # if there were more recent events, they supersede this one:
+        # (latest_eventtime is always set by _button_handler before this callback is scheduled)
         if (eventtime - self.debounce_delay) < self.latest_eventtime:
             return
         # enact state transition and trigger action
@@ -198,7 +246,7 @@ class DebounceButton:
 class VirtualRunoutHelper:
     """Minimal runout helper used by FPS_PSF virtual sensors."""
 
-    def __init__(self, printer: Printer, name: str, runout_cb: Optional[Callable] = None,
+    def __init__(self, printer: Printer, name: str, runout_cb: Optional[Callable[..., Any]] = None,
                  enable_runout: bool = False) -> None:
         """
         Initialize the minimal runout helper.
@@ -212,7 +260,7 @@ class VirtualRunoutHelper:
         self.gcode: GCodeDispatch = self.printer.lookup_object('gcode')
         self._reactor: Reactor = printer.get_reactor()
         self.name: str = name
-        self.runout_callback: Optional[Callable] = runout_cb
+        self.runout_callback: Optional[Callable[..., Any]] = runout_cb
         self.sensor_enabled: bool = bool(enable_runout)
         self.filament_present: bool = False
         self.insert_gcode: Optional[str] = None
@@ -221,7 +269,7 @@ class VirtualRunoutHelper:
         self.min_event_systime: float = self._reactor.NEVER
 
     def note_filament_present(self, eventtime: Optional[float] = None,
-                              is_filament_present: bool = False, **_kwargs) -> None:
+                              is_filament_present: bool = False, **_kwargs: Any) -> None:
         """
         Update the tracked filament-present state and fire runout if needed.
 
@@ -240,7 +288,7 @@ class VirtualRunoutHelper:
             return
 
         self.filament_present = new_state
-        idle_timeout = self.printer.lookup_object("idle_timeout")
+        idle_timeout: IdleTimeout = self.printer.lookup_object("idle_timeout")
         is_printing = idle_timeout.get_status(eventtime)["state"] == "Printing"
 
         if (not new_state
@@ -261,7 +309,7 @@ class VirtualRunoutHelper:
                 # Calling Pause command directly since user/plugins could have overridden this command
                 pause_resume.cmd_PAUSE(pause_cmd)
 
-    def get_status(self, _eventtime: Optional[float] = None) -> dict:
+    def get_status(self, _eventtime: Optional[float] = None) -> dict[str, bool]:
         """
         Return the sensor status.
 
@@ -280,8 +328,9 @@ class VirtualFilamentSensor:
     SET_HELP = "Sets the filament sensor on/off"
 
     def __init__(self, printer: Printer, name: str, logger: AFC_logger,
-                show_in_gui: bool = True, runout_cb: Optional[Callable] = None,
-                enable_runout: bool = False) -> None:
+                show_in_gui: bool = True, runout_cb: Optional[Callable[..., Any]] = None,
+                enable_runout: bool = False,
+                enable_cb: Optional[Callable] = None) -> None:
         """
         Register a lightweight virtual filament sensor.
 
@@ -294,10 +343,14 @@ class VirtualFilamentSensor:
         :param show_in_gui: When False, hide the sensor from the GUI.
         :param runout_cb: Optional runout callback passed to the runout helper.
         :param enable_runout: Whether runout callbacks are enabled.
+        :param enable_cb: Optional callback invoked with the new ENABLE value whenever
+                          SET_FILAMENT_SENSOR toggles this sensor, allowing callers to
+                          treat the GUI switch as the filament-presence state.
         """
         self.printer: Printer = printer
         self.name: str = name
         self.logger: AFC_logger = logger
+        self.enable_cb: Optional[Callable] = enable_cb
         self._object_name: str = f"filament_switch_sensor {name}"
         self._object_name = self._object_name if show_in_gui else "_" + self._object_name
         self.runout_helper: VirtualRunoutHelper = VirtualRunoutHelper(
@@ -311,7 +364,7 @@ class VirtualFilamentSensor:
             if isinstance(objects, dict):
                 objects.setdefault(self._object_name, self)
 
-        gcode = printer.lookup_object("gcode", None)
+        gcode: Optional[GCodeDispatch] = printer.lookup_object("gcode", None)
         if gcode is None:
             return
         try:
@@ -325,7 +378,7 @@ class VirtualFilamentSensor:
         except Exception:
             pass
 
-    def get_status(self, eventtime: Optional[float]) -> dict:
+    def get_status(self, eventtime: Optional[float]) -> dict[str, bool]:
         """
         Return the sensor status from the runout helper.
 
@@ -357,7 +410,10 @@ class VirtualFilamentSensor:
 
         :param gcmd: The parsed G-code command.
         """
-        self.runout_helper.sensor_enabled = bool(gcmd.get_int("ENABLE", 1, minval=0, maxval=1))
+        enable = bool(gcmd.get_int("ENABLE", 1, minval=0, maxval=1))
+        self.runout_helper.sensor_enabled = enable
+        if self.enable_cb is not None:
+            self.enable_cb(enable)
 
 class AFC_moonraker:
     """
@@ -528,7 +584,7 @@ class AFC_moonraker:
             data = None
         return data
 
-    def wait_for_moonraker(self, toolhead, timeout:int=30):
+    def wait_for_moonraker(self, toolhead: Any, timeout: int=30) -> bool:
         """
         Function to wait for moonraker to start, times out after passed in timeout value
 
@@ -549,7 +605,7 @@ class AFC_moonraker:
         self.logger.warning(f"Failed to connect to moonraker after {timeout} seconds, check AFC.log for more information")
         return False
 
-    def get_spoolman_server(self)->str:
+    def get_spoolman_server(self) -> Optional[str]:
         """
         Queries moonraker to see if spoolman is configured, returns True when
         spoolman is configured
@@ -558,8 +614,10 @@ class AFC_moonraker:
         """
         resp = self._get_results(urljoin(self.host, 'server/config'))
         # Check to make sure response is valid and spoolman exists in dictionary
-        if resp is not None and 'orig' in resp and 'spoolman' in resp['orig']:
-            return resp['orig']['spoolman']['server']     # check for spoolman and grab url
+        if (resp is not None
+            and 'orig' in resp
+            and 'spoolman' in resp['orig']):
+            return str(resp['orig']['spoolman']['server'])     # check for spoolman and grab url
         else:
             self.logger.debug("Spoolman server is not defined")
             return None
@@ -579,7 +637,7 @@ class AFC_moonraker:
         self.reactor.register_async_callback(
             lambda eventtime: callback(resp) if not self._closing else None)
 
-    def get_afc_stats(self) -> Optional[dict]:
+    def get_afc_stats(self) -> Optional[dict[str, Any]]:
         """
         Queries moonraker database for all `afc_stats` entries and returns results if afc_stats exist.
         Function also caches results and refetches data if cache is older than 60s. This is done to help
@@ -603,7 +661,8 @@ class AFC_moonraker:
             self.last_stats_time = datetime.now()
 
         # Cache results to keep queries to moonraker down
-        if self.afc_stats is None or refetch_data:
+        if (self.afc_stats is None
+            or refetch_data):
             resp = self._get_results(urljoin(self.database_url, f"?namespace={self.afc_stats_key}"))
             if resp is not None:
                 self.afc_stats = resp
@@ -644,7 +703,7 @@ class AFC_moonraker:
                 self.logger.error,
                 f"Error when trying to update {key} in moonraker, see AFC.log for more info")
 
-    def get_spool(self, id:int):
+    def get_spool(self, id: int) -> Optional[dict[str, Any]]:
         """
         Uses moonrakers proxy to query spoolID from spoolman
 
@@ -666,7 +725,7 @@ class AFC_moonraker:
             self.logger.info(f"SpoolID: {id} not found")
         return resp
 
-    def check_for_td1(self):
+    def check_for_td1(self) -> tuple[bool, bool, bool]:
         """
         Checks moonrakers server/config endpoint to see if user has `[td1]` and `[lane_data]`
         specified in their moonraker.conf file.
@@ -689,7 +748,7 @@ class AFC_moonraker:
                 self._lane_data = True
         return td1_defined, td1, self._lane_data
 
-    def get_td1_data(self):
+    def get_td1_data(self) -> Optional[dict[str, Any]]:
         """
         Fetches TD-1 data from moonrakers `machine/td1/data` endpoint
 
@@ -699,12 +758,13 @@ class AFC_moonraker:
         url = urljoin(self.host, "machine/td1/data")
         req = Request(url=url)
         resp = self._get_results(req)
-        if resp is not None and "devices" in resp:
-            return resp["devices"]
+        if (resp is not None
+            and resp.get("devices")):
+            return dict(resp["devices"])
         else:
             return None
 
-    def reboot_td1(self, serial_number):
+    def reboot_td1(self, serial_number: str) -> Optional[dict[str, Any]]:
         """
         Send's TD-1 serial to moonrakers `machine/td1/reboot` endpoint to force restart TD-1
         device
@@ -724,7 +784,7 @@ class AFC_moonraker:
         resp = self._get_results(req)
         return resp
 
-    def send_lane_data(self, data):
+    def send_lane_data(self, data: Any) -> None:
         """
         Send lane data to moonrakers `machine/set_lane_data` endpoint so that
         other programs can query moonrakers `machine/lane_data` endpoint to see what lanes
@@ -785,7 +845,7 @@ class AFC_moonraker:
                 f"Error occurred when trying to delete {key} from {namespace} namespace")
             self._log_async(self.logger.debug, f"{e}")
 
-    def delete_lane_data(self):
+    def delete_lane_data(self) -> None:
         """
         Function recursively delete's lane_data namespace from moonrakers database.
 
@@ -838,7 +898,7 @@ class AFC_PrintFileMetaData:
         self._moonraker = moonraker
         self.logger = logger
         self._filename: str = ""
-        self._metadata: dict = {}
+        self._metadata: dict[str, Any] = {}
         self._query_generation = 0
 
     @property
