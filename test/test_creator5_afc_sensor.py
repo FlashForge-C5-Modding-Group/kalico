@@ -45,7 +45,7 @@ class Creator5AfcSensorTest(unittest.TestCase):
     def test_infinite_spool_changes_to_selected_loaded_head(self):
         runout = load_method('AFC_lane.py', 'AFCLane',
                              '_perform_creator5_infinite_runout')
-        source = mock.Mock(name='source', map='T0')
+        source = mock.Mock(name='source')
         source.name = 'extruder'
         source.runout_lane = 'extruder2'
         source.extruder_obj.toolhead_extruder.get_heater.return_value.target_temp = 220
@@ -66,7 +66,7 @@ class Creator5AfcSensorTest(unittest.TestCase):
             target.extruder_obj.toolhead_extruder.get_heater.return_value,
             220, wait=True)
         source.gcode.run_script_from_command.assert_called_once_with(
-            'SET_MAP LANE=extruder2 MAP=T0')
+            'AFC_SWAP_MAPPING FROM=extruder TO=extruder2')
         target.set_tool_loaded.assert_called_once_with(
             normal_toolchange=True)
         source.afc.restore_pos.assert_called_once_with(
@@ -260,7 +260,8 @@ class Creator5AfcSensorTest(unittest.TestCase):
                              tool_start_state=True)
         extruder.prep_on_shuttle_check.return_value = ' parked'
         lane = mock.Mock(name='extruder', prep_state=True, load_state=True,
-                         extruder_obj=extruder, map='T0')
+                         extruder_obj=extruder)
+        lane.map_to_string.return_value = 'T0'
         lane.name = 'extruder'
         unit = mock.Mock()
         unit.afc.function.TcmdAssign = mock.Mock()

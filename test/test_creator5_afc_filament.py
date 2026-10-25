@@ -1,14 +1,22 @@
 import importlib.util
+import sys
 import unittest
 from pathlib import Path
 from unittest import mock
+
+from klippy import extras
+from klippy.extras import AFC_utils
 
 
 SPEC = importlib.util.spec_from_file_location(
     'AFC_spool', Path(__file__).resolve().parents[1]
     / 'klippy' / 'extras' / 'AFC_spool.py')
 MODULE = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(MODULE)
+# AFC modules import siblings as `extras.X`; Klippy's compat hook provides
+# that alias at runtime.
+with mock.patch.dict(sys.modules, {'extras': extras,
+                                   'extras.AFC_utils': AFC_utils}):
+    SPEC.loader.exec_module(MODULE)
 
 
 class GCmd:

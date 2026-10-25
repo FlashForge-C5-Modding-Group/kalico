@@ -1350,8 +1350,11 @@ class Creator5Toolchanger:
         replacement = self._afc_lane(afc, target)
         if lane is None or replacement is None:
             raise gcmd.error('No AFC lane for T%d or T%d' % (tool, to))
-        # Keeps the position AFC saved when the runout paused the print.
+        # Keep the position AFC saved when the runout paused the print:
+        # reset_failure() clears position_saved, and restore_pos needs it.
+        position_saved = afc.position_saved
         afc.error.reset_failure()
+        afc.position_saved = position_saved
         lane._perform_creator5_infinite_runout(replacement, target_temp=temp)
         if afc.error_state:
             return
