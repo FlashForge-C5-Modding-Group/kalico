@@ -4,6 +4,7 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import collections
+import greenlet
 import logging
 import os
 import re
@@ -329,6 +330,9 @@ class GCodeDispatch:
                 self.printer.send_event("gcode:command_error")
                 if not need_ack:
                     raise
+            except greenlet.GreenletExit:
+                # The reactor is ending (SAVE_CONFIG/RESTART): not an error
+                raise
             except:
                 msg = 'Internal error on command:"%s"' % (cmd,)
                 logging.exception(msg)
@@ -337,7 +341,10 @@ class GCodeDispatch:
                 if not need_ack:
                     raise
             gcmd.ack()
-            if next_yield is not None and reactor.monotonic() >= next_yield:
+            # Not once a restart is requested: the reactor is ending, and the
+            # rest of the macro finishes first, as without the yield
+            if (next_yield is not None and self.printer.run_result is None
+                    and reactor.monotonic() >= next_yield):
                 reactor.pause(reactor.NOW)
                 next_yield = reactor.monotonic() + 0.010
 
