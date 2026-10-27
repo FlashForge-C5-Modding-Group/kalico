@@ -77,6 +77,10 @@ class Creator5FlowSwitch(Creator5MiscSwitch):
 
 
 class Creator5Toolchanger:
+    # Overridden from the config in __init__ (persist_babystep defaults on)
+    persist_babystep = False
+    _applied_z = None
+
     def __init__(self, config):
         self.printer = config.get_printer()
         self.gcode = self.printer.lookup_object('gcode')
@@ -101,6 +105,11 @@ class Creator5Toolchanger:
             'test_json_path', '/usr/data/firmwareRes/config/test.json'))
         self.z_adjustments = [0.] * 4
         self._load_zoffset_json()
+        # Baby stepping (SET_GCODE_OFFSET Z_ADJUST) during a print is kept:
+        # the difference from the Z this module last set for the tool is
+        # added to its zoffset.json adjustment at dock and at print end.
+        self.persist_babystep = config.getboolean('persist_babystep', True)
+        self._applied_z = None      # (tool, G-code Z offset this module set)
         config_dir = os.path.dirname(os.path.abspath(
             self.printer.get_start_args().get('config_file', 'printer.cfg')))
         self.toolchange_count_path = os.path.expanduser(config.get(
@@ -330,6 +339,7 @@ class Creator5Toolchanger:
             ('C5_SAVE_OFFSETS_JSON', self.cmd_save_offsets_json),
             ('C5_SAVE_TOUCHSCREEN_Z_OFFSET',
              self.cmd_save_touchscreen_z_offset),
+            ('C5_SAVE_BABYSTEP', self.cmd_save_babystep),
             ('C5_AUTO_NOZZLE_Z', self.cmd_auto_nozzle_z),
             ('C5_VERIFY_NOZZLE_Z', self.cmd_verify_nozzle_z),
             ('C5_CALIBRATE_ATTACHED', self.cmd_calibrate_attached),
@@ -550,6 +560,12 @@ class Creator5Toolchanger:
         adjustment = origin - baseline
         if not math.isfinite(adjustment) or abs(adjustment) > 5.:
             raise gcmd.error('Touchscreen Z adjustment is outside +/-5 mm')
+        self._write_z_adjustment(gcmd, tool, adjustment)
+        self._applied_z = (tool, origin)
+        gcmd.respond_info('Saved T%d touchscreen Z adjustment %.4f mm'
+                          % (tool, adjustment))
+
+    def _write_z_adjustment(self, gcmd, tool, adjustment):
         if not os.path.isfile(self.zoffset_json_path):
             raise gcmd.error('Missing stock %s; refusing to create it'
                              % self.zoffset_json_path)
@@ -579,8 +595,44 @@ class Creator5Toolchanger:
             if temp_path is not None and os.path.exists(temp_path):
                 os.unlink(temp_path)
         self.z_adjustments[tool] = adjustment
-        gcmd.respond_info('Saved T%d touchscreen Z adjustment %.4f mm'
-                          % (tool, adjustment))
+
+    def _printing(self):
+        stats = self.printer.lookup_object('print_stats', None)
+        if stats is None:
+            return False
+        return stats.get_status(self.printer.get_reactor().monotonic())[
+            'state'] in ('printing', 'paused')
+
+    def _persist_babystep(self, gcmd, tool):
+        """Add the baby stepping on TOOL since this module last set its Z
+        offset to its zoffset.json adjustment. Returns the step saved."""
+        if self._applied_z is None or self._applied_z[0] != tool:
+            return 0.
+        origin = self.printer.lookup_object('gcode_move').get_status()[
+            'homing_origin'][2]
+        step = origin - self._applied_z[1]
+        if not math.isfinite(step) or abs(step) < 0.0005:
+            return 0.
+        if abs(step) > 1.:
+            # Not baby stepping: something else set the offset
+            gcmd.respond_info('T%d Z offset changed by %.4f mm; not saved as '
+                              'baby stepping' % (tool, step))
+            self._applied_z = None
+            return 0.
+        self._write_z_adjustment(gcmd, tool, self.z_adjustments[tool] + step)
+        self._applied_z = (tool, origin)
+        gcmd.respond_info('Saved T%d baby stepping %+.4f mm (Z adjustment now '
+                          '%.4f mm)' % (tool, step, self.z_adjustments[tool]))
+        return step
+
+    def cmd_save_babystep(self, gcmd):
+        """Keep the attached tool's baby stepping for later prints."""
+        if not self.persist_babystep and not gcmd.get_int('FORCE', 0):
+            return
+        dock, grab, tool = self._sensor_state(gcmd)
+        if tool is None:
+            return
+        self._persist_babystep(gcmd, tool)
 
     def _load_toolchange_counts(self):
         counts = [0] * 4
@@ -645,6 +697,7 @@ class Creator5Toolchanger:
         # MOVE=1 before print motion. The earlier crash path was the
         # preparation purge occurring before this command at all.
         self._run('SET_GCODE_OFFSET Z=%.4f MOVE=1 MOVE_SPEED=100' % offset)
+        self._applied_z = (tool, offset)
         self.print_z_baseline[tool] = baseline + correction
         gcmd.respond_info('Automatic T%d nozzle Z %.4f mm '
                           '(tool %.4f - station %.4f + print %.4f + '
@@ -1026,6 +1079,8 @@ class Creator5Toolchanger:
     def _dock(self, gcmd, tool, raise_z=True):
         x, y = self.docks[tool]
         clear_feed = self.clear_travel_speed * 60.
+        if self.persist_babystep and self._printing():
+            self._persist_babystep(gcmd, tool)
         # Do not clear nozzle Z while a tool is physically mounted.  A
         # previously selected tool may have been left at zero by a slicer.
         origin_z = self.printer.lookup_object('gcode_move').get_status()[
@@ -1623,6 +1678,7 @@ class Creator5Toolchanger:
                 'Unsafe T%d nozzle Z offset; refusing tool motion' % tool)
         self._run('SET_GCODE_OFFSET X=%.4f Y=%.4f Z=%.4f MOVE=0'
                   % tuple(offsets))
+        self._applied_z = (tool, offsets[2])
 
     def cmd_reference_calibrate(self, gcmd):
         if not gcmd.get_int('BUILDPLATE_REMOVED', 0, minval=0, maxval=1):
