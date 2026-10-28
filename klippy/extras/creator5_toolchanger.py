@@ -105,9 +105,8 @@ class Creator5Toolchanger:
             'test_json_path', '/usr/data/firmwareRes/config/test.json'))
         self.z_adjustments = [0.] * 4
         self._load_zoffset_json()
-        # Baby stepping (SET_GCODE_OFFSET Z_ADJUST) during a print is kept:
-        # the difference from the Z this module last set for the tool is
-        # added to its zoffset.json adjustment at dock and at print end.
+        # Baby stepping (SET_GCODE_OFFSET Z_ADJUST) is added to the tool's
+        # zoffset.json adjustment as it happens
         self.persist_babystep = config.getboolean('persist_babystep', True)
         self._applied_z = None      # (tool, G-code Z offset this module set)
         config_dir = os.path.dirname(os.path.abspath(
@@ -356,6 +355,7 @@ class Creator5Toolchanger:
         self.prev_G28 = None
         self._g28_passthrough = False
         self.prev_set_pressure_advance = None
+        self.prev_set_gcode_offset = None
         self._tool_pa_memory = {}
         self.printer.register_event_handler('klippy:ready', self._handle_ready)
 
@@ -368,6 +368,12 @@ class Creator5Toolchanger:
             danger.multi_mcu_trsync_timeout = max(timeout, .1)
         self.prev_G28 = self.gcode.register_command('G28', None)
         self.gcode.register_command('G28', self.cmd_G28)
+        self.prev_set_gcode_offset = self.gcode.register_command(
+            'SET_GCODE_OFFSET', None)
+        if self.prev_set_gcode_offset is not None:
+            self.gcode.register_command(
+                'SET_GCODE_OFFSET', self.cmd_set_gcode_offset,
+                desc=getattr(self.prev_set_gcode_offset, '__doc__', None))
         self.prev_set_pressure_advance = self.gcode.register_command(
             'SET_PRESSURE_ADVANCE', None)
         if self.prev_set_pressure_advance is not None:
@@ -565,7 +571,7 @@ class Creator5Toolchanger:
         gcmd.respond_info('Saved T%d touchscreen Z adjustment %.4f mm'
                           % (tool, adjustment))
 
-    def _write_z_adjustment(self, gcmd, tool, adjustment):
+    def _write_z_adjustment(self, gcmd, tool, adjustment, backup=True):
         if not os.path.isfile(self.zoffset_json_path):
             raise gcmd.error('Missing stock %s; refusing to create it'
                              % self.zoffset_json_path)
@@ -574,9 +580,11 @@ class Creator5Toolchanger:
             data, suffix = self._read_stock_json(self.zoffset_json_path)
             data['z_offset_t%d' % (tool + 1)] = round(adjustment, 4)
             directory = os.path.dirname(self.zoffset_json_path)
-            backup = self.zoffset_json_path + '.bak-' + (
-                datetime.now().strftime('%Y%m%d-%H%M%S-%f'))
-            shutil.copy2(self.zoffset_json_path, backup)
+            if backup:
+                shutil.copy2(self.zoffset_json_path,
+                             self.zoffset_json_path + '.bak-' + (
+                                 datetime.now().strftime(
+                                     '%Y%m%d-%H%M%S-%f')))
             fd, temp_path = tempfile.mkstemp(prefix='.zoffset-',
                                              suffix='.tmp', dir=directory)
             os.chmod(temp_path, os.stat(self.zoffset_json_path).st_mode)
@@ -603,7 +611,7 @@ class Creator5Toolchanger:
         return stats.get_status(self.printer.get_reactor().monotonic())[
             'state'] in ('printing', 'paused')
 
-    def _persist_babystep(self, gcmd, tool):
+    def _persist_babystep(self, gcmd, tool, backup=True):
         """Add the baby stepping on TOOL since this module last set its Z
         offset to its zoffset.json adjustment. Returns the step saved."""
         if self._applied_z is None or self._applied_z[0] != tool:
@@ -619,11 +627,26 @@ class Creator5Toolchanger:
                               'baby stepping' % (tool, step))
             self._applied_z = None
             return 0.
-        self._write_z_adjustment(gcmd, tool, self.z_adjustments[tool] + step)
+        self._write_z_adjustment(gcmd, tool, self.z_adjustments[tool] + step,
+                                 backup)
         self._applied_z = (tool, origin)
         gcmd.respond_info('Saved T%d baby stepping %+.4f mm (Z adjustment now '
                           '%.4f mm)' % (tool, step, self.z_adjustments[tool]))
         return step
+
+    def cmd_set_gcode_offset(self, gcmd):
+        self.prev_set_gcode_offset(gcmd)
+        if (not self.persist_babystep or self.busy
+                or self._applied_z is None
+                or gcmd.get('Z_ADJUST', None) is None):
+            return
+        try:
+            tool = self.attached_tool_from_pins()
+            if tool is not None:
+                self._persist_babystep(gcmd, tool, backup=False)
+        except Exception as exc:
+            # Never stop a print over the saved copy
+            gcmd.respond_info('Baby stepping not saved: %s' % exc)
 
     def cmd_save_babystep(self, gcmd):
         """Keep the attached tool's baby stepping for later prints."""
