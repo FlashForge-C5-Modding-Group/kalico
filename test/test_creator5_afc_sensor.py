@@ -518,6 +518,48 @@ class Creator5AfcSensorTest(unittest.TestCase):
         afc.afcDeltaTime.log_total_time.assert_called_once_with(
             'Total change time:')
 
+    def _restore_afc(self, current_z, old_offset, new_offset):
+        restore = load_method('AFC.py', 'afc', 'restore_pos', {
+            'round_floats': lambda value: value,
+            'State': types.SimpleNamespace(RESTORING_POS='restoring',
+                                           IDLE='idle'),
+            'get_gcode_absolute_extrude': lambda gcode_move: True,
+            'set_gcode_absolute_extrude': lambda gcode_move, value: None})
+        afc = mock.Mock()
+        afc.position_saved = True
+        afc.z_hop = .4
+        afc.last_gcode_position = [100., 100., 12. + old_offset, 50.]
+        afc.homing_position = [0., 0., old_offset, 0.]
+        afc.base_position = [0., 0., old_offset, 0.]
+        afc.gcode_move.homing_position = [0., 0., new_offset, 0.]
+        afc.gcode_move.last_position = [300., 50., current_z, 50.]
+        moves = []
+        afc.gcode_move.move_with_transform.side_effect = (
+            lambda pos, speed: moves.append(list(pos[:3])))
+
+        def move_z(z, label):
+            afc.gcode_move.last_position[2] = z
+            moves.append(['z', z])
+            return z
+        afc.move_z_pos.side_effect = move_z
+        restore(afc, move_z_first=False, keep_offsets=True)
+        return moves
+
+    def test_toolchange_return_lifts_when_the_new_nozzle_is_lower(self):
+        # T0 printing at Z12 (offset 3.03) above safe_z, so nothing was
+        # raised for the change; T1's offset is 0.21 mm larger
+        moves = self._restore_afc(15.03, 3.03, 3.2429)
+        self.assertEqual(moves[0][0], 'z')
+        self.assertAlmostEqual(moves[0][1], 12. + 3.2429 + .4)
+        self.assertEqual(moves[1][:2], [100., 100.])      # XY at that height
+        self.assertAlmostEqual(moves[2][2], 12. + 3.2429)  # then down
+
+    def test_toolchange_return_keeps_a_higher_clearance(self):
+        # Raised to safe travel height: no extra move before the XY return
+        moves = self._restore_afc(20., 3.03, 3.2429)
+        self.assertEqual(moves[0], [100., 100., 20.])
+        self.assertAlmostEqual(moves[1][2], 12. + 3.2429)
+
 
 if __name__ == '__main__':
     unittest.main()
