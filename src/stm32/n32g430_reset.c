@@ -14,3 +14,14 @@ command_reset(uint32_t *args)
     NVIC_SystemReset();
 }
 DECL_COMMAND_FLAGS(command_reset, HF_IN_SHUTDOWN, "reset");
+
+// The levelboard's boot stage stays resident after every reset already; the
+// same name as the eBoard and heaterBoard keeps the host side uniform.
+void
+command_c5_reset_bootloader(uint32_t *args)
+{
+    (void)args;
+    NVIC_SystemReset();
+}
+DECL_COMMAND_FLAGS(command_c5_reset_bootloader, HF_IN_SHUTDOWN,
+                   "c5_reset_bootloader");

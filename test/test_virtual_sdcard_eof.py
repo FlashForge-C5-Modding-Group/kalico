@@ -1,6 +1,8 @@
 import importlib.util
 import io
 from pathlib import Path
+import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -10,6 +12,11 @@ SPEC = importlib.util.spec_from_file_location(
     / 'klippy' / 'extras' / 'virtual_sdcard.py')
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
+PRINT_STATS_SPEC = importlib.util.spec_from_file_location(
+    'print_stats', Path(__file__).resolve().parents[1]
+    / 'klippy' / 'extras' / 'print_stats.py')
+PRINT_STATS_MODULE = importlib.util.module_from_spec(PRINT_STATS_SPEC)
+PRINT_STATS_SPEC.loader.exec_module(PRINT_STATS_MODULE)
 
 
 class VirtualSDEOFTests(unittest.TestCase):
@@ -26,6 +33,7 @@ class VirtualSDEOFTests(unittest.TestCase):
         sd.creator5_preloaded_definitions = set()
         sd.must_pause_work = sd.cmd_from_sd = False
         sd.work_timer = object()
+        sd._in_worker_script = False
         sd.reactor = mock.Mock(NOW=0., NEVER=999.)
         sd.reactor.monotonic.return_value = 0.
         sd.gcode = mock.Mock()
@@ -35,6 +43,170 @@ class VirtualSDEOFTests(unittest.TestCase):
         sd.on_error_gcode = mock.Mock()
         sd.on_error_gcode.render.return_value = 'TURN_OFF_HEATERS'
         return sd
+
+    def attach_print_stats(self, sd):
+        printer = mock.Mock()
+        printer.get_reactor.return_value = sd.reactor
+        printer.lookup_object.return_value = sd.gcode
+        gcode_move = mock.Mock()
+        gcode_move.get_status.return_value = {
+            'position': SimpleNamespace(e=0.0), 'extrude_factor': 1.0}
+        printer.load_object.return_value = gcode_move
+        config = mock.Mock()
+        config.get_printer.return_value = printer
+        sd.printer = printer
+        sd.print_stats = PRINT_STATS_MODULE.PrintStats(config)
+
+    def cancel_from_script(self, sd, cleanup):
+        previous = sd.reactor.pause.side_effect
+        sd.reactor.pause.side_effect = AssertionError(
+            'worker cancellation attempted to wait')
+        try:
+            sd.do_cancel()
+        finally:
+            sd.reactor.pause.side_effect = previous
+        cleanup.append('cancel returned')
+
+    def assert_cancelled(self, sd, original_file, cleanup):
+        self.assertTrue(original_file.closed)
+        self.assertFalse(sd.is_active())
+        self.assertEqual(sd.print_stats.get_status(
+            sd.reactor.monotonic())['state'], 'cancelled')
+        self.assertEqual(cleanup, ['cancel returned'])
+        events = [c.args[0] for c in sd.printer.send_event.call_args_list]
+        self.assertNotIn('print_stats:complete_printing', events)
+
+    def test_automatic_start_cancel_allows_new_print(self):
+        sd = self.make_sd('M109 S220\nG1 X10\n')
+        sd.auto_creator5_start = True
+        self.attach_print_stats(sd)
+        original_file = sd.current_file
+        cleanup = []
+        commands = []
+        def dispatch(line):
+            commands.append(line)
+            if line.startswith('C5_PRINT_START'):
+                self.cancel_from_script(sd, cleanup)
+        sd.gcode.run_script.side_effect = dispatch
+        sd.work_handler(0.)
+        self.assert_cancelled(sd, original_file, cleanup)
+        self.assertNotIn('G1 X10', commands)
+        self.assertNotIn('C5_PRINT_STOP', commands)
+
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, 'retry.gcode').write_text('M109 S220\nG1 X20\n')
+            sd.sdcard_dirname = directory
+            gcmd = mock.Mock()
+            gcmd.get.return_value = 'retry.gcode'
+            gcmd.error = sd.gcode.error
+            commands.clear()
+            sd.printer.send_event.reset_mock()
+            sd.gcode.run_script.side_effect = commands.append
+            sd.cmd_SDCARD_PRINT_FILE(gcmd)
+            retry_file = sd.current_file
+            self.addCleanup(retry_file.close)
+            worker = sd.reactor.register_timer.call_args.args[0]
+            worker(0.)
+        self.assertTrue(retry_file.closed)
+        self.assertFalse(sd.is_active())
+        self.assertEqual(sum(c.startswith('C5_PRINT_START')
+                             for c in commands), 1)
+        self.assertIn('G1 X20', commands)
+        self.assertEqual(commands.count('C5_PRINT_STOP'), 1)
+        self.assertEqual(sd.print_stats.get_status(
+            sd.reactor.monotonic())['state'], 'complete')
+
+    def test_automatic_start_error_can_cancel_cleanup(self):
+        for text in ('G1 X10\n', 'M109 S220\nG1 X10\n'):
+            with self.subTest(text=text):
+                sd = self.make_sd(text)
+                sd.auto_creator5_start = True
+                self.attach_print_stats(sd)
+                original_file = sd.current_file
+                cleanup = []
+                commands = []
+                sd.on_error_gcode.render.return_value = 'CANCEL_PRINT'
+                def dispatch(line):
+                    commands.append(line)
+                    if line.startswith('C5_PRINT_START'):
+                        raise sd.gcode.error('startup failed')
+                    if line == 'CANCEL_PRINT':
+                        self.cancel_from_script(sd, cleanup)
+                sd.gcode.run_script.side_effect = dispatch
+                sd.work_handler(0.)
+                self.assert_cancelled(sd, original_file, cleanup)
+                self.assertNotIn('G1 X10', commands)
+                self.assertNotIn('C5_PRINT_STOP', commands)
+
+    def test_automatic_end_cancel_does_not_complete(self):
+        sd = self.make_sd('M109 S220\nG1 X10\n')
+        sd.auto_creator5_start = True
+        self.attach_print_stats(sd)
+        original_file = sd.current_file
+        cleanup = []
+        commands = []
+        def dispatch(line):
+            commands.append(line)
+            if line == 'C5_PRINT_STOP':
+                self.cancel_from_script(sd, cleanup)
+        sd.gcode.run_script.side_effect = dispatch
+        sd.work_handler(0.)
+        self.assert_cancelled(sd, original_file, cleanup)
+        self.assertIn('G1 X10', commands)
+        self.assertNotIn(mock.call('Done printing file'),
+                         sd.gcode.respond_raw.call_args_list)
+
+    def test_automatic_end_error_can_cancel_cleanup(self):
+        for error_type in (RuntimeError, ValueError):
+            with self.subTest(error_type=error_type):
+                sd = self.make_sd('M109 S220\nG1 X10\n')
+                sd.auto_creator5_start = True
+                self.attach_print_stats(sd)
+                original_file = sd.current_file
+                cleanup = []
+                commands = []
+                sd.on_error_gcode.render.return_value = 'CANCEL_PRINT'
+                def dispatch(line):
+                    commands.append(line)
+                    if line == 'C5_PRINT_STOP':
+                        raise error_type('stop failed')
+                    if line == 'CANCEL_PRINT':
+                        self.cancel_from_script(sd, cleanup)
+                sd.gcode.run_script.side_effect = dispatch
+                sd.work_handler(0.)
+                self.assert_cancelled(sd, original_file, cleanup)
+                self.assertIn('G1 X10', commands)
+                self.assertNotIn(mock.call('Done printing file'),
+                                 sd.gcode.respond_raw.call_args_list)
+
+    def test_worker_scripts_wait_for_dispatcher(self):
+        for blocked_script in ('start', 'end'):
+            with self.subTest(blocked_script=blocked_script):
+                sd = self.make_sd('M109 S220\nG1 X10\n')
+                sd.auto_creator5_start = True
+                self.attach_print_stats(sd)
+                original_file = sd.current_file
+                locked = [blocked_script == 'start']
+                commands = []
+                sd.gcode.get_mutex.return_value.test.side_effect = (
+                    lambda: locked[0])
+                def release_dispatcher(waketime):
+                    locked[0] = False
+                def dispatch(line):
+                    if locked[0]:
+                        raise sd.gcode.error('dispatcher is still occupied')
+                    commands.append(line)
+                    if line == 'G1 X10' and blocked_script == 'end':
+                        locked[0] = True
+                sd.reactor.pause.side_effect = release_dispatcher
+                sd.gcode.run_script.side_effect = dispatch
+                sd.work_handler(0.)
+                self.assertTrue(original_file.closed)
+                self.assertFalse(sd.is_active())
+                self.assertIn('G1 X10', commands)
+                self.assertEqual(commands.count('C5_PRINT_STOP'), 1)
+                self.assertEqual(sd.print_stats.get_status(
+                    sd.reactor.monotonic())['state'], 'complete')
 
     def test_end_macro_with_and_without_newline(self):
         for suffix in ('', '\n', '\r\n'):
@@ -103,9 +275,226 @@ class VirtualSDEOFTests(unittest.TestCase):
         sd.work_handler(0.)
         commands = [c.args[0] for c in sd.gcode.run_script.call_args_list]
         self.assertEqual(commands[0],
-                         'C5_PRINT_START TOOL=2 HOTEND=220 BED=60')
+                         'C5_PRINT_START TOOL=2 HOTEND=220 BED=60 '
+                         'MATERIAL0=UNKNOWN MATERIAL1=UNKNOWN '
+                         'MATERIAL2=UNKNOWN MATERIAL3=UNKNOWN')
         self.assertEqual(commands[-2:], ['G1 X10', 'C5_PRINT_STOP'])
         self.assertEqual(sd.file_position, sd.file_size)
+
+    def test_automatic_start_maps_all_materials_independent_of_initial_tool(self):
+        for tool in range(4):
+            with self.subTest(tool=tool):
+                sd = self.make_sd(
+                    '; filament_type = PLA;PETG;ABS;ASA\n'
+                    'M109 S220\nT%d\nT0\nG1 X10\n' % tool)
+                sd.auto_creator5_start = True
+                sd.work_handler(0.)
+                commands = [c.args[0]
+                            for c in sd.gcode.run_script.call_args_list]
+                self.assertEqual(
+                    commands[0],
+                    'C5_PRINT_START TOOL=%d HOTEND=220 BED=0 '
+                    'MATERIAL0=PLA MATERIAL1=PETG MATERIAL2=ABS MATERIAL3=ASA'
+                    % tool)
+                self.assertIn('G1 X10', commands)
+                sd.print_stats.note_complete.assert_called_once()
+
+    def test_automatic_start_defaults_invalid_materials_independently(self):
+        metadata = (
+            ('', 'UNKNOWN', 'UNKNOWN', 'UNKNOWN', 'UNKNOWN'),
+            ('; filament_type = \n',
+             'UNKNOWN', 'UNKNOWN', 'UNKNOWN', 'UNKNOWN'),
+            ('; filament_type = PLA;PETG\n',
+             'PLA', 'PETG', 'UNKNOWN', 'UNKNOWN'),
+            ('; filament_type = PLA;PETG; ;ABS\n',
+             'PLA', 'PETG', 'UNKNOWN', 'ABS'),
+            ('; filament_type = PLA;PETG;PLA HOTEND=300\n',
+             'PLA', 'PETG', 'UNKNOWN', 'UNKNOWN'),
+            ('; filament_type = PLA;PETG;PLA#\n',
+             'PLA', 'PETG', 'UNKNOWN', 'UNKNOWN'),
+            ('; filament_type = PLA;PETG;"PLA\n',
+             'PLA', 'PETG', 'UNKNOWN', 'UNKNOWN'),
+            ('; filament_type = PLA;PETG;PLA"\n',
+             'PLA', 'PETG', 'UNKNOWN', 'UNKNOWN'),
+            ('; filament_type = ;PLA HOTEND=300;abs\n',
+             'UNKNOWN', 'UNKNOWN', 'ABS', 'UNKNOWN'),
+            ('; filament_type_extra = PLA;PETG;ABS\n',
+             'UNKNOWN', 'UNKNOWN', 'UNKNOWN', 'UNKNOWN'),
+            ('; default_filament_type = PLA;PETG;ABS\n',
+             'UNKNOWN', 'UNKNOWN', 'UNKNOWN', 'UNKNOWN'),
+            ('filament_type = PLA;PETG;ABS\n',
+             'UNKNOWN', 'UNKNOWN', 'UNKNOWN', 'UNKNOWN'),
+        )
+        for value, material0, material1, material2, material3 in metadata:
+            with self.subTest(metadata=value):
+                sd = self.make_sd(value + 'M109 S220\nT2\nG1 X10\n')
+                sd.auto_creator5_start = True
+                sd.work_handler(0.)
+                self.assertEqual(
+                    sd.gcode.run_script.call_args_list[0].args[0],
+                    'C5_PRINT_START TOOL=2 HOTEND=220 BED=0 '
+                    'MATERIAL0=%s MATERIAL1=%s MATERIAL2=%s MATERIAL3=%s'
+                    % (material0, material1, material2, material3))
+                sd.print_stats.note_complete.assert_called_once()
+
+    def test_automatic_start_ignores_material_slots_beyond_four(self):
+        for extra in (';PC', ';PLA HOTEND=999', ';;PETG;ABS'):
+            with self.subTest(extra=extra):
+                sd = self.make_sd(
+                    '; filament_type = PLA;PETG;ABS;ASA%s\n'
+                    'M109 S220\nT2\nG1 X10\n' % extra)
+                sd.auto_creator5_start = True
+                sd.work_handler(0.)
+                self.assertEqual(
+                    sd.gcode.run_script.call_args_list[0].args[0],
+                    'C5_PRINT_START TOOL=2 HOTEND=220 BED=0 '
+                    'MATERIAL0=PLA MATERIAL1=PETG MATERIAL2=ABS MATERIAL3=ASA')
+
+    def test_automatic_start_normalizes_quoted_material_slots(self):
+        for value in ('" petg-cf "', "' petg-cf '"):
+            with self.subTest(value=value):
+                sd = self.make_sd(
+                    '; filament_type = pla; %s ;pa6+gf;abs\n'
+                    'M109 S220\nT1\nG1 X10\n' % value)
+                sd.auto_creator5_start = True
+                sd.work_handler(0.)
+                self.assertEqual(
+                    sd.gcode.run_script.call_args_list[0].args[0],
+                    'C5_PRINT_START TOOL=1 HOTEND=220 BED=0 '
+                    'MATERIAL0=PLA MATERIAL1=PETG-CF '
+                    'MATERIAL2=PA6+GF MATERIAL3=ABS')
+
+    def test_automatic_start_uses_authoritative_footer_beyond_header(self):
+        text = ('; filament_type = PLA;PLA;PLA;PLA\n'
+                'M109 S220\nT2\nG1 X10\n;'
+                + 'x' * 70000
+                + '\n; CONFIG_BLOCK_START\n'
+                '; filament_type = ABS;PETG;PA6+GF;ASA\n'
+                '; CONFIG_BLOCK_END\nG1 X20\n')
+        sd = self.make_sd(text)
+        sd.auto_creator5_start = True
+        sd.work_handler(0.)
+        commands = [c.args[0] for c in sd.gcode.run_script.call_args_list]
+        self.assertEqual(
+            commands[0],
+            'C5_PRINT_START TOOL=2 HOTEND=220 BED=0 '
+            'MATERIAL0=ABS MATERIAL1=PETG MATERIAL2=PA6+GF MATERIAL3=ASA')
+        self.assertEqual(commands.count('G1 X10'), 1)
+        self.assertEqual(commands.count('G1 X20'), 1)
+        self.assertEqual(commands[-1], 'C5_PRINT_STOP')
+        self.assertEqual(sd.file_position, sd.file_size)
+        sd.print_stats.note_complete.assert_called_once()
+
+    def test_automatic_start_passes_used_tools_and_idle_temperatures(self):
+        text = ('M109 S220\nT0\nG1 X10\n;' + 'x' * 70000
+                + '\n; filament used [mm] = 3745.08, 0.00, 0.00, 650.04\n'
+                '; CONFIG_BLOCK_START\n'
+                '; idle_temperature = 0,150,0,170\n'
+                '; CONFIG_BLOCK_END\n')
+        sd = self.make_sd(text)
+        sd.auto_creator5_start = True
+        sd.work_handler(0.)
+        commands = [c.args[0] for c in sd.gcode.run_script.call_args_list]
+        self.assertEqual(
+            commands[0],
+            'C5_PRINT_START TOOL=0 HOTEND=220 BED=0 '
+            'MATERIAL0=UNKNOWN MATERIAL1=UNKNOWN '
+            'MATERIAL2=UNKNOWN MATERIAL3=UNKNOWN '
+            'USED_TOOLS=0,3 IDLE1=150 IDLE3=170')
+
+    def test_footer_material_overrides_prefix_even_when_windows_overlap(self):
+        for value, material in (('PETG', 'PETG'), ('', 'UNKNOWN'),
+                                ('PLA HOTEND=999', 'UNKNOWN')):
+            with self.subTest(value=value):
+                sd = self.make_sd(
+                    '; filament_type = PLA\nM109 S220\nG1 X10\n'
+                    '; CONFIG_BLOCK_START\n; filament_type = %s'
+                    % value)
+                sd.auto_creator5_start = True
+                sd.work_handler(0.)
+                self.assertEqual(
+                    sd.gcode.run_script.call_args_list[0].args[0],
+                    'C5_PRINT_START TOOL=0 HOTEND=220 BED=0 MATERIAL0='
+                    + material + ' MATERIAL1=UNKNOWN MATERIAL2=UNKNOWN '
+                    'MATERIAL3=UNKNOWN')
+                sd.print_stats.note_complete.assert_called_once()
+
+    def test_truncated_header_material_does_not_select_partial_token(self):
+        start = 'M109 S220\nG1 X10\n;'
+        metadata = '\n; filament_type = PLA'
+        text = (start + 'x' * (65536 - len(start) - len(metadata))
+                + metadata + '-CF\n;' + 'x' * 70000)
+        sd = self.make_sd(text)
+        sd.auto_creator5_start = True
+        sd.work_handler(0.)
+        self.assertEqual(
+            sd.gcode.run_script.call_args_list[0].args[0],
+            'C5_PRINT_START TOOL=0 HOTEND=220 BED=0 '
+            'MATERIAL0=UNKNOWN MATERIAL1=UNKNOWN '
+            'MATERIAL2=UNKNOWN MATERIAL3=UNKNOWN')
+        sd.print_stats.note_complete.assert_called_once()
+
+    def test_footer_material_requires_complete_line_at_read_boundary(self):
+        metadata = '; filament_type = ABS\n'
+        tail = metadata + ';' + 'x' * (65536 - len(metadata.encode()) - 1)
+        for line_start, material in (('\n', 'ABS'), ('x', 'PLA')):
+            with self.subTest(line_start=line_start):
+                text = ('; filament_type = PLA\nM109 S220\nG1 X10\n;'
+                        + 'x' * 70000 + line_start + tail)
+                sd = self.make_sd(text)
+                sd.auto_creator5_start = True
+                sd.work_handler(0.)
+                self.assertEqual(
+                    sd.gcode.run_script.call_args_list[0].args[0],
+                    'C5_PRINT_START TOOL=0 HOTEND=220 BED=0 MATERIAL0='
+                    + material + ' MATERIAL1=UNKNOWN MATERIAL2=UNKNOWN '
+                    'MATERIAL3=UNKNOWN')
+                sd.print_stats.note_complete.assert_called_once()
+
+    def test_automatic_start_handles_utf8_split_tail_and_rewinds_stream(self):
+        tail = '\n; filament_type = PETG\nG1 X20\n'
+        suffix = 'y' * (65535 - len(tail.encode())) + tail
+        comment = ';' + 'x' * 70000 + 'é' + suffix.split('\n', 1)[0]
+        text = 'M109 S220\nG1 X10\n' + comment + tail
+        sd = self.make_sd(text)
+        sd.auto_creator5_start = True
+        def check_rewind(line):
+            if line.startswith('C5_PRINT_START '):
+                self.assertEqual(sd.current_file.tell(), 0)
+        sd.gcode.run_script.side_effect = check_rewind
+        sd.work_handler(0.)
+        commands = [c.args[0] for c in sd.gcode.run_script.call_args_list]
+        self.assertEqual(
+            commands[0],
+            'C5_PRINT_START TOOL=0 HOTEND=220 BED=0 MATERIAL0=PETG '
+            'MATERIAL1=UNKNOWN MATERIAL2=UNKNOWN MATERIAL3=UNKNOWN')
+        self.assertEqual(commands.count(comment), 1)
+        self.assertEqual(commands.count('G1 X10'), 1)
+        self.assertEqual(commands.count('G1 X20'), 1)
+        self.assertEqual(sd.file_position, len(text.encode()))
+        sd.print_stats.note_complete.assert_called_once()
+
+    def test_explicit_start_ignores_malformed_material_and_keeps_preloading(self):
+        define = ('EXCLUDE_OBJECT_DEFINE NAME=cube '
+                  'POLYGON=[[10,10],[20,10],[20,20],[10,20]]')
+        start = 'C5_PRINT_START TOOL=1 HOTEND=210 BED=50'
+        text = (define + '\n' + start + '\nG1 X10\n;'
+                + 'x' * 70000
+                + '\n; filament_type = "PLA HOTEND=999\n')
+        sd = self.make_sd(text)
+        sd.auto_creator5_start = True
+        sd.work_handler(0.)
+        commands = [c.args[0] for c in sd.gcode.run_script.call_args_list]
+        self.assertEqual(commands[:3], [
+            'EXCLUDE_OBJECT_DEFINE RESET=1', define, start])
+        self.assertEqual(commands.count(define), 1)
+        self.assertEqual(
+            [line for line in commands if line.startswith('C5_PRINT_START')],
+            [start])
+        self.assertFalse(any(line.startswith('_SET_MPC_MATERIAL')
+                             for line in commands))
+        self.assertIn('G1 X10', commands)
+        sd.print_stats.note_complete.assert_called_once()
 
     def test_automatic_start_passes_first_layer_height(self):
         sd = self.make_sd('; first_layer_height = 0.08\nM104 S220\nG1 X10')
@@ -113,14 +502,17 @@ class VirtualSDEOFTests(unittest.TestCase):
         sd.work_handler(0.)
         self.assertEqual(sd.gcode.run_script.call_args_list[0].args[0],
                          'C5_PRINT_START TOOL=0 HOTEND=220 BED=0 '
-                         'FIRST_LAYER_HEIGHT=0.08')
+                         'FIRST_LAYER_HEIGHT=0.08 MATERIAL0=UNKNOWN '
+                         'MATERIAL1=UNKNOWN MATERIAL2=UNKNOWN MATERIAL3=UNKNOWN')
 
     def test_automatic_start_prefers_print_wait_over_early_preheat(self):
         sd = self.make_sd('M104 S300\nM109 S220\nG1 X10\n')
         sd.auto_creator5_start = True
         sd.work_handler(0.)
         self.assertEqual(sd.gcode.run_script.call_args_list[0].args[0],
-                         'C5_PRINT_START TOOL=0 HOTEND=220 BED=0')
+                         'C5_PRINT_START TOOL=0 HOTEND=220 BED=0 '
+                         'MATERIAL0=UNKNOWN MATERIAL1=UNKNOWN '
+                         'MATERIAL2=UNKNOWN MATERIAL3=UNKNOWN')
 
     def test_existing_start_is_not_duplicated(self):
         sd = self.make_sd('C5_PRINT_START TOOL=1 HOTEND=210 BED=50\nG1 X10')
@@ -190,9 +582,9 @@ class VirtualSDEOFTests(unittest.TestCase):
         sd.auto_creator5_start = True
         sd.work_handler(0.)
         commands = [c.args[0] for c in sd.gcode.run_script.call_args_list]
-        self.assertEqual(commands, [
-            'C5_PRINT_START TOOL=0 HOTEND=220 BED=0', 'M109 S220',
-            'G92 E0', 'G1 X10', 'C5_PRINT_STOP'])
+        self.assertTrue(commands[0].startswith('C5_PRINT_START '))
+        self.assertEqual(commands[1:], [
+            'M109 S220', 'G92 E0', 'G1 X10', 'C5_PRINT_STOP'])
         self.assertEqual(sd.file_position, sd.file_size)
 
     def test_slicer_z_offset_fast_path_keeps_exact_matching(self):
@@ -211,9 +603,9 @@ class VirtualSDEOFTests(unittest.TestCase):
         sd.auto_creator5_start = True
         sd.work_handler(0.)
         commands = [c.args[0] for c in sd.gcode.run_script.call_args_list]
-        self.assertEqual(commands[:3], [
-            'EXCLUDE_OBJECT_DEFINE RESET=1', define,
-            'C5_PRINT_START TOOL=0 HOTEND=220 BED=0'])
+        self.assertEqual(commands[:2], [
+            'EXCLUDE_OBJECT_DEFINE RESET=1', define])
+        self.assertTrue(commands[2].startswith('C5_PRINT_START '))
         self.assertEqual(commands.count(define), 1)
         self.assertEqual(commands[-3:], ['M109 S220', 'G1 X10',
                                          'C5_PRINT_STOP'])

@@ -69,6 +69,12 @@ class Creator5OffsetTests(unittest.TestCase):
         with open(self.board.test_json_path, 'w') as target:
             target.write('{"generalFirmware": false, "tempOffset": 0.00045, '
                          '"cylinder_x": 28.5, "cylinder_y": 214.5}\n')
+        self.board.toolchange_count_path = os.path.join(
+            self.temp.name, 'toolchanges.txt')
+        self.board.toolchange_count_writer = MODULE.LatestFileWriter(
+            self.board.toolchange_count_path, 'test_toolchanges')
+        self.addCleanup(self.board.toolchange_count_writer.close)
+        self.board.toolchange_counts = [0] * 4
         self.board.measurements = [[15., 215., 1.] for _ in range(4)]
         self.board.docks = [[298., 50. + i * 50.] for i in range(4)]
         self.board.station_x = 29.
@@ -119,7 +125,7 @@ class Creator5OffsetTests(unittest.TestCase):
     def _afc_tool_fixture(self, t0_alias='extruder0'):
         afc = types.SimpleNamespace(
             tools={}, lanes={}, current=t0_alias, in_toolchange=False,
-            error_state=False, error=mock.Mock(),
+            error_state=False, error=mock.Mock(), position_saved=False,
             function=types.SimpleNamespace(
                 is_printing=lambda: True, is_paused=lambda: True))
         for tool in range(4):
@@ -221,21 +227,24 @@ class Creator5OffsetTests(unittest.TestCase):
                     self.board._run.assert_called_once_with(
                         'SET_HEATER_TEMPERATURE HEATER=%s TARGET=0' % heater)
 
-    def test_failed_runout_switch_asks_again(self):
-        afc = self._afc_tool_fixture('extruder')
-        source_lane = afc.lanes['extruder']
-        source_lane._perform_creator5_infinite_runout = mock.Mock(
-            side_effect=lambda *a, **k: setattr(afc, 'error_state', True))
-        pause = types.SimpleNamespace(is_paused=True)
-        objects = {'AFC': afc, 'pause_resume': pause}
+    def test_runout_switch_keeps_the_position_saved_by_the_runout_pause(self):
+        # restore_pos only returns to the print if position_saved is still set.
+        afc = self._afc_tool_fixture()
+        afc.current = 'extruder1'
+        afc.position_saved = True
+        afc.error.reset_failure.side_effect = (
+            lambda: setattr(afc, 'position_saved', False))
+        seen = []
+        afc.lanes['extruder1']._perform_creator5_infinite_runout = mock.Mock(
+            side_effect=lambda *args, **kwargs: seen.append(afc.position_saved))
+        objects = {'AFC': afc, 'pause_resume': types.SimpleNamespace(is_paused=True)}
         self.board.printer.lookup_object.side_effect = (
             lambda name, default=None: objects.get(name, default))
         self.board._run = mock.Mock()
 
-        self.board.cmd_runout_switch(GCmd(TOOL=0, TO=1))
+        self.board.cmd_runout_switch(GCmd(TOOL=1, TO=0, TEMP=215.))
 
-        self.board._run.assert_called_once_with('_OC_RUNOUT_PROMPT')
-        self.assertTrue(pause.is_paused)
+        self.assertEqual(seen, [True])
 
     def test_offset_reference_unselects_afc_owned_t0_alias(self):
         for alias in ('extruder0', 'extruder'):
@@ -610,21 +619,71 @@ class Creator5OffsetTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'Door topDoor is open'):
             self.board._check_chamber_doors(GCmd(), 'Door %s is open')
 
+    def _holder_measure_setup(self, x_trigger, y_trigger):
+        self.board.max_mount_correction = 2.
+        self.board.pullback_slow_distance = 20.
+        self.board.pullback_speed = 80.
+        self.board.pickup_latch_wait_ms = 0
+        self.board.sensor_settle_ms = 0
+        self.board.docks[1] = [298., 100.]
+        self.board._run = mock.Mock()
+        self.board._move = mock.Mock()
+        self.board._pause_ms = mock.Mock()
+        self.board._button = lambda name, gcmd: name == 'grab1'
+        x_home, y_home = mock.Mock(), mock.Mock()
+        x_home.measure_axis.return_value = x_trigger
+        y_home.measure_axis.return_value = y_trigger
+        self.board.printer.lookup_object.side_effect = (
+            lambda name, *default: {'hd_home X': x_home,
+                                    'hd_home Y': y_home}[name])
+        return x_home, y_home
+
+    def test_holder_measure_travels_fast_to_short_of_saved_dock(self):
+        # T1: Y reference 130; saved dock X298 Y100 puts the endstops at
+        # X-3 and Y30, so travel stops 10 mm short of each.
+        self._holder_measure_setup(-3.5, 29.8)
+        x, y = self.board._measure_holder_position(GCmd(), 1)
+        self.assertAlmostEqual(x, 298.5)
+        self.assertAlmostEqual(y, 100.2)
+        self.assertEqual(self.board._move.call_args_list[1:], [
+            mock.call(x=240., feed=12000),
+            mock.call(x=7., feed=12000),
+            mock.call(y=40., feed=12000)])
+
+    def test_holder_measure_margin_stays_wider_than_correction_limit(self):
+        self._holder_measure_setup(-3., 30.)
+        self.board.max_mount_correction = 8.
+        self.board._measure_holder_position(GCmd(), 1)
+        self.assertEqual(self.board._move.call_args_list[2:], [
+            mock.call(x=10., feed=12000),
+            mock.call(y=43., feed=12000)])
+
+    def test_toolchange_counter_persists_per_tool_and_total(self):
+        self.board._count_toolchange(2)
+        self.board._count_toolchange(2)
+        self.board._count_toolchange(0)
+        self.board.toolchange_count_writer.flush()
+        with open(self.board.toolchange_count_path) as source:
+            self.assertEqual(source.read(),
+                             'Total: 3\nT0: 1\nT1: 0\nT2: 2\nT3: 0\n')
+        self.assertEqual(self.board._load_toolchange_counts(), [1, 0, 2, 0])
+
     def test_unknown_chamber_heater_state_does_not_bypass_open_doors(self):
         self.board.door_buttons = ['topDoor']
-        # configured, but the heaters object can't be read
+        heaters = mock.Mock()
+        heaters.lookup_heater.side_effect = Exception('lookup failed')
         self.board.printer.lookup_object.side_effect = (
-            lambda name, default=None: mock.Mock()
-            if name == 'heater_generic chamber_heater' else None)
+            lambda name, *default: heaters if name == 'heaters'
+            else mock.Mock())
         with self.assertRaisesRegex(RuntimeError,
                                     'Cannot verify chamber heater state'):
             self.board._check_chamber_doors(GCmd(), 'Door %s is open')
 
-    def test_creator5_without_chamber_heater_skips_door_check(self):
+    def test_open_door_allowed_without_a_chamber_heater(self):
         self.board.door_buttons = ['topDoor']
-        self.board._button = lambda name, gcmd: False   # door open
+        self.board._button = lambda name, gcmd: False
         self.board.printer.lookup_object.side_effect = (
-            lambda name, default=None: None)
+            lambda name, *default: default[0] if default else mock.Mock())
         self.board._check_chamber_doors(GCmd(), 'Door %s is open')
 
     def test_attached_tool_and_status_use_only_dock_grab_pins(self):
@@ -702,15 +761,44 @@ class Creator5OffsetTests(unittest.TestCase):
         self.assertFalse(any(' Z=0 ' in call.args[0] for call in
                              board._run.call_args_list))
 
-    def test_dock_lane_travel_is_diagonal_from_inboard(self):
+    def _dock_board(self, seated, at_mount):
         board = self.board
         board.approach_x = 250.
+        board.clear_travel_speed = 600.
+        board.dock_approach_speed = 25.
+        board.dock_predock_offset = 20.
+        board.departure_speed = 90.
+        board.release_latch_wait_ms = 50
+        board.toolchange_sensor_settle_ms = 20
+        board.dock_buttons = ['d0', 'd1', 'd2', 'd3']
+        board.grab_buttons = ['g0', 'g1', 'g2', 'g3']
         board._move = mock.Mock()
-        board.printer.lookup_object.return_value.get_position.return_value = [
-            150., 150., 10., 0.]
-        board._travel_to_lane(50., 36000.)
-        self.assertEqual(board._move.call_args_list, [
-            mock.call(x=250., y=50., feed=36000.)])
+        board._run = mock.Mock()
+        board._pause_ms = mock.Mock()
+        board._verify = mock.Mock()
+        board._travel_to_lane = mock.Mock()
+        board._button = lambda name, gcmd: {'d0': seated, 'g0': at_mount}.get(name, False)
+        board.z_adjustments = [0.] * 4
+        board.printer.lookup_object.return_value.get_status.return_value = {
+            'homing_origin': (0., 0., 2., 0.)}
+        return board
+
+    def test_dock_releases_only_when_seated_at_mount(self):
+        board = self._dock_board(seated=True, at_mount=True)
+        board._dock(GCmd(), 0, raise_z=False)
+        board._run.assert_any_call('MOTOR_RELEASE')
+        board._verify.assert_called_once_with(mock.ANY, None, parked=0)
+
+    def test_dock_keeps_head_locked_when_not_seated(self):
+        for seated, at_mount in ((False, True), (True, False), (False, False)):
+            with self.subTest(seated=seated, at_mount=at_mount):
+                board = self._dock_board(seated, at_mount)
+                with self.assertRaisesRegex(RuntimeError, 'not seated in its dock'):
+                    board._dock(GCmd(), 0, raise_z=False)
+                commands = [c.args[0] for c in board._run.call_args_list]
+                self.assertNotIn('MOTOR_RELEASE', commands)
+                self.assertIn('TURN_OFF_HEATERS', commands)
+                board._verify.assert_not_called()
 
     def test_pickup_speeds_come_from_config(self):
         board = self.board
@@ -969,6 +1057,90 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board._run.assert_called_once_with(
             'SET_GCODE_OFFSET Z=2.8500 MOVE=1 MOVE_SPEED=100')
         self.assertAlmostEqual(self.board.print_z_baseline[1], 2.8)
+
+    def _babystep_fixture(self, origin_after):
+        zpath = os.path.join(self.temp.name, 'zoffset.json')
+        with open(zpath, 'w') as target:
+            target.write('{"z_offset_t2": 0.05}\n/* stock comment */\n')
+        with open(self.path, 'w') as target:
+            target.write('{"t1_offset_z": 1.3, "z_station_pos": -1.5}\n')
+        self.board.zoffset_json_path = zpath
+        self.board.z_adjustments = [0.] * 4
+        self.board.persist_babystep = True
+        self.board._preflight = lambda command: ([True] * 4, [], 1)
+        self.board._sensor_state = lambda command: ([True] * 4, [], 1)
+        self.board._run = mock.Mock()
+        self.board.cmd_auto_nozzle_z(GCmd(T=1))     # sets Z 2.85
+        self.board.printer.lookup_object.return_value.get_status.return_value = {
+            'homing_origin': (0., 0., origin_after, 0.)}
+        return zpath
+
+    def test_babystep_is_kept_for_later_prints(self):
+        zpath = self._babystep_fixture(2.80)          # baby stepped -0.05
+        self.board.cmd_save_babystep(GCmd())
+        data, suffix = self.board._read_stock_json(zpath)
+        self.assertAlmostEqual(data['z_offset_t2'], 0.0)
+        self.assertAlmostEqual(self.board.z_adjustments[1], 0.0)
+        self.assertEqual(suffix, '/* stock comment */')
+        # Saved once: the same offset again is no new baby stepping
+        self.board.cmd_save_babystep(GCmd())
+        self.assertEqual(len(list(Path(self.temp.name).glob(
+            'zoffset.json.bak-*'))), 1)
+
+    def test_babystep_is_saved_as_it_happens(self):
+        zpath = self._babystep_fixture(2.83)          # baby stepped -0.02
+        self.board.busy = False
+        self.board.attached_tool_from_pins = lambda: 1
+        self.board.prev_set_gcode_offset = mock.Mock()
+        gcmd = GCmd(Z_ADJUST=-0.02)
+        self.board.cmd_set_gcode_offset(gcmd)
+        self.board.prev_set_gcode_offset.assert_called_once_with(gcmd)
+        data, _ = self.board._read_stock_json(zpath)
+        self.assertAlmostEqual(data['z_offset_t2'], 0.03)
+        self.assertEqual(list(Path(self.temp.name).glob(
+            'zoffset.json.bak-*')), [])
+        # A plain Z offset is not baby stepping
+        self.board.printer.lookup_object.return_value.get_status.return_value = {
+            'homing_origin': (0., 0., 2.9, 0.)}
+        self.board.cmd_set_gcode_offset(GCmd(Z=2.9))
+        data, _ = self.board._read_stock_json(zpath)
+        self.assertAlmostEqual(data['z_offset_t2'], 0.03)
+
+    def test_babystep_list_and_clear(self):
+        zpath = self._babystep_fixture(2.85)          # T1 attached at 2.85
+        self.board.busy = False
+        self.board.attached_tool_from_pins = lambda: 1
+        gcmd = GCmd(T='1')
+        self.board.cmd_list_babystep(gcmd)
+        self.assertIn('T1: +0.0500 mm', gcmd.messages[0])
+        self.board._run.reset_mock()
+        self.board.cmd_clear_babystep(GCmd(T='1'))
+        data, _ = self.board._read_stock_json(zpath)
+        self.assertAlmostEqual(data['z_offset_t2'], 0.)
+        self.board._run.assert_called_once_with(
+            'SET_GCODE_OFFSET Z=2.8000 MOVE=0')
+        self.assertEqual(self.board._applied_z[0], 1)
+        self.assertAlmostEqual(self.board._applied_z[1], 2.8)
+        with self.assertRaisesRegex(RuntimeError, 'T must be'):
+            self.board.cmd_clear_babystep(GCmd(T='5'))
+
+    def test_large_z_change_is_not_saved_as_babystep(self):
+        zpath = self._babystep_fixture(1.2)           # -1.65 mm
+        gcmd = GCmd()
+        self.board.cmd_save_babystep(gcmd)
+        data, _ = self.board._read_stock_json(zpath)
+        self.assertAlmostEqual(data['z_offset_t2'], 0.05)
+        self.assertIn('not saved', gcmd.messages[0])
+
+    def test_babystep_saving_can_be_turned_off(self):
+        zpath = self._babystep_fixture(2.90)
+        self.board.persist_babystep = False
+        self.board.cmd_save_babystep(GCmd())
+        data, _ = self.board._read_stock_json(zpath)
+        self.assertAlmostEqual(data['z_offset_t2'], 0.05)
+        self.board.cmd_save_babystep(GCmd(FORCE=1))
+        data, _ = self.board._read_stock_json(zpath)
+        self.assertAlmostEqual(data['z_offset_t2'], 0.10)
 
     def test_factory_print_temperature_bed_and_layer_z_compensation(self):
         zpath = os.path.join(self.temp.name, 'zoffset.json')
@@ -1620,13 +1792,15 @@ class Creator5OffsetTests(unittest.TestCase):
     def test_g28_wrapper_keeps_previous_safe_z_home_handler(self):
         previous = mock.Mock()
         self.board.gcode = mock.Mock()
-        self.board.gcode.register_command.side_effect = [previous, None, None]
+        self.board.gcode.register_command.side_effect = [
+            previous, None, None, None]
         self.board.printer.lookup_object.return_value.extruder_stepper = None
         self.board._handle_ready()
         self.assertIs(self.board.prev_G28, previous)
         self.assertEqual(self.board.gcode.register_command.call_args_list, [
             mock.call('G28', None),
             mock.call('G28', self.board.cmd_G28),
+            mock.call('SET_GCODE_OFFSET', None),
             mock.call('SET_PRESSURE_ADVANCE', None),
         ])
 

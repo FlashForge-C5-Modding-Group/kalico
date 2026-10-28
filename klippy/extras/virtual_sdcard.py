@@ -19,7 +19,7 @@ DEFAULT_ERROR_GCODE = """
 """
 
 
-def creator5_start_command(header):
+def creator5_start_command(header, footer=""):
     if re.search(r"^\s*C5_PRINT_START\b", header, re.I | re.M):
         return None
     tool = 0
@@ -53,10 +53,61 @@ def creator5_start_command(header):
     if hotend is None:
         raise ValueError("No hotend temperature found in G-code header; "
                          "add C5_PRINT_START TOOL=n HOTEND=n BED=n")
+    material_header = header
+    if len(header) >= 65536 and not header.endswith(("\n", "\r")):
+        material_header = header.rpartition("\n")[0]
+    materials = ()
+    for source in (footer, material_header):
+        meta = None
+        for candidate in re.finditer(
+                r"^[ \t]*;[ \t]*filament_type[ \t]*=[ \t]*([^\r\n]*)",
+                source, re.M):
+            meta = candidate
+        if meta:
+            materials = meta.group(1).split(";", 4)
+            break
     command = "C5_PRINT_START TOOL=%d HOTEND=%g BED=%g" % (tool, hotend, bed or 0.)
     if first_layer is not None:
         command += " FIRST_LAYER_HEIGHT=%g" % first_layer
+    for index in range(4):
+        material = "UNKNOWN"
+        if index < len(materials):
+            value = materials[index].strip()
+            if (len(value) >= 2 and value[0] in "\"'"
+                    and value[-1] == value[0]):
+                value = value[1:-1].strip()
+            if re.fullmatch(r"[A-Za-z0-9+_./-]+", value):
+                material = value.upper()
+        command += " MATERIAL%d=%s" % (index, material)
+    used = creator5_slot_list(r"filament used \[mm\]", footer, material_header)
+    tools = [index for index, value in enumerate(used[:4]) if value > 0]
+    if tools:
+        command += " USED_TOOLS=%s" % ",".join(map(str, tools))
+    idle = creator5_slot_list(r"idle_temperature", footer, material_header)
+    for index, value in enumerate(idle[:4]):
+        if value > 0:
+            command += " IDLE%d=%g" % (index, value)
     return command
+
+
+def creator5_slot_list(key, *sources):
+    """Orca's '; <key> = a,b,...' per-filament numbers, from the first source
+    that has the line (its last occurrence)."""
+    for source in sources:
+        meta = None
+        for candidate in re.finditer(
+                r"^[ \t]*;[ \t]*" + key + r"[ \t]*=[ \t]*([^\r\n]*)",
+                source, re.M):
+            meta = candidate
+        if meta:
+            values = []
+            for value in meta.group(1).split(","):
+                try:
+                    values.append(float(value))
+                except ValueError:
+                    values.append(0.)
+            return values
+    return []
 
 
 def creator5_slicer_z_offset(line):
@@ -116,6 +167,7 @@ class VirtualSD:
         self.cancelled_work = False
         self.next_file_position = 0
         self.work_timer = None
+        self._in_worker_script = False
         # Error handling
         gcode_macro = self.printer.load_object(config, "gcode_macro")
         self.on_error_gcode = gcode_macro.load_template(
@@ -217,7 +269,8 @@ class VirtualSD:
     def do_pause(self):
         if self.work_timer is not None:
             self.must_pause_work = True
-            while self.work_timer is not None and not self.cmd_from_sd:
+            while (self.work_timer is not None and not self.cmd_from_sd
+                   and not self._in_worker_script):
                 self.reactor.pause(self.reactor.monotonic() + 0.001)
 
     def do_resume(self):
@@ -362,6 +415,23 @@ class VirtualSD:
         return self.cmd_from_sd
 
     # Background work timer
+    def _run_worker_script(self, script):
+        # Synchronous worker scripts outside ordinary SD-file dispatch.
+        # Do not claim worker ownership while another dispatcher owns the
+        # mutex: its cancellation must be able to wait for this worker.
+        gcode_mutex = self.gcode.get_mutex()
+        while gcode_mutex.test():
+            if self.must_pause_work:
+                return False
+            self.reactor.pause(self.reactor.monotonic() + 0.100)
+        was_in_worker_script = self._in_worker_script
+        self._in_worker_script = True
+        try:
+            self.gcode.run_script(script)
+        finally:
+            self._in_worker_script = was_in_worker_script
+        return True
+
     def work_handler(self, eventtime):
         logging.info("Starting SD card print (position %d)", self.file_position)
         self.reactor.unregister_timer(self.work_timer)
@@ -382,30 +452,48 @@ class VirtualSD:
                 and not self.file_position):
             try:
                 header = self.current_file.read(65536)
+                # Read bytes so a tail offset inside UTF-8 cannot corrupt
+                # the text decoder used to execute the print afterward.
+                footer_offset = max(0, self.file_size - 65536)
+                self.current_file.buffer.seek(max(0, footer_offset - 1))
+                at_line_start = (not footer_offset
+                                 or self.current_file.buffer.read(1) == b"\n")
+                footer = self.current_file.buffer.read(65536).decode(
+                    errors="replace")
+                if not at_line_start:
+                    footer = footer.partition("\n")[2]
                 self.current_file.seek(0)
                 definitions = creator5_object_definitions(header)
-                if definitions:
-                    self.gcode.run_script("EXCLUDE_OBJECT_DEFINE RESET=1")
+                if (definitions and self._run_worker_script(
+                        "EXCLUDE_OBJECT_DEFINE RESET=1")):
                     for offset, definition in definitions:
-                        self.gcode.run_script(definition)
+                        if (self.must_pause_work
+                                or not self._run_worker_script(definition)):
+                            break
                         self.creator5_preloaded_definitions.add(offset)
-                start_command = creator5_start_command(header)
-                self.creator5_start_done = True
-                if start_command is not None:
-                    self.gcode.run_script(start_command)
+                if not self.must_pause_work:
+                    start_command = creator5_start_command(header, footer)
+                    self.creator5_start_done = True
+                    if (start_command is not None
+                            and not self._run_worker_script(start_command)):
+                        self.creator5_start_done = False
             except (ValueError, self.gcode.error) as e:
                 error_message = str(e)
-                self.must_pause_work = True
             except:
                 logging.exception("virtual_sdcard Creator 5 print start")
                 error_message = "Creator 5 print start failed"
-                self.must_pause_work = True
             if error_message is not None:
                 try:
-                    self.gcode.run_script(self.on_error_gcode.render())
+                    self._run_worker_script(self.on_error_gcode.render())
                 except:
                     logging.exception("virtual_sdcard on_error")
+                self.must_pause_work = True
         while not self.must_pause_work:
+            # Include reads and EOF scripts in the dispatcher availability
+            # check, so external cancellation can stop the worker first.
+            if gcode_mutex.test():
+                self.reactor.pause(self.reactor.monotonic() + 0.100)
+                continue
             if not lines:
                 # Read more data
                 try:
@@ -423,24 +511,30 @@ class VirtualSD:
                     if (self.auto_creator5_start and self.creator5_start_done
                             and not self.creator5_stop_done):
                         try:
-                            self.gcode.run_script("C5_PRINT_STOP")
+                            if not self._run_worker_script("C5_PRINT_STOP"):
+                                break
                             self.creator5_stop_done = True
                         except self.gcode.error as e:
                             error_message = str(e)
                             try:
-                                self.gcode.run_script(self.on_error_gcode.render())
+                                if not self._run_worker_script(
+                                        self.on_error_gcode.render()):
+                                    break
                             except:
                                 logging.exception("virtual_sdcard on_error")
                         except:
                             logging.exception("virtual_sdcard Creator 5 print stop")
                             error_message = "Creator 5 print stop failed"
                             try:
-                                self.gcode.run_script(self.on_error_gcode.render())
+                                if not self._run_worker_script(
+                                        self.on_error_gcode.render()):
+                                    break
                             except:
                                 logging.exception("virtual_sdcard on_error")
-                    self.current_file.close()
-                    self.current_file = None
-                    if error_message is None:
+                    if self.current_file is not None:
+                        self.current_file.close()
+                        self.current_file = None
+                    if error_message is None and not self.cancelled_work:
                         logging.info("Finished SD card print")
                         self.gcode.respond_raw("Done printing file")
                     break
@@ -449,10 +543,6 @@ class VirtualSD:
                 partial_input = lines.pop()
                 lines.reverse()
                 self.reactor.pause(self.reactor.NOW)
-                continue
-            # Pause if any other request is pending in the gcode class
-            if gcode_mutex.test():
-                self.reactor.pause(self.reactor.monotonic() + 0.100)
                 continue
             # Dispatch command
             self.cmd_from_sd = True

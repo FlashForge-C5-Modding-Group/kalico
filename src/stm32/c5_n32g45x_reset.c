@@ -19,13 +19,30 @@ try_request_canboot(void)
 {
 }
 
+static void
+reset_with_flag(uint16_t flag)
+{
+    RCC->APB1ENR |= RCC_APB1ENR_PWREN | RCC_APB1ENR_BKPEN;
+    PWR->CR |= PWR_CR_DBP;
+    BKP->DR1 = flag;
+    NVIC_SystemReset();
+}
+
 void
 command_reset(uint32_t *args)
 {
     (void)args;
-    RCC->APB1ENR |= RCC_APB1ENR_PWREN | RCC_APB1ENR_BKPEN;
-    PWR->CR |= PWR_CR_DBP;
-    BKP->DR1 = C5_RESET_FLAG;
-    NVIC_SystemReset();
+    reset_with_flag(C5_RESET_FLAG);
 }
 DECL_COMMAND_FLAGS(command_reset, HF_IN_SHUTDOWN, "reset");
+
+// Without the flag the boot stage stays resident, as after power-on, so the
+// stock IAPCommand can flash the board without a power cycle.
+void
+command_c5_reset_bootloader(uint32_t *args)
+{
+    (void)args;
+    reset_with_flag(0);
+}
+DECL_COMMAND_FLAGS(command_c5_reset_bootloader, HF_IN_SHUTDOWN,
+                   "c5_reset_bootloader");

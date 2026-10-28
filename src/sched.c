@@ -16,6 +16,7 @@
 #include "stepper.h" // stepper_event
 
 static struct timer periodic_timer, sentinel_timer, deleted_timer;
+static uint32_t late_timers;
 
 static struct {
     struct timer *timer_list, *last_insert;
@@ -86,15 +87,13 @@ void
 sched_add_timer(struct timer *add)
 {
     uint32_t waketime = add->waketime;
-    uint8_t flags = 0;
     irqstatus_t flag = irq_save();
     struct timer *tl = SchedStatus.timer_list;
     if (unlikely(timer_is_before(waketime, tl->waketime))) {
         // This timer is before all other scheduled timers
-        if (timer_is_before(waketime, timer_read_time()))
-        //    try_shutdown("Timer too close");
-        {
-            flags = 1;
+        if (timer_is_before(waketime, timer_read_time())) {
+            // Run late instead of shutting down; reported by late_timer_task
+            late_timers++;
             waketime = timer_read_time() + timer_from_us(2);
             add->waketime = waketime;
         }
@@ -110,12 +109,26 @@ sched_add_timer(struct timer *add)
         insert_timer(tl, add, waketime);
     }
     irq_restore(flag);
-    if(flags)
-	{			
-		output("Timer too close");
-		flags = 0;
-	}
 }
+
+// Report late timers at most once a second. Sending from sched_add_timer
+// itself (often called with irqs off) floods the transmit buffer and the
+// clock replies get dropped.
+void
+late_timer_task(void)
+{
+    static uint32_t last_report;
+    uint32_t now = timer_read_time();
+    if (!late_timers || now - last_report < timer_from_us(1000000))
+        return;
+    irq_disable();
+    uint32_t count = late_timers;
+    late_timers = 0;
+    irq_enable();
+    last_report = now;
+    output("Timer too close count=%u", count);
+}
+DECL_TASK(late_timer_task);
 
 // The deleted timer is used when deleting an active timer.
 static uint_fast8_t

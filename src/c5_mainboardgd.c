@@ -190,3 +190,43 @@ command_mclib_set_resonance_damp(uint32_t *args)
 DECL_COMMAND(command_mclib_set_resonance_damp,
              "mclib_set_resonance_damp oid=%c tdx=%c amp=%u"
                           " phase1=%u phase2=%u");
+
+static int32_t
+milli(float value)
+{
+    float scaled = value * 1000.0f;
+    if (scaled > 2000000000.0f)
+        return 2000000000;
+    if (scaled < -2000000000.0f)
+        return -2000000000;
+    return (int32_t)scaled;
+}
+
+void
+command_mclib_query_status(uint32_t *args)
+{
+    uint8_t oid = args[0];
+    struct c5_mclib_motor *motor = lookup_motor(oid);
+    struct c5_mclib_health h;
+    irqstatus_t flag = irq_save();
+    c5_mclib_take_health(motor, &h);
+    uint8_t stall = motor->stall;
+    irq_restore(flag);
+    sendf("mclib_status oid=%c stall=%c stalls=%u slips=%i slip_total=%u"
+          " samples=%u tracked=%u torque_min=%i torque_max=%i err_min=%i"
+          " err_max=%i"
+          , oid, stall, h.stall_count, h.slips, h.slip_total, h.samples
+          , h.tracked, milli(h.torque_min), milli(h.torque_max)
+          , milli(h.error_min), milli(h.error_max));
+}
+DECL_COMMAND(command_mclib_query_status, "mclib_query_status oid=%c");
+
+void
+command_mclib_config_slip(uint32_t *args)
+{
+    struct c5_mclib_motor *motor = lookup_motor(args[0]);
+    irqstatus_t flag = irq_save();
+    c5_mclib_slip_mode(motor, args[1]);
+    irq_restore(flag);
+}
+DECL_COMMAND(command_mclib_config_slip, "mclib_config_slip oid=%c mode=%c");

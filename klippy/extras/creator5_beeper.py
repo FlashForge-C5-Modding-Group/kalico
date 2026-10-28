@@ -18,11 +18,13 @@ class Creator5Beeper:
         self.gcode.register_command('C5_BUZZER', self.cmd_C5_BUZZER,
                                     desc='Sound the Creator 5 host PWM buzzer')
 
-    def _run(self, *args):
+    # Set by creator5_midi while it plays a file on the channel
+    busy = False
+
+    def execute(self, *args):
+        """Run one cmd_pwm command; callable from any thread."""
         try:
-            result = self.executor.submit(
-                                    subprocess.run,
-                                    [self.command] + list(args),
+            result = subprocess.run([self.command] + list(args),
                                     stdin=subprocess.DEVNULL,
                                     stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE,
@@ -36,6 +38,9 @@ class Creator5Beeper:
                 'Creator 5 buzzer command failed (%d): %s'
                 % (result.returncode, detail))
 
+    def _run(self, *args):
+        self.executor.submit(self.execute, *args)
+
     def cmd_C5_BUZZER(self, gcmd):
         duration_ms = gcmd.get_int('DURATION', 5000, minval=1,
                                    maxval=30000)
@@ -43,6 +48,9 @@ class Creator5Beeper:
         level = gcmd.get_int('LEVEL', 100, minval=0, maxval=100)
         optional = gcmd.get_int('OPTIONAL', 0, minval=0, maxval=1)
         try:
+            if self.busy:
+                raise self.printer.command_error(
+                    'Creator 5 buzzer is playing MIDI; C5_MIDI_STOP first')
             self._play_tone(duration_ms, frequency, level)
         except self.printer.command_error as exc:
             if not optional:
@@ -50,7 +58,9 @@ class Creator5Beeper:
             gcmd.respond_info('Creator 5 buzzer unavailable; tune skipped: %s'
                               % (exc,))
 
-    def _play_tone(self, duration_ms, frequency, level):
+    def ensure_configured(self, run):
+        """Configure the channel once per session, with RUN (a cmd_pwm
+        runner: _run from the gcode thread, execute from another)."""
         # The factory application configures the channel once, then changes
         # its waveform for each note. The kernel refuses to reconfigure a PWM
         # channel that is already working (EPERM), including across Klippy
@@ -63,22 +73,29 @@ class Creator5Beeper:
             raise self._config_error
         if not self._configured:
             try:
-                self._run('disable', self.channel)
-                self._run('config', self.channel, 'freq=50000000',
-                          'max_level=300', 'active_level=1',
-                          'accuracy_priority=freq')
-                self._run('set_level', self.channel, '100')
-                self._run('set_prescale', self.channel, '6')
+                run('disable', self.channel)
+                run('config', self.channel, 'freq=50000000',
+                    'max_level=300', 'active_level=1',
+                    'accuracy_priority=freq')
+                run('set_level', self.channel, '100')
+                run('set_prescale', self.channel, '6')
             except self.printer.command_error as exc:
                 self._config_error = exc
                 raise
             self._configured = True
-        # cmd_pwm set_wc takes high and low counts, not period and high.
+
+    @staticmethod
+    def wave_counts(frequency, level):
+        """cmd_pwm set_wc's high and low counts for a tone."""
         period = max(2, int(round(50000000. / frequency)))
         # LEVEL is a duty-based intensity percentage: 100 preserves the
         # factory 50% duty tone; 0 is silent. Perceived volume is not linear.
         high = period * level // 200
-        low = period - high
+        return high, period - high
+
+    def _play_tone(self, duration_ms, frequency, level):
+        self.ensure_configured(self._run)
+        high, low = self.wave_counts(frequency, level)
         try:
             # Program the intended waveform before enabling the channel.
             self._run('set_wc', self.channel, str(high), str(low))

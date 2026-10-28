@@ -10,6 +10,8 @@ import tempfile
 from contextlib import contextmanager
 from datetime import datetime
 
+from klippy.extras.latest_file_writer import LatestFileWriter
+
 
 # Config::initExtruderConfig() in the factory firmwareExe binary.  These are
 # nominal positions; saved measurements in the printer's config take priority.
@@ -75,6 +77,10 @@ class Creator5FlowSwitch(Creator5MiscSwitch):
 
 
 class Creator5Toolchanger:
+    # Overridden from the config in __init__ (persist_babystep defaults on)
+    persist_babystep = False
+    _applied_z = None
+
     def __init__(self, config):
         self.printer = config.get_printer()
         self.gcode = self.printer.lookup_object('gcode')
@@ -99,6 +105,20 @@ class Creator5Toolchanger:
             'test_json_path', '/usr/data/firmwareRes/config/test.json'))
         self.z_adjustments = [0.] * 4
         self._load_zoffset_json()
+        # Baby stepping (SET_GCODE_OFFSET Z_ADJUST) is added to the tool's
+        # zoffset.json adjustment as it happens
+        self.persist_babystep = config.getboolean('persist_babystep', True)
+        self._applied_z = None      # (tool, G-code Z offset this module set)
+        config_dir = os.path.dirname(os.path.abspath(
+            self.printer.get_start_args().get('config_file', 'printer.cfg')))
+        self.toolchange_count_path = os.path.expanduser(config.get(
+            'toolchange_count_path', os.path.join(config_dir,
+                                                  'toolchanges.txt')))
+        self.toolchange_counts = self._load_toolchange_counts()
+        self.toolchange_count_writer = LatestFileWriter(
+            self.toolchange_count_path, 'c5_toolchanges')
+        self.printer.register_event_handler(
+            'klippy:disconnect', self.toolchange_count_writer.close)
         self.print_z_baseline = [None] * 4
         self._button_objects = {}
         # UI status may be polled many times per second on a small MIPS host.
@@ -205,7 +225,7 @@ class Creator5Toolchanger:
         self.purge_max_x = config.getfloat('purge_max_x', 279., maxval=279.)
         self.cooldown_x = config.getfloat('cooldown_x', 266.5)
         self.cooldown_y = config.getfloat('cooldown_y', 13.8)
-        self.cooldown_wipe_z = config.getfloat('cooldown_wipe_z', 2.,
+        self.cooldown_wipe_z = config.getfloat('cooldown_wipe_z', 1.8,
                                                minval=1., maxval=5.)
         self.cooldown_lift_z = config.getfloat('cooldown_lift_z', 10.,
                                                above=self.cooldown_wipe_z)
@@ -321,6 +341,9 @@ class Creator5Toolchanger:
             ('C5_SAVE_OFFSETS_JSON', self.cmd_save_offsets_json),
             ('C5_SAVE_TOUCHSCREEN_Z_OFFSET',
              self.cmd_save_touchscreen_z_offset),
+            ('C5_SAVE_BABYSTEP', self.cmd_save_babystep),
+            ('C5_CLEAR_BABYSTEP', self.cmd_clear_babystep),
+            ('C5_LIST_BABYSTEP', self.cmd_list_babystep),
             ('C5_AUTO_NOZZLE_Z', self.cmd_auto_nozzle_z),
             ('C5_VERIFY_NOZZLE_Z', self.cmd_verify_nozzle_z),
             ('C5_CALIBRATE_ATTACHED', self.cmd_calibrate_attached),
@@ -337,6 +360,7 @@ class Creator5Toolchanger:
         self.prev_G28 = None
         self._g28_passthrough = False
         self.prev_set_pressure_advance = None
+        self.prev_set_gcode_offset = None
         self._tool_pa_memory = {}
         self.printer.register_event_handler('klippy:ready', self._handle_ready)
 
@@ -349,6 +373,12 @@ class Creator5Toolchanger:
             danger.multi_mcu_trsync_timeout = max(timeout, .1)
         self.prev_G28 = self.gcode.register_command('G28', None)
         self.gcode.register_command('G28', self.cmd_G28)
+        self.prev_set_gcode_offset = self.gcode.register_command(
+            'SET_GCODE_OFFSET', None)
+        if self.prev_set_gcode_offset is not None:
+            self.gcode.register_command(
+                'SET_GCODE_OFFSET', self.cmd_set_gcode_offset,
+                desc=getattr(self.prev_set_gcode_offset, '__doc__', None))
         self.prev_set_pressure_advance = self.gcode.register_command(
             'SET_PRESSURE_ADVANCE', None)
         if self.prev_set_pressure_advance is not None:
@@ -541,6 +571,12 @@ class Creator5Toolchanger:
         adjustment = origin - baseline
         if not math.isfinite(adjustment) or abs(adjustment) > 5.:
             raise gcmd.error('Touchscreen Z adjustment is outside +/-5 mm')
+        self._write_z_adjustment(gcmd, tool, adjustment)
+        self._applied_z = (tool, origin)
+        gcmd.respond_info('Saved T%d touchscreen Z adjustment %.4f mm'
+                          % (tool, adjustment))
+
+    def _write_z_adjustment(self, gcmd, tool, adjustment, backup=True):
         if not os.path.isfile(self.zoffset_json_path):
             raise gcmd.error('Missing stock %s; refusing to create it'
                              % self.zoffset_json_path)
@@ -549,9 +585,11 @@ class Creator5Toolchanger:
             data, suffix = self._read_stock_json(self.zoffset_json_path)
             data['z_offset_t%d' % (tool + 1)] = round(adjustment, 4)
             directory = os.path.dirname(self.zoffset_json_path)
-            backup = self.zoffset_json_path + '.bak-' + (
-                datetime.now().strftime('%Y%m%d-%H%M%S-%f'))
-            shutil.copy2(self.zoffset_json_path, backup)
+            if backup:
+                shutil.copy2(self.zoffset_json_path,
+                             self.zoffset_json_path + '.bak-' + (
+                                 datetime.now().strftime(
+                                     '%Y%m%d-%H%M%S-%f')))
             fd, temp_path = tempfile.mkstemp(prefix='.zoffset-',
                                              suffix='.tmp', dir=directory)
             os.chmod(temp_path, os.stat(self.zoffset_json_path).st_mode)
@@ -570,8 +608,124 @@ class Creator5Toolchanger:
             if temp_path is not None and os.path.exists(temp_path):
                 os.unlink(temp_path)
         self.z_adjustments[tool] = adjustment
-        gcmd.respond_info('Saved T%d touchscreen Z adjustment %.4f mm'
-                          % (tool, adjustment))
+
+    def _printing(self):
+        stats = self.printer.lookup_object('print_stats', None)
+        if stats is None:
+            return False
+        return stats.get_status(self.printer.get_reactor().monotonic())[
+            'state'] in ('printing', 'paused')
+
+    def _persist_babystep(self, gcmd, tool, backup=True):
+        """Add the baby stepping on TOOL since this module last set its Z
+        offset to its zoffset.json adjustment. Returns the step saved."""
+        if self._applied_z is None or self._applied_z[0] != tool:
+            return 0.
+        origin = self.printer.lookup_object('gcode_move').get_status()[
+            'homing_origin'][2]
+        step = origin - self._applied_z[1]
+        if not math.isfinite(step) or abs(step) < 0.0005:
+            return 0.
+        if abs(step) > 1.:
+            # Not baby stepping: something else set the offset
+            gcmd.respond_info('T%d Z offset changed by %.4f mm; not saved as '
+                              'baby stepping' % (tool, step))
+            self._applied_z = None
+            return 0.
+        self._write_z_adjustment(gcmd, tool, self.z_adjustments[tool] + step,
+                                 backup)
+        self._applied_z = (tool, origin)
+        gcmd.respond_info('Saved T%d baby stepping %+.4f mm (Z adjustment now '
+                          '%.4f mm)' % (tool, step, self.z_adjustments[tool]))
+        return step
+
+    def cmd_set_gcode_offset(self, gcmd):
+        self.prev_set_gcode_offset(gcmd)
+        if (not self.persist_babystep or self.busy
+                or self._applied_z is None
+                or gcmd.get('Z_ADJUST', None) is None):
+            return
+        try:
+            tool = self.attached_tool_from_pins()
+            if tool is not None:
+                self._persist_babystep(gcmd, tool, backup=False)
+        except Exception as exc:
+            # Never stop a print over the saved copy
+            gcmd.respond_info('Baby stepping not saved: %s' % exc)
+
+    def cmd_save_babystep(self, gcmd):
+        """Keep the attached tool's baby stepping for later prints."""
+        if not self.persist_babystep and not gcmd.get_int('FORCE', 0):
+            return
+        dock, grab, tool = self._sensor_state(gcmd)
+        if tool is None:
+            return
+        self._persist_babystep(gcmd, tool)
+
+    def _babystep_tools(self, gcmd):
+        value = gcmd.get('T', 'ALL').strip().upper()
+        if value == 'ALL':
+            return list(range(4))
+        try:
+            tool = int(value.lstrip('T'))
+        except ValueError:
+            tool = -1
+        if not 0 <= tool <= 3:
+            raise gcmd.error('T must be 0-3 or ALL')
+        return [tool]
+
+    def cmd_list_babystep(self, gcmd):
+        self._load_zoffset_json()
+        lines = ['T%d: %+.4f mm' % (tool, self.z_adjustments[tool])
+                 for tool in self._babystep_tools(gcmd)]
+        gcmd.respond_info('Saved Z adjustments (zoffset.json):\n'
+                          + '\n'.join(lines))
+
+    def cmd_clear_babystep(self, gcmd):
+        if self.busy:
+            raise gcmd.error('Cannot clear Z offset during a toolchange')
+        tools = self._babystep_tools(gcmd)
+        self._load_zoffset_json()
+        try:
+            attached = self.attached_tool_from_pins()
+        except self.printer.command_error:
+            attached = None
+        for tool in tools:
+            old = self.z_adjustments[tool]
+            if old == 0.:
+                continue
+            self._write_z_adjustment(gcmd, tool, 0.)
+            if (tool == attached and self._applied_z is not None
+                    and self._applied_z[0] == tool):
+                # Take it off the live offset too, without counting that as
+                # baby stepping
+                origin = self.printer.lookup_object('gcode_move').get_status()[
+                    'homing_origin'][2]
+                self._run('SET_GCODE_OFFSET Z=%.4f MOVE=0' % (origin - old))
+                self._applied_z = (tool, origin - old)
+            gcmd.respond_info('Cleared T%d Z adjustment (was %+.4f mm)'
+                              % (tool, old))
+
+    def _load_toolchange_counts(self):
+        counts = [0] * 4
+        try:
+            with open(self.toolchange_count_path) as source:
+                for line in source:
+                    key, _, value = line.partition(':')
+                    key = key.strip().upper()
+                    if key in ('T0', 'T1', 'T2', 'T3'):
+                        counts[int(key[1])] = max(0, int(value.strip()))
+        except (OSError, ValueError):
+            pass
+        return counts
+
+    def _count_toolchange(self, tool):
+        # A failed write must never stop a print; the writer logs failures.
+        self.toolchange_counts[tool] += 1
+        counts = self.toolchange_counts
+        text = 'Total: %d\n' % sum(counts) + ''.join(
+            'T%d: %d\n' % (index, count) for index, count in enumerate(counts))
+        self.toolchange_count_writer.submit(text)
 
     def cmd_auto_nozzle_z(self, gcmd):
         tool = gcmd.get_int('T', minval=0, maxval=3)
@@ -615,6 +769,7 @@ class Creator5Toolchanger:
         # MOVE=1 before print motion. The earlier crash path was the
         # preparation purge occurring before this command at all.
         self._run('SET_GCODE_OFFSET Z=%.4f MOVE=1 MOVE_SPEED=100' % offset)
+        self._applied_z = (tool, offset)
         self.print_z_baseline[tool] = baseline + correction
         gcmd.respond_info('Automatic T%d nozzle Z %.4f mm '
                           '(tool %.4f - station %.4f + print %.4f + '
@@ -776,7 +931,7 @@ class Creator5Toolchanger:
                              % (offset, attached))
 
     def _chamber_heater_active(self, gcmd):
-        # The Creator 5 (non-Pro) has no chamber heater configured.
+        # The Creator 5 (non-Pro) has no chamber heater.
         if self.printer.lookup_object('heater_generic chamber_heater',
                                       None) is None:
             return False
@@ -996,6 +1151,8 @@ class Creator5Toolchanger:
     def _dock(self, gcmd, tool, raise_z=True):
         x, y = self.docks[tool]
         clear_feed = self.clear_travel_speed * 60.
+        if self.persist_babystep and self._printing():
+            self._persist_babystep(gcmd, tool)
         # Do not clear nozzle Z while a tool is physically mounted.  A
         # previously selected tool may have been left at zero by a slicer.
         origin_z = self.printer.lookup_object('gcode_move').get_status()[
@@ -1011,6 +1168,19 @@ class Creator5Toolchanger:
         self._move(x=x - 10., feed=self.dock_approach_speed * 60.)
         self._move(x=x, feed=self.dock_approach_speed * 60.)
         self._run('M400')
+        # Release only with the head seated in its holder and the carriage at
+        # the mount. After lost steps the dock position is wrong, and an
+        # unchecked release dropped the head; keep it locked on instead.
+        self._pause_ms(self.toolchange_sensor_settle_ms)
+        if not (self._button(self.dock_buttons[tool], gcmd)
+                and self._button(self.grab_buttons[tool], gcmd)):
+            try:
+                self._run('TURN_OFF_HEATERS')
+            except Exception:
+                logging.exception('Creator 5 heater shutdown failed after dock check')
+            raise gcmd.error(
+                'T%d is not seated in its dock; not releasing it (heaters '
+                'off). XY may have lost steps: re-home before docking' % tool)
         self._run('MOTOR_RELEASE')
         self._pause_ms(self.release_latch_wait_ms)
         self._move(x=self.approach_x,
@@ -1095,8 +1265,12 @@ class Creator5Toolchanger:
         extruder = 'extruder' if tool == 0 else 'extruder%d' % tool
         self._run('ACTIVATE_EXTRUDER EXTRUDER=%s' % extruder)
         self._restore_pressure_advance(extruder)
-        self._move(x=self.approach_x,
-                   feed=self.pickup_departure_speed * 60.)
+        # A pullback longer than the dock-to-approach_x distance already
+        # ends inboard of it; moving "out" to approach_x would step back
+        # toward the docks.
+        if x - self.pullback > self.approach_x:
+            self._move(x=self.approach_x,
+                       feed=self.pickup_departure_speed * 60.)
 
     def _with_motion(self, gcmd, operation, final_accel=None):
         toolhead = self.printer.lookup_object('toolhead')
@@ -1295,8 +1469,11 @@ class Creator5Toolchanger:
         replacement = self._afc_lane(afc, target)
         if lane is None or replacement is None:
             raise gcmd.error('No AFC lane for T%d or T%d' % (tool, to))
-        # Keeps the position AFC saved when the runout paused the print.
+        # Keep the position AFC saved when the runout paused the print:
+        # reset_failure() clears position_saved, and restore_pos needs it.
+        position_saved = afc.position_saved
         afc.error.reset_failure()
+        afc.position_saved = position_saved
         lane._perform_creator5_infinite_runout(replacement, target_temp=temp)
         if afc.error_state:
             # Still paused: offer the other tools or a reload again.
@@ -1352,6 +1529,7 @@ class Creator5Toolchanger:
             self._pickup(gcmd, tool, raise_z=z_homed)
         self._with_motion(gcmd, change,
                           final_accel=self.post_select_accel)
+        self._count_toolchange(tool)
         self._sync_clog_sensors(tool)
 
     def cmd_dock(self, gcmd):
@@ -1574,6 +1752,7 @@ class Creator5Toolchanger:
                 'Unsafe T%d nozzle Z offset; refusing tool motion' % tool)
         self._run('SET_GCODE_OFFSET X=%.4f Y=%.4f Z=%.4f MOVE=0'
                   % tuple(offsets))
+        self._applied_z = (tool, offsets[2])
 
     def cmd_reference_calibrate(self, gcmd):
         if not gcmd.get_int('BUILDPLATE_REMOVED', 0, minval=0, maxval=1):
@@ -1830,14 +2009,23 @@ class Creator5Toolchanger:
                 or not self._button(self.grab_buttons[tool], gcmd)):
             raise gcmd.error('T%d did not leave its holder with the '
                              'carriage; calibration stopped' % tool)
-        self._move(x=240., feed=6000)
+        # Travel fast to just short of where the saved dock position puts
+        # each endstop, then measure slowly from there. The margin stays
+        # wider than the correction limit, so a holder that is still within
+        # it can never be driven into at travel speed.
+        old_x, old_y = self.docks[tool]
+        approach = max(10., self.max_mount_correction + 5.)
+        self._move(x=240., feed=12000)
+        self._move(x=min(240., HOLDER_REFERENCE_X - old_x + approach),
+                   feed=12000)
         x_result = x_home.measure_axis(-5.)
+        self._move(y=min(y_reference, y_reference - old_y + approach),
+                   feed=12000)
         y_result = y_home.measure_axis(0.)
         x = abs(HOLDER_REFERENCE_X - x_result)
         y = y_reference - y_result
         if not all(math.isfinite(value) for value in (x, y)):
             raise gcmd.error('Non-finite holder measurement')
-        old_x, old_y = self.docks[tool]
         if (abs(x - old_x) > self.max_mount_correction
                 or abs(y - old_y) > self.max_mount_correction):
             raise gcmd.error('T%d holder X=%.4f Y=%.4f exceeds the '
