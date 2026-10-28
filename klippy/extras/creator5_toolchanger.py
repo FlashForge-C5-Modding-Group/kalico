@@ -339,6 +339,8 @@ class Creator5Toolchanger:
             ('C5_SAVE_TOUCHSCREEN_Z_OFFSET',
              self.cmd_save_touchscreen_z_offset),
             ('C5_SAVE_BABYSTEP', self.cmd_save_babystep),
+            ('C5_CLEAR_BABYSTEP', self.cmd_clear_babystep),
+            ('C5_LIST_BABYSTEP', self.cmd_list_babystep),
             ('C5_AUTO_NOZZLE_Z', self.cmd_auto_nozzle_z),
             ('C5_VERIFY_NOZZLE_Z', self.cmd_verify_nozzle_z),
             ('C5_CALIBRATE_ATTACHED', self.cmd_calibrate_attached),
@@ -656,6 +658,50 @@ class Creator5Toolchanger:
         if tool is None:
             return
         self._persist_babystep(gcmd, tool)
+
+    def _babystep_tools(self, gcmd):
+        value = gcmd.get('T', 'ALL').strip().upper()
+        if value == 'ALL':
+            return list(range(4))
+        try:
+            tool = int(value.lstrip('T'))
+        except ValueError:
+            tool = -1
+        if not 0 <= tool <= 3:
+            raise gcmd.error('T must be 0-3 or ALL')
+        return [tool]
+
+    def cmd_list_babystep(self, gcmd):
+        self._load_zoffset_json()
+        lines = ['T%d: %+.4f mm' % (tool, self.z_adjustments[tool])
+                 for tool in self._babystep_tools(gcmd)]
+        gcmd.respond_info('Saved Z adjustments (zoffset.json):\n'
+                          + '\n'.join(lines))
+
+    def cmd_clear_babystep(self, gcmd):
+        if self.busy:
+            raise gcmd.error('Cannot clear Z offset during a toolchange')
+        tools = self._babystep_tools(gcmd)
+        self._load_zoffset_json()
+        try:
+            attached = self.attached_tool_from_pins()
+        except self.printer.command_error:
+            attached = None
+        for tool in tools:
+            old = self.z_adjustments[tool]
+            if old == 0.:
+                continue
+            self._write_z_adjustment(gcmd, tool, 0.)
+            if (tool == attached and self._applied_z is not None
+                    and self._applied_z[0] == tool):
+                # Take it off the live offset too, without counting that as
+                # baby stepping
+                origin = self.printer.lookup_object('gcode_move').get_status()[
+                    'homing_origin'][2]
+                self._run('SET_GCODE_OFFSET Z=%.4f MOVE=0' % (origin - old))
+                self._applied_z = (tool, origin - old)
+            gcmd.respond_info('Cleared T%d Z adjustment (was %+.4f mm)'
+                              % (tool, old))
 
     def _load_toolchange_counts(self):
         counts = [0] * 4
