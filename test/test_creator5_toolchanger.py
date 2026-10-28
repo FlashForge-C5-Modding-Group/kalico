@@ -1043,6 +1043,90 @@ class Creator5OffsetTests(unittest.TestCase):
             'SET_GCODE_OFFSET Z=2.8500 MOVE=1 MOVE_SPEED=100')
         self.assertAlmostEqual(self.board.print_z_baseline[1], 2.8)
 
+    def _babystep_fixture(self, origin_after):
+        zpath = os.path.join(self.temp.name, 'zoffset.json')
+        with open(zpath, 'w') as target:
+            target.write('{"z_offset_t2": 0.05}\n/* stock comment */\n')
+        with open(self.path, 'w') as target:
+            target.write('{"t1_offset_z": 1.3, "z_station_pos": -1.5}\n')
+        self.board.zoffset_json_path = zpath
+        self.board.z_adjustments = [0.] * 4
+        self.board.persist_babystep = True
+        self.board._preflight = lambda command: ([True] * 4, [], 1)
+        self.board._sensor_state = lambda command: ([True] * 4, [], 1)
+        self.board._run = mock.Mock()
+        self.board.cmd_auto_nozzle_z(GCmd(T=1))     # sets Z 2.85
+        self.board.printer.lookup_object.return_value.get_status.return_value = {
+            'homing_origin': (0., 0., origin_after, 0.)}
+        return zpath
+
+    def test_babystep_is_kept_for_later_prints(self):
+        zpath = self._babystep_fixture(2.80)          # baby stepped -0.05
+        self.board.cmd_save_babystep(GCmd())
+        data, suffix = self.board._read_stock_json(zpath)
+        self.assertAlmostEqual(data['z_offset_t2'], 0.0)
+        self.assertAlmostEqual(self.board.z_adjustments[1], 0.0)
+        self.assertEqual(suffix, '/* stock comment */')
+        # Saved once: the same offset again is no new baby stepping
+        self.board.cmd_save_babystep(GCmd())
+        self.assertEqual(len(list(Path(self.temp.name).glob(
+            'zoffset.json.bak-*'))), 1)
+
+    def test_babystep_is_saved_as_it_happens(self):
+        zpath = self._babystep_fixture(2.83)          # baby stepped -0.02
+        self.board.busy = False
+        self.board.attached_tool_from_pins = lambda: 1
+        self.board.prev_set_gcode_offset = mock.Mock()
+        gcmd = GCmd(Z_ADJUST=-0.02)
+        self.board.cmd_set_gcode_offset(gcmd)
+        self.board.prev_set_gcode_offset.assert_called_once_with(gcmd)
+        data, _ = self.board._read_stock_json(zpath)
+        self.assertAlmostEqual(data['z_offset_t2'], 0.03)
+        self.assertEqual(list(Path(self.temp.name).glob(
+            'zoffset.json.bak-*')), [])
+        # A plain Z offset is not baby stepping
+        self.board.printer.lookup_object.return_value.get_status.return_value = {
+            'homing_origin': (0., 0., 2.9, 0.)}
+        self.board.cmd_set_gcode_offset(GCmd(Z=2.9))
+        data, _ = self.board._read_stock_json(zpath)
+        self.assertAlmostEqual(data['z_offset_t2'], 0.03)
+
+    def test_babystep_list_and_clear(self):
+        zpath = self._babystep_fixture(2.85)          # T1 attached at 2.85
+        self.board.busy = False
+        self.board.attached_tool_from_pins = lambda: 1
+        gcmd = GCmd(T='1')
+        self.board.cmd_list_babystep(gcmd)
+        self.assertIn('T1: +0.0500 mm', gcmd.messages[0])
+        self.board._run.reset_mock()
+        self.board.cmd_clear_babystep(GCmd(T='1'))
+        data, _ = self.board._read_stock_json(zpath)
+        self.assertAlmostEqual(data['z_offset_t2'], 0.)
+        self.board._run.assert_called_once_with(
+            'SET_GCODE_OFFSET Z=2.8000 MOVE=0')
+        self.assertEqual(self.board._applied_z[0], 1)
+        self.assertAlmostEqual(self.board._applied_z[1], 2.8)
+        with self.assertRaisesRegex(RuntimeError, 'T must be'):
+            self.board.cmd_clear_babystep(GCmd(T='5'))
+
+    def test_large_z_change_is_not_saved_as_babystep(self):
+        zpath = self._babystep_fixture(1.2)           # -1.65 mm
+        gcmd = GCmd()
+        self.board.cmd_save_babystep(gcmd)
+        data, _ = self.board._read_stock_json(zpath)
+        self.assertAlmostEqual(data['z_offset_t2'], 0.05)
+        self.assertIn('not saved', gcmd.messages[0])
+
+    def test_babystep_saving_can_be_turned_off(self):
+        zpath = self._babystep_fixture(2.90)
+        self.board.persist_babystep = False
+        self.board.cmd_save_babystep(GCmd())
+        data, _ = self.board._read_stock_json(zpath)
+        self.assertAlmostEqual(data['z_offset_t2'], 0.05)
+        self.board.cmd_save_babystep(GCmd(FORCE=1))
+        data, _ = self.board._read_stock_json(zpath)
+        self.assertAlmostEqual(data['z_offset_t2'], 0.10)
+
     def test_factory_print_temperature_bed_and_layer_z_compensation(self):
         zpath = os.path.join(self.temp.name, 'zoffset.json')
         with open(zpath, 'w') as target:
@@ -1692,13 +1776,15 @@ class Creator5OffsetTests(unittest.TestCase):
     def test_g28_wrapper_keeps_previous_safe_z_home_handler(self):
         previous = mock.Mock()
         self.board.gcode = mock.Mock()
-        self.board.gcode.register_command.side_effect = [previous, None, None]
+        self.board.gcode.register_command.side_effect = [
+            previous, None, None, None]
         self.board.printer.lookup_object.return_value.extruder_stepper = None
         self.board._handle_ready()
         self.assertIs(self.board.prev_G28, previous)
         self.assertEqual(self.board.gcode.register_command.call_args_list, [
             mock.call('G28', None),
             mock.call('G28', self.board.cmd_G28),
+            mock.call('SET_GCODE_OFFSET', None),
             mock.call('SET_PRESSURE_ADVANCE', None),
         ])
 
