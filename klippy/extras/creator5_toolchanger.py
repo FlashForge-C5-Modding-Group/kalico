@@ -1191,7 +1191,12 @@ class Creator5Toolchanger:
         # the dock move above has already completed.
         extruder_name = 'extruder' if tool == 0 else 'extruder%d' % tool
         extruder_obj = self._afc_extruder(extruder_name)
-        if extruder_obj is not None and extruder_obj.lane_loaded:
+        # Only a head that is its own lane: its sensor re-marks the lane on
+        # the next pickup. A unit-fed head (ACE) keeps its filament docked,
+        # and nothing would mark it loaded again.
+        standalone = getattr(extruder_obj, 'is_standalone', lambda: True)
+        if (extruder_obj is not None and extruder_obj.lane_loaded
+                and standalone()):
             lane = extruder_obj.lanes.get(extruder_obj.lane_loaded)
             if lane is not None:
                 lane.set_tool_unloaded(normal_toolchange=True)

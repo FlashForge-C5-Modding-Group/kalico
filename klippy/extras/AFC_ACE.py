@@ -1985,6 +1985,38 @@ class afcACE(afcUnit):
             ok, msg = self._push_to_gears(slot, lane)
         return ok, msg
 
+    def _mark_fed_heads(self, status: Dict[str, Any]) -> None:
+        """A lane that alone feeds its head, with its spool in and filament
+        at the head's sensor, is that head's loaded lane: whatever got it
+        there (an autofeed, a load before a restart, a dock that cleared the
+        flag). Feed assist and AFC's runout checks need it marked."""
+        if self._operation_active or self.monitor_only or self.afc.current_loading:
+            return
+        changed = False
+        for lane_name, slot in self._slot_map.items():
+            lane = self.lanes[lane_name]
+            extruder = lane.extruder_obj
+            # Before PREP, AFC.var has yet to restore the lanes. A head that
+            # names this lane while the lane is not marked is repaired.
+            if (lane.tool_loaded or lane_name in self._staged
+                    or not getattr(lane, "_afc_prep_done", False)
+                    or not self._own_path(lane) or extruder is None
+                    or extruder.lane_loaded not in (None, lane_name)
+                    or not self._slot_present(slot, status)):
+                continue
+            sensor = self._toolhead_sensor_fn(lane)
+            if sensor is None or not sensor():
+                continue
+            self.logger.info(f"{lane_name}: filament at {extruder.name}'s sensor, "
+                             "marking it loaded there")
+            lane.set_loaded()
+            lane.set_tool_loaded()
+            if not self._head_mounted(lane):
+                self.lane_tool_loaded_idle(lane)
+            changed = True
+        if changed:
+            self.afc.save_vars()
+
     def _follow_active_tool(self) -> None:
         """On a toolchanger whose lanes each feed their own toolhead, feed
         assist belongs to the lane in the toolhead that is picked up: a
@@ -2231,6 +2263,7 @@ class afcACE(afcUnit):
             # prep_state is left alone so the last known spool still shows.
             self._mark_lanes_unloadable()
             return eventtime + 2.0
+        self._mark_fed_heads(status)
         self._follow_active_tool()
         if self._assist_needs_arming(status):
             self._arm_assist()

@@ -171,6 +171,35 @@ class Creator5OffsetTests(unittest.TestCase):
                 lane.set_tool_unloaded.assert_called_once_with(
                     normal_toolchange=True)
 
+    def test_dock_keeps_a_unit_fed_lane_loaded(self):
+        afc = self._afc_tool_fixture('extruder0')
+        extruder = afc.tools['extruder']
+        extruder.is_standalone = lambda: False
+        lane = afc.lanes['extruder0']
+        lane.set_tool_unloaded = mock.Mock()
+        objects = {
+            'AFC': afc,
+            'AFC_extruder extruder0': extruder,
+            'toolhead': mock.Mock(get_position=lambda: [250., 0., 0., 0.]),
+            'gcode_move': types.SimpleNamespace(
+                get_status=lambda: {'homing_origin': (0., 0., 2., 0.)})}
+        self.board.printer.lookup_object.side_effect = (
+            lambda name, default=None: objects.get(name, default))
+        self.board.approach_x = 250.
+        self.board.dock_predock_offset = 20.
+        self.board.dock_approach_speed = 25.
+        self.board.release_latch_wait_ms = 50
+        self.board.departure_speed = 90.
+        self.board._move = mock.Mock()
+        self.board._run = mock.Mock()
+        self.board._pause_ms = mock.Mock()
+        self.board._verify = mock.Mock()
+        self.board._button = mock.Mock(return_value=True)
+
+        self.board._dock(GCmd(), 0, raise_z=False)
+
+        lane.set_tool_unloaded.assert_not_called()
+
     def test_wheel_clog_resolves_numbered_and_legacy_t0_lanes(self):
         for alias in ('extruder0', 'extruder'):
             with self.subTest(alias=alias):
