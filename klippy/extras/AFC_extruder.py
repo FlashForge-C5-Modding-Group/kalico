@@ -1062,7 +1062,10 @@ class AFCExtruder:
             busy = (AFCLaneState.TOOL_LOADING, AFCLaneState.TOOL_UNLOADING,
                     AFCLaneState.EJECTING, AFCLaneState.CALIBRATING,
                     AFCLaneState.INFINITE_RUNOUT, AFCLaneState.ERROR)
-            if self.tc_lane is not None and self.tc_lane.status not in busy:
+            # Only while the head is its own lane: once a unit's lane feeds it
+            # (an ACE), that lane owns the loaded state
+            if (self.tc_lane is not None and getattr(self, 'no_lanes', True)
+                    and self.tc_lane.status not in busy):
                 if mounted and self.tool_start_state:
                     if self.tc_lane.status not in (AFCLaneState.LOADED,
                                                     AFCLaneState.TOOLED):
