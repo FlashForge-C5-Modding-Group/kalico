@@ -26,6 +26,8 @@ FACTORY_MEASUREMENTS = ((15.800, 215.280, 1.460),
 HOLDER_REFERENCE_X = 295.
 HOLDER_REFERENCE_Y_BASE = 80.
 HOLDER_REFERENCE_Y_PITCH = 50.
+# Longest single extrude of a purge (max_extrude_only_distance is 500)
+PURGE_CHUNK_MM = 100.
 
 
 class Creator5MiscSwitch:
@@ -2240,7 +2242,7 @@ class Creator5Toolchanger:
 
     def cmd_purge(self, gcmd):
         length = gcmd.get_float('LENGTH', self.purge_length,
-                                minval=0., maxval=80.)
+                                minval=0., maxval=1000.)
         if not math.isfinite(length) or length <= 0.:
             raise gcmd.error('LENGTH must be finite and positive')
         dock, grab, attached = self._preflight(gcmd)
@@ -2263,8 +2265,14 @@ class Creator5Toolchanger:
                 self._move_to_prep_bucket()
                 self._move(z=self.purge_z, feed=600, machine=False)
                 self._run('M83')
-                self._run('G1 E%.3f F%.0f' % (length,
-                                              self.purge_speed * 60.))
+                # One extrude-only move may not exceed
+                # max_extrude_only_distance; queued back to back they run as one
+                left = length
+                while left > 0.:
+                    step = min(PURGE_CHUNK_MM, left)
+                    self._run('G1 E%.3f F%.0f' % (step,
+                                                  self.purge_speed * 60.))
+                    left -= step
                 self._run('G1 E-5 F1200')
                 self._run('M400')
             finally:

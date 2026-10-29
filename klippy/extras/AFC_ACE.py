@@ -96,6 +96,11 @@ NOT_REACHED = "sensor not reached"
 
 # Longest single extruder move of a drive-through
 DRIVE_CHUNK_MM = 100.0
+# An ACE 2 assist runs open-ended at 50 mm/s whenever its buffer reads
+# pulled; on a strand nothing holds (cut, out of the gears) that is forever.
+# Stopped once the extruder has not moved forward for this long, and armed
+# again on its next forward move.
+ASSIST_IDLE_S = 3.0
 # After this unit retracted a lane to the ACE, the slot can read empty and
 # then ready again as the ACE re-stages the tip: not a new spool
 RETRACT_QUIET_S = 60.0
@@ -1145,6 +1150,10 @@ class AceHumiditySensor:
 class afcACE(afcUnit):
     """Anycubic ACE Pro unit — stepperless, firmware-managed feeder."""
 
+    # An insert is autofeed's (to the toolhead sensor at most), never AFC's
+    # direct-load TOOL_LOAD: the load is the user's
+    load_on_insert = False
+
     def __init__(self, config: ConfigWrapper) -> None:
         super().__init__(config)
         # Not configurable: AFC's lane-type gates match this exact string
@@ -1247,6 +1256,15 @@ class afcACE(afcUnit):
         # Lane -> time until which a slot reading ready is this unit's own
         # retract settling, not an insert (see RETRACT_QUIET_S)
         self._retracted: Dict[str, float] = {}
+        # Lanes fed (inserted, AFC_ACE_FEED) during a print, in order: fed
+        # one after another once it has finished, then the heaters go off
+        self._feed_queue: list = []
+        self._draining = False
+        # A feed then its autoload_cmd: the lane reaches its sensor before
+        # the load, which must not see it marked loaded already
+        self._feeding = False
+        # Last time the extruder was seen moving forward while assist ran
+        self._last_pull = 0.0
 
         # Expose the firmware dryer as a heater (+ humidity sensor) so UIs
         # control it with SET_HEATER_TEMPERATURE and see live values.
@@ -1785,6 +1803,21 @@ class afcACE(afcUnit):
         return ((dropped or self._assist_gen != self.transport.generation)
                 and self._extruding())
 
+    def _idle_assist_off(self) -> None:
+        """Stop an armed ACE 2 assist the extruder is not pulling on. It stays
+        wanted: _assist_needs_arming arms it on the next forward move."""
+        if (self.protocol != "ace2" or self._assist_slot is None
+                or self._assist_gen is None):
+            return
+        now = time.monotonic()
+        if self._extruding():
+            self._last_pull = now
+            return
+        if now - self._last_pull < ASSIST_IDLE_S:
+            return
+        self._stop_motion(self._assist_slot, "stop_feed_assist")
+        self._assist_gen = None
+
     def _extruding(self) -> bool:
         try:
             report = self.printer.lookup_object("motion_report")
@@ -1797,6 +1830,7 @@ class afcACE(afcUnit):
         res = self._rpc("start_feed_assist", {"index": self._assist_slot})
         if res.get("ok"):
             self._assist_gen = generation
+            self._last_pull = time.monotonic()
         else:
             self._log_once(
                 "assist", f"{self.name}: feed assist did not start ({res.get('error')}) — "
@@ -1985,35 +2019,50 @@ class afcACE(afcUnit):
             ok, msg = self._push_to_gears(slot, lane)
         return ok, msg
 
-    def _mark_fed_heads(self, status: Dict[str, Any]) -> None:
-        """A lane that alone feeds its head, with its spool in and filament
-        at the head's sensor, is that head's loaded lane: whatever got it
-        there (an autofeed, a load before a restart, a dock that cleared the
-        flag). Feed assist and AFC's runout checks need it marked."""
-        if self._operation_active or self.monitor_only or self.afc.current_loading:
+    def _sync_heads(self, status: Dict[str, Any]) -> None:
+        """Keep a lane that alone feeds its head in step with that head's
+        sensor. Filament there is not by itself a load (an autofeed stops at
+        the sensor, short of the gears), so a lane is only re-marked loaded
+        where the head still names it (AFC.var, a dock that cleared the
+        lane's flag). An empty sensor unloads it, whatever took it away (a
+        spool pulled: AFC clears the lane but leaves the head naming it).
+        Never during a load or unload; during a print only marking, as an
+        empty sensor then is AFC's runout to handle."""
+        if (self._operation_active or self.monitor_only or self.afc.current_loading
+                or self._feeding or self._draining):
             return
+        printing = self._print_running()
         changed = False
         for lane_name, slot in self._slot_map.items():
             lane = self.lanes[lane_name]
             extruder = lane.extruder_obj
-            # Before PREP, AFC.var has yet to restore the lanes. A head that
-            # names this lane while the lane is not marked is repaired.
-            if (lane.tool_loaded or lane_name in self._staged
+            # Before PREP, AFC.var has yet to restore the lanes
+            if (lane_name in self._staged or extruder is None
                     or not getattr(lane, "_afc_prep_done", False)
-                    or not self._own_path(lane) or extruder is None
-                    or extruder.lane_loaded not in (None, lane_name)
-                    or not self._slot_present(slot, status)):
+                    or not self._own_path(lane)
+                    or extruder.lane_loaded not in (None, lane_name)):
                 continue
             sensor = self._toolhead_sensor_fn(lane)
-            if sensor is None or not sensor():
+            if sensor is None:
                 continue
-            self.logger.info(f"{lane_name}: filament at {extruder.name}'s sensor, "
-                             "marking it loaded there")
-            lane.set_loaded()
-            lane.set_tool_loaded()
-            if not self._head_mounted(lane):
-                self.lane_tool_loaded_idle(lane)
-            changed = True
+            fed = bool(sensor()) and self._slot_present(slot, status)
+            named = extruder.lane_loaded == lane_name
+            if fed and named and not lane.tool_loaded:
+                self.logger.info(f"{lane_name}: filament at {extruder.name}'s sensor, "
+                                 "marking it loaded there")
+                lane.set_loaded()
+                lane.set_tool_loaded()
+                if not self._head_mounted(lane):
+                    self.lane_tool_loaded_idle(lane)
+                changed = True
+            elif not fed and not printing and (lane.tool_loaded or named):
+                self.logger.info(f"{lane_name}: no filament at {extruder.name}'s sensor"
+                                 + ("" if self._slot_present(slot, status) else " and no spool")
+                                 + ", marking it unloaded")
+                lane.set_tool_unloaded()
+                if self._slot_present(slot, status):
+                    lane.set_loaded()
+                changed = True
         if changed:
             self.afc.save_vars()
 
@@ -2025,12 +2074,13 @@ class afcACE(afcUnit):
             return
         if not any(self._own_path(self.lanes[n]) for n in self._slot_map):
             return
-        current = self.afc.function.get_current_extruder()
         want = None
         for lane_name, slot in self._slot_map.items():
             lane = self.lanes[lane_name]
+            # The mount sensors, not the active extruder: that stays on a
+            # head's extruder after it is docked
             if (lane.tool_loaded and self._own_path(lane)
-                    and lane.extruder_obj.th_extruder_name == current
+                    and self._head_mounted(lane)
                     and lane_name not in self._tail_pending):
                 want = slot
         if want == self._assist_slot:
@@ -2051,30 +2101,41 @@ class afcACE(afcUnit):
     def cmd_AFC_ACE_FEED(self, gcmd: GCodeCommand) -> None:
         if self._motion_blocked("AFC_ACE_FEED"):
             return
-        if self.afc.function.in_print():
-            raise gcmd.error("AFC_ACE_FEED: not during a print")
+        if self._print_running():
+            if gcmd.get("LENGTH", None) is not None or not gcmd.get_int("LOAD", 1):
+                raise gcmd.error("AFC_ACE_FEED: LENGTH and LOAD=0 not during a print")
+            for name in self._lanes_for(gcmd):
+                if not self.lanes[name].tool_loaded:
+                    self._queue_feed(name)
+            gcmd.respond_info("Queued for after the print: "
+                              + (", ".join(self._feed_queue) or "nothing"))
+            return
         # LENGTH: push that much further from where the filament is now, cold
         # (for finding sensor_to_gears_mm)
         nudge = gcmd.get_float("LENGTH", None, above=0.0, maxval=300.0)
         # LOAD=0: only to the sensor, no autoload_cmd
         load = gcmd.get_int("LOAD", 1, minval=0, maxval=1) and nudge is None
-        for name in self._lanes_for(gcmd):
-            status = self._get_status()
-            if status is not None and not self._slot_present(self._slot_map[name], status):
-                gcmd.respond_info(f"{name}: no spool")
-                continue
-            self._operation_active = True
-            try:
-                if nudge is not None:
-                    ok, msg = self._feed_until(self._slot_map[name], None, nudge,
-                                               self.sensor_approach_speed)
-                else:
-                    ok, msg = self._feed_to_gears(self.lanes[name])
-            finally:
-                self._operation_active = False
-            gcmd.respond_info(f"{name}: " + ("at its toolhead" if ok else f"feed failed: {msg}"))
-            if ok and load and self.autoload_cmd and not self.lanes[name].tool_loaded:
-                self.gcode.run_script_from_command(f"{self.autoload_cmd} LANE={name}")
+        self._feeding = True
+        try:
+            for name in self._lanes_for(gcmd):
+                status = self._get_status()
+                if status is not None and not self._slot_present(self._slot_map[name], status):
+                    gcmd.respond_info(f"{name}: no spool")
+                    continue
+                self._operation_active = True
+                try:
+                    if nudge is not None:
+                        ok, msg = self._feed_until(self._slot_map[name], None, nudge,
+                                                   self.sensor_approach_speed)
+                    else:
+                        ok, msg = self._feed_to_gears(self.lanes[name])
+                finally:
+                    self._operation_active = False
+                gcmd.respond_info(f"{name}: " + ("at its toolhead" if ok else f"feed failed: {msg}"))
+                if ok and load and self.autoload_cmd and not self.lanes[name].tool_loaded:
+                    self.gcode.run_script_from_command(f"{self.autoload_cmd} LANE={name}")
+        finally:
+            self._feeding = False
 
     def cmd_AFC_ACE_RETRACT(self, gcmd: GCodeCommand) -> None:
         """Back to the ACE, so a spool can come out: clear of the toolhead
@@ -2263,8 +2324,11 @@ class afcACE(afcUnit):
             # prep_state is left alone so the last known spool still shows.
             self._mark_lanes_unloadable()
             return eventtime + 2.0
-        self._mark_fed_heads(status)
+        self._sync_heads(status)
+        if self._drain_ready():
+            self.reactor.register_callback(lambda e: self._drain_feed_queue())
         self._follow_active_tool()
+        self._idle_assist_off()
         if self._assist_needs_arming(status):
             self._arm_assist()
             # The RPC paused this timer: a load or unload may have started,
@@ -2311,7 +2375,9 @@ class afcACE(afcUnit):
     def _mark_lanes_unloadable(self) -> None:
         """Withdraw the "staged and loadable" flag from this unit's lanes."""
         for lane_name, lane in self.lanes.items():
-            if lane_name in self._slot_map and lane.loaded_to_hub:
+            # A lane loaded in its head stays usable: the extruder prints it
+            # without the ACE (no feed assist until the ACE is back)
+            if lane_name in self._slot_map and lane.loaded_to_hub and not lane.tool_loaded:
                 lane.loaded_to_hub = False
 
     def _sync_lane(self, lane_name: str, lane: AFCLane, slot: int,
@@ -2348,10 +2414,13 @@ class afcACE(afcUnit):
                 self._apply_rfid(lane, self._slot_info(slot, status), force=True)
                 self._publish_lane(lane)
                 if (self.autofeed and not lane.tool_loaded and self._own_path(lane)
-                        and not self.monitor_only and not self.afc.function.in_print()
+                        and not self.monitor_only
                         and time.monotonic() >= self._retracted.get(lane_name, 0.0)):
-                    self.reactor.register_callback(
-                        lambda e, lane=lane: self._autofeed(lane))
+                    if self._print_running() or self._feed_queue:
+                        self._queue_feed(lane_name)
+                    else:
+                        self.reactor.register_callback(
+                            lambda e, lane=lane: self._autofeed(lane))
             elif lane.tool_loaded:
                 # Spool ran out while loaded: an ungripped tail now spans
                 # slot->nozzle, so an immediate swap could not retract it.
@@ -2413,28 +2482,84 @@ class afcACE(afcUnit):
             return False
         return idle.get_status(self.reactor.monotonic()).get("state") == "Printing"
 
-    def _autofeed(self, lane: AFCLane) -> None:
-        if (self._operation_active or self.afc.function.in_print()
-                or self._printer_busy() or lane.tool_loaded):
+    def _print_running(self) -> bool:
+        """A print is under way, paused included."""
+        if self.afc.function.in_print():
+            return True
+        stats = self.printer.lookup_object("print_stats", None)
+        if stats is None:
+            return False
+        state = stats.get_status(self.reactor.monotonic()).get("state")
+        return state in ("printing", "paused")
+
+    def _queue_feed(self, lane_name: str) -> None:
+        if lane_name in self._feed_queue:
+            return
+        self._feed_queue.append(lane_name)
+        self.logger.info(f"{lane_name}: feed queued for after the print "
+                         f"(queue: {', '.join(self._feed_queue)})")
+
+    def _drain_ready(self) -> bool:
+        return (bool(self._feed_queue) and not self._draining
+                and not self._operation_active and not self._print_running()
+                and not self._printer_busy())
+
+    def _drain_feed_queue(self) -> None:
+        """Feed the queued lanes in order, then turn the heaters off. Stops
+        (keeping the rest queued) if a print starts in between."""
+        if not self._drain_ready():
+            return
+        self._draining = True
+        fed = False
+        try:
+            while self._feed_queue and not self._print_running():
+                name = self._feed_queue.pop(0)
+                lane = self.lanes.get(name)
+                slot = self._slot_map.get(name)
+                status = self._get_status()
+                if (lane is None or lane.tool_loaded or status is None
+                        or not self._slot_present(slot, status)):
+                    continue
+                fed = True
+                self._autofeed(lane, queued=True)
+        finally:
+            self._draining = False
+            if fed:
+                try:
+                    self.gcode.run_script("TURN_OFF_HEATERS")
+                except Exception as exc:
+                    self.logger.error(f"{self.name}: turning the heaters off after "
+                                      f"the queued feeds failed: {exc}")
+
+    def _autofeed(self, lane: AFCLane, queued: bool = False) -> None:
+        if self._print_running() or (not queued and self._feed_queue):
+            self._queue_feed(lane.name)
+            return
+        if (self._operation_active or lane.tool_loaded
+                or (not queued and self._printer_busy())):
             self.logger.info(f"{lane.name}: spool inserted while the printer is busy; "
                              f"not autofeeding (AFC_ACE_FEED UNIT={self.name} LANE={lane.name})")
             return
-        self._operation_active = True
+        self._feeding = True
         try:
-            ok, msg = self._feed_to_gears(lane)
-        except Exception:
-            ok, msg = False, traceback.format_exc()
+            self._operation_active = True
+            try:
+                ok, msg = self._feed_to_gears(lane)
+            except Exception:
+                ok, msg = False, traceback.format_exc()
+            finally:
+                self._operation_active = False
+            if ok:
+                self.logger.info(f"{lane.name}: autofed to its toolhead")
+                if self.autoload_cmd and not lane.tool_loaded:
+                    try:
+                        self.gcode.run_script(f"{self.autoload_cmd} LANE={lane.name}")
+                    except Exception as exc:
+                        self.logger.error(f"{lane.name}: autoload failed: {exc}")
+            else:
+                self.logger.error(f"{lane.name}: autofeed failed: {msg}")
         finally:
-            self._operation_active = False
-        if ok:
-            self.logger.info(f"{lane.name}: autofed to its toolhead")
-            if self.autoload_cmd and not lane.tool_loaded:
-                try:
-                    self.gcode.run_script(f"{self.autoload_cmd} LANE={lane.name}")
-                except Exception as exc:
-                    self.logger.error(f"{lane.name}: autoload failed: {exc}")
-        else:
-            self.logger.error(f"{lane.name}: autofeed failed: {msg}")
+            self._feeding = False
 
     def _apply_rfid(self, lane: AFCLane, info: Dict[str, Any], force: bool = False) -> None:
         """Apply a slot's RFID data (material type, color) to its lane.

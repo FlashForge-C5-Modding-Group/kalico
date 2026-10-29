@@ -1314,7 +1314,10 @@ class AFCLane:
                     and not self.tool_loaded):
                     self._prep_capture_td1()
 
-                if self.hub == 'direct_load': # TODO: change to is_direct_hub
+                # A unit can handle its own inserts (the ACE feeds only to the
+                # toolhead sensor, and the load stays the user's)
+                if (self.hub == 'direct_load' # TODO: change to is_direct_hub
+                        and getattr(self.unit_obj, 'load_on_insert', True)):
                     # Check to see if the printer is printing or moving, as trying to load while printer is doing something will crash klipper
                     if self.afc.function.is_printing(check_movement=True):
                         self.afc.error.AFC_error("Cannot load spool to toolhead while printer is actively moving or homing", False)
