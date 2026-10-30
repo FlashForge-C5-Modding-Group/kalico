@@ -24,7 +24,7 @@ def creator5_start_command(header, footer=""):
         return None
     tool = 0
     tool_seen = False
-    hotend = bed = preheat = first_layer = None
+    hotend = bed = preheat = first_layer = chamber = None
     for raw in header.splitlines():
         meta = re.match(r"^\s*;\s*first_layer_height\s*=\s*([0-9.]+)", raw, re.I)
         if meta and first_layer is None:
@@ -48,6 +48,9 @@ def creator5_start_command(header, footer=""):
             value = float(match.group(2))
             if value > 0:
                 bed = value
+        match = re.match(r"^M(141|191)\b.*?\bS\s*([0-9.]+)", line, re.I)
+        if match and chamber is None and float(match.group(2)) > 0:
+            chamber = float(match.group(2))
     if hotend is None:
         hotend = preheat
     if hotend is None:
@@ -87,6 +90,17 @@ def creator5_start_command(header, footer=""):
     for index, value in enumerate(idle[:4]):
         if value > 0:
             command += " IDLE%d=%g" % (index, value)
+    if chamber is None:
+        # Orca's per-filament chamber temperature, for the slots this print
+        # uses that have chamber control on
+        temps = creator5_slot_list(r"chamber_temperature", footer, material_header)
+        active = creator5_slot_list(r"activate_chamber_temp_control",
+                                    footer, material_header)
+        chamber = max([temps[index] for index in (tools or [tool])
+                       if index < len(temps)
+                       and (index >= len(active) or active[index] > 0)] or [0.])
+    if chamber > 0:
+        command += " CHAMBER=%g" % chamber
     return command
 
 

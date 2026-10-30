@@ -283,6 +283,9 @@ class Creator5Toolchanger:
         self.purge_switch = Creator5MiscSwitch(
             self.printer, self.gcode, 'purge',
             config.getboolean('purge_default', True))
+        self.purge_line_switch = Creator5MiscSwitch(
+            self.printer, self.gcode, 'purge_line',
+            config.getboolean('purge_line_default', True))
         self.bed_leveling_switch = Creator5MiscSwitch(
             self.printer, self.gcode, 'bed_leveling',
             config.getboolean('bed_leveling_default', True))
