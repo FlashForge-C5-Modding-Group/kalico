@@ -101,6 +101,10 @@ DRIVE_CHUNK_MM = 100.0
 # Stopped once the extruder has not moved forward for this long, and armed
 # again on its next forward move.
 ASSIST_IDLE_S = 3.0
+# A print leaves the ACE 2 buffers compressed (assist pushed them forward).
+# Rollback assist rewinds a lane until its strand is taut, at 50 mm/s; on a
+# strand nothing holds that never comes, so it is cut off after this long
+RELAX_MAX_S = 4.0
 # After this unit retracted a lane to the ACE, the slot can read empty and
 # then ready again as the ACE re-stages the tip: not a new spool
 RETRACT_QUIET_S = 60.0
@@ -565,8 +569,10 @@ ACE2_FORBIDDEN = 2
 # that window last 20-30 s after stopping feed assist, which every unload
 # does just before its retract.
 ACE2_FORBIDDEN_WAIT_S = 30.0
-ACE2_MOTION_METHODS = frozenset(("feed_filament", "unwind_filament", "start_feed_assist"))
+ACE2_MOTION_METHODS = frozenset(("feed_filament", "unwind_filament", "start_feed_assist",
+                                 "start_unwind_assist"))
 ACE2_ASSIST_ERROR = 131
+ACE2_ROLLBACK_ASSISTING = 4
 ACE2_MAX_SPEED = 100    # firmware PARAM_ERROR above this (Simon-CR 8.1)
 # The firmware drops a STOP that lands within ~200 ms of the move it stops
 # starting, and the move then runs its full length (Simon-CR docs/05)
@@ -651,6 +657,10 @@ def _ace2_request(method: str, params: Optional[dict]) -> list:
         # at a fixed 50 mm/s whatever speed is sent; 10 is what others send.
         return [(ACE2_STOP, _pb_msg(p["index"])),
                 (ACE2_FEED, _pb_msg(p["index"], 10, 0, 2))]
+    if method == "start_unwind_assist":
+        # Mode 3, the mirror of assist: rewinds until the buffer reads taut
+        return [(ACE2_STOP, _pb_msg(p["index"])),
+                (ACE2_FEED, _pb_msg(p["index"], 10, 0, 3))]
     if method == "drying":
         # A DRYING sent mid-cycle keeps the old cycle's start time, so it can
         # end at once (Simon-CR docs/07): stop first. Duration in minutes;
@@ -1189,6 +1199,11 @@ class afcACE(afcUnit):
         # behind the splitter (staged for fast reload) and the next lane can
         # load. Must exceed the sensor -> splitter-merge distance.
         self.hub_clear_mm = config.getfloat("hub_clear_mm", 100.0, minval=0.0)
+        # Unloads go on past hub_clear_mm, back into the ACE: the lane's
+        # dist_hub behind the sensor, less unload_leave_mm so the tip stays in
+        # the ACE's outlet (as AFC_ACE_RETRACT does)
+        self.unload_to_ace = config.getboolean("unload_to_ace", False)
+        self.unload_leave_mm = config.getfloat("unload_leave_mm", 50.0, minval=0.0)
         # A toolhead sensor sits a few mm short of the extruder gears, and a
         # stopped ACE feed lands a few mm late at full speed, so the last
         # sensor_approach_mm before it run at sensor_approach_speed.
@@ -1245,6 +1260,8 @@ class afcACE(afcUnit):
         # so the gears take the tip instead of the ACE pushing it against
         # them until the tube pops off. 0: the ACE alone, until it stalls.
         self.gear_catch_mm = config.getfloat("gear_catch_mm", 0.0, minval=0.0)
+        # ACE 2: once a print ends, rewind each loaded lane's buffer to taut
+        self.relax_after_print = config.getboolean("relax_after_print", True)
         # Run after a load, at the purge spot with the nozzle hot
         self.purge_cmd = config.get("purge_cmd", None)
         # Run (with LANE=) after autofeed or AFC_ACE_FEED has fed a lane to its
@@ -1265,6 +1282,9 @@ class afcACE(afcUnit):
         self._feeding = False
         # Last time the extruder was seen moving forward while assist ran
         self._last_pull = 0.0
+        # Print state at the last poll, and a buffer relax owed for its end
+        self._was_printing = False
+        self._relax_pending = False
 
         # Expose the firmware dryer as a heater (+ humidity sensor) so UIs
         # control it with SET_HEATER_TEMPERATURE and see live values.
@@ -1338,6 +1358,9 @@ class afcACE(afcUnit):
         self.gcode.register_mux_command(
             'AFC_ACE_STOP', "UNIT", self.name, self.cmd_AFC_ACE_STOP,
             desc="Stop all ACE motion for a lane: AFC_ACE_STOP UNIT=%s LANE=" % self.name)
+        self.gcode.register_mux_command(
+            'AFC_ACE_RELAX', "UNIT", self.name, self.cmd_AFC_ACE_RELAX,
+            desc="Decompress the buffers of loaded lanes: AFC_ACE_RELAX UNIT=%s [LANE=]" % self.name)
         self.gcode.register_mux_command(
             'AFC_ACE_RESET', "UNIT", self.name, self.cmd_AFC_ACE_RESET,
             desc="Retract a lane clear of the sensors and park it behind the "
@@ -2325,6 +2348,14 @@ class afcACE(afcUnit):
             self._mark_lanes_unloadable()
             return eventtime + 2.0
         self._sync_heads(status)
+        printing = self._print_running()
+        if (self._was_printing and not printing and self.relax_after_print
+                and self.protocol == "ace2"):
+            self._relax_pending = True
+        self._was_printing = printing
+        if self._relax_pending and not self._printer_busy():
+            self._relax_pending = False
+            self.reactor.register_callback(lambda e: self._relax_buffers())
         if self._drain_ready():
             self.reactor.register_callback(lambda e: self._drain_feed_queue())
         self._follow_active_tool()
@@ -2498,6 +2529,51 @@ class afcACE(afcUnit):
         self._feed_queue.append(lane_name)
         self.logger.info(f"{lane_name}: feed queued for after the print "
                          f"(queue: {', '.join(self._feed_queue)})")
+
+    def _relax_buffers(self, names: Optional[list] = None) -> None:
+        """Rewind loaded lanes' buffers to taut (rollback assist), one lane
+        at a time. Feed assist re-arms on the next extrusion."""
+        if (self._operation_active or self._print_running() or self.monitor_only
+                or self.protocol != "ace2"):
+            return
+        lanes = [n for n, lane in self.lanes.items()
+                 if n in self._slot_map and lane.tool_loaded
+                 and (names is None or n in names)]
+        if not lanes:
+            return
+        self._operation_active = True
+        try:
+            if self._assist_slot is not None and self._assist_gen is not None:
+                self._stop_motion(self._assist_slot, "stop_feed_assist")
+                self._assist_gen = None
+            for name in lanes:
+                self._relax_buffer(self.lanes[name], self._slot_map[name])
+        finally:
+            self._operation_active = False
+
+    def _relax_buffer(self, lane: AFCLane, slot: int) -> None:
+        sensor = self._path_sensor(lane)
+        res = self._rpc("start_unwind_assist", {"index": slot})
+        if not res.get("ok"):
+            self.logger.info(f"{lane.name}: buffer not relaxed ({res.get('error')})")
+            return
+        self.reactor.pause(self.reactor.monotonic() + SPIN_UP_S)
+        deadline = self.reactor.monotonic() + RELAX_MAX_S
+        rewinding = False
+        try:
+            while self.reactor.monotonic() < deadline:
+                # The strand left the head: nothing was holding it
+                if sensor is not None and not sensor[1]():
+                    break
+                state = self._slot_info(slot, self._get_status(strict=True)).get("ace2_state")
+                if state == ACE2_ROLLBACK_ASSISTING:
+                    rewinding = True
+                elif rewinding or (state or 0) >= 127:
+                    break
+                self.reactor.pause(self.reactor.monotonic() + 0.1)
+        finally:
+            self._stop_motion(slot, "stop_unwind_filament")
+        self.logger.info(f"{lane.name}: buffer relaxed")
 
     def _drain_ready(self) -> bool:
         return (bool(self._feed_queue) and not self._draining
@@ -3120,6 +3196,13 @@ class afcACE(afcUnit):
             # ACE-driven retract: pull the bowden empty and park the filament
             # behind the splitter.
             ok, msg = self._retract_clear_of_sensors(cur_lane, slot)
+            if ok and self.unload_to_ace:
+                _, dist_hub = self._path_lengths(cur_lane)
+                rest = dist_hub - self.unload_leave_mm - self.hub_clear_mm
+                if rest > 0:
+                    ok, msg = self._retract(slot, rest, self.retract_speed)
+                self._staged.discard(cur_lane.name)
+                self._retracted[cur_lane.name] = time.monotonic() + RETRACT_QUIET_S
             if not ok:
                 self.afc.error.handle_lane_failure(
                     cur_lane, f"ACE retract failed for {cur_lane.name}: {msg}",
@@ -3135,6 +3218,11 @@ class afcACE(afcUnit):
             cur_lane.status = AFCLaneState.NONE
             self.lane_tool_unloaded(cur_lane)
             self.afc.save_vars()
+            # TOOL_UNLOAD restores the head that was active before, not the
+            # one picked up and heated for this unload
+            if not self.afc.function.in_print():
+                self.printer.lookup_object("heaters").set_temperature(
+                    cur_extruder.get_heater(), 0.)
             return True
         finally:
             self._operation_active = False
@@ -3395,6 +3483,14 @@ class afcACE(afcUnit):
         self._stop_motion(slot, "stop_feed_filament")
         self._stop_motion(slot, "stop_unwind_filament")
         self._set_assist(slot, False)
+
+    def cmd_AFC_ACE_RELAX(self, gcmd: GCodeCommand) -> None:
+        if self._print_running():
+            raise gcmd.error("Not during a print: it relaxes on its own when the print ends")
+        lane = gcmd.get("LANE", None)
+        if lane is not None and lane not in self._slot_map:
+            raise gcmd.error(f"Unknown lane {lane} on {self.name}")
+        self._relax_buffers([lane] if lane else None)
 
     def cmd_AFC_ACE_RESET(self, gcmd: GCodeCommand) -> None:
         lane = self.lanes.get(gcmd.get("LANE"))
