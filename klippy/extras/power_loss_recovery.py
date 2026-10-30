@@ -280,11 +280,15 @@ class PowerLossRecovery:
                 self.gcode.run_script_from_command(
                     'SET_HEATER_TEMPERATURE HEATER=%s TARGET=%.1f'
                     % (name, target))
+        heaters = self.printer.lookup_object('heaters')
+        sensors = dict((n.split()[-1], n) for n in
+                       heaters.get_status(self.reactor.monotonic())
+                       ['available_heaters'])
         for name, target in heater_targets.items():
             if target > 0:
                 self.gcode.run_script_from_command(
-                    'TEMPERATURE_WAIT SENSOR=%s MINIMUM=%.1f'
-                    % (name, target - 2.))
+                    'TEMPERATURE_WAIT SENSOR="%s" MINIMUM=%.1f'
+                    % (sensors.get(name, name), target - 2.))
         toolhead = self.printer.lookup_object('toolhead')
         cur_z = toolhead.get_position()[2]
         safe_z = max(z + self.min_z_clearance, cur_z)
