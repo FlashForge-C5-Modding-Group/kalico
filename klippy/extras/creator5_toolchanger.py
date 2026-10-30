@@ -23,7 +23,9 @@ FACTORY_MEASUREMENTS = ((15.800, 215.280, 1.460),
                         (15.864, 215.340, 1.437))
 # CommMgr::cmdXYCalibrationManualFrontHome() in firmwareExe.i64 uses this
 # temporary coordinate after the operator aligns the carriage by hand.
-HOLDER_REFERENCE_X = 295.
+# High enough that the X measurement stays above position_min. The result is
+# a distance, so this frame doesn't change it.
+HOLDER_REFERENCE_X = 305.
 HOLDER_REFERENCE_Y_BASE = 80.
 HOLDER_REFERENCE_Y_PITCH = 50.
 # Longest single extrude of a purge (max_extrude_only_distance is 500)
@@ -122,6 +124,7 @@ class Creator5Toolchanger:
         self.printer.register_event_handler(
             'klippy:disconnect', self.toolchange_count_writer.close)
         self.print_z_baseline = [None] * 4
+        self.print_z_corrections = [None] * 4
         self._button_objects = {}
         # UI status may be polled many times per second on a small MIPS host.
         # Motion interlocks always bypass this one-second status cache.
@@ -347,6 +350,7 @@ class Creator5Toolchanger:
             ('C5_CLEAR_BABYSTEP', self.cmd_clear_babystep),
             ('C5_LIST_BABYSTEP', self.cmd_list_babystep),
             ('C5_AUTO_NOZZLE_Z', self.cmd_auto_nozzle_z),
+            ('C5_PRINT_Z_PLAN', self.cmd_print_z_plan),
             ('C5_VERIFY_NOZZLE_Z', self.cmd_verify_nozzle_z),
             ('C5_CALIBRATE_ATTACHED', self.cmd_calibrate_attached),
             ('C5_MOUNT_COORDS', self.cmd_mount_coords),
@@ -729,6 +733,48 @@ class Creator5Toolchanger:
             'T%d: %d\n' % (index, count) for index, count in enumerate(counts))
         self.toolchange_count_writer.submit(text)
 
+    def _print_correction(self, hotend, temp_coefficient, bed, first_layer):
+        return ((hotend - 120.) * temp_coefficient
+                - (0.08 if bed >= 100. else 0.)
+                - (0.06 if first_layer < 0.11 else 0.))
+
+    def cmd_print_z_plan(self, gcmd):
+        # Each tool's thermal Z correction for this print, for the pickups
+        # and re-selects that happen once it is running.
+        bed = gcmd.get_float('BED', 0., minval=0.)
+        first_layer = gcmd.get_float('FIRST_LAYER_HEIGHT', 0.2, above=0.)
+        hotends = [gcmd.get_float('HOTEND%d' % tool, 0., minval=0.)
+                   for tool in range(4)]
+        try:
+            test_data, _ = self._read_stock_json(self.test_json_path)
+            temp_coefficient = float(test_data['tempOffset'])
+            if not math.isfinite(temp_coefficient):
+                raise ValueError('non-finite tempOffset')
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            raise gcmd.error('Invalid automatic nozzle Z calibration: %s' % exc)
+        self.print_z_corrections = [
+            self._print_correction(hotend, temp_coefficient, bed, first_layer)
+            if hotend > 0. else None for hotend in hotends]
+
+    def _apply_print_z(self, tool):
+        correction = self.print_z_corrections[tool]
+        if correction is None or not self._printing():
+            return
+        baseline = self.measurements[tool][2] - self.station_z + correction
+        offset = baseline + self.z_adjustments[tool]
+        if not math.isfinite(offset) or not 0.5 <= offset <= 5.:
+            raise self.printer.command_error(
+                'Unsafe T%d nozzle Z offset; refusing tool motion' % tool)
+        self._run('SET_GCODE_OFFSET Z=%.4f MOVE=0' % offset)
+        self._applied_z = (tool, offset)
+        self.print_z_baseline[tool] = baseline
+
+    def _keeps_print_z(self, tool):
+        origin = self.printer.lookup_object('gcode_move').get_status()[
+            'homing_origin'][2]
+        return (self._printing() and self.print_z_baseline[tool] is not None
+                and math.isfinite(origin) and 0.5 <= origin <= 5.)
+
     def cmd_auto_nozzle_z(self, gcmd):
         tool = gcmd.get_int('T', minval=0, maxval=3)
         hotend = gcmd.get_float('HOTEND', 120., minval=0.)
@@ -760,9 +806,8 @@ class Creator5Toolchanger:
         except (OSError, ValueError, TypeError, KeyError) as exc:
             raise gcmd.error('Invalid automatic nozzle Z calibration: %s' % exc)
         baseline = tool_z - station_z
-        correction = ((hotend - 120.) * temp_coefficient
-                      - (0.08 if bed >= 100. else 0.)
-                      - (0.06 if first_layer < 0.11 else 0.))
+        correction = self._print_correction(hotend, temp_coefficient, bed,
+                                            first_layer)
         offset = baseline + correction + self.z_adjustments[tool]
         if not 0.5 <= offset <= 5.:
             raise gcmd.error('Automatic T%d nozzle Z %.4f mm outside 0.5..5 mm'
@@ -1242,8 +1287,10 @@ class Creator5Toolchanger:
         clear_feed = self.clear_travel_speed * 60.
         # Establish a calibrated, positive nozzle clearance before the latch
         # can make the tool physically attached.  Print-specific thermal Z
-        # compensation is applied later by C5_AUTO_NOZZLE_Z.
+        # compensation is applied later by C5_AUTO_NOZZLE_Z, or here for a
+        # pickup during a print.
         self._apply_offsets(tool)
+        self._apply_print_z(tool)
         if raise_z:
             self._raise_z()
         self._travel_to_lane(y, clear_feed)
@@ -1509,7 +1556,14 @@ class Creator5Toolchanger:
         if attached == tool:
             # AFC may select a head that was already mounted at Klippy start.
             # Restore its active extruder and offsets even without pickup motion.
-            self._apply_offsets(tool)
+            # A running print keeps its Z: thermal correction and baby stepping.
+            if self._keeps_print_z(tool):
+                self._run('SET_GCODE_OFFSET X=%.4f Y=%.4f MOVE=0' % tuple(
+                    self.measurements[tool][axis] - self.measurements[0][axis]
+                    for axis in range(2)))
+            else:
+                self._apply_offsets(tool)
+                self._apply_print_z(tool)
             extruder = 'extruder' if tool == 0 else 'extruder%d' % tool
             self._run('ACTIVATE_EXTRUDER EXTRUDER=%s' % extruder)
             self._restore_pressure_advance(extruder)
@@ -2018,7 +2072,7 @@ class Creator5Toolchanger:
         self._move(x=240., feed=12000)
         self._move(x=min(240., HOLDER_REFERENCE_X - old_x + approach),
                    feed=12000)
-        x_result = x_home.measure_axis(-5.)
+        x_result = x_home.measure_axis(HOLDER_REFERENCE_X - 300.)
         self._move(y=min(y_reference, y_reference - old_y + approach),
                    feed=12000)
         y_result = y_home.measure_axis(0.)
@@ -2128,7 +2182,14 @@ class Creator5Toolchanger:
                                 toolhead.get_kinematics().clear_homing_state('xy')
                 finally:
                     if state_saved and not complete:
-                        self._run('RESTORE_GCODE_STATE NAME=C5_HOLDER_CALIBRATE MOVE=0')
+                        # Saved with no tool attached, so its zero nozzle Z is
+                        # refused once one is: keep the error that got us here.
+                        try:
+                            self._run('RESTORE_GCODE_STATE '
+                                      'NAME=C5_HOLDER_CALIBRATE MOVE=0')
+                        except self.printer.command_error as exc:
+                            gcmd.respond_info('G-code state not restored: %s'
+                                              % exc)
         self._with_motion(gcmd, calibrate)
 
     # Fluidd/Mainsail prompt flow for offset calibration without arguments:
@@ -2238,15 +2299,30 @@ class Creator5Toolchanger:
             self._move_to_prep_bucket()
         self._with_motion(gcmd, move)
 
+    def _verify_purge_z(self, gcmd):
+        # A paused print keeps the offset it was printing with. C5_AUTO_NOZZLE_Z
+        # here would count the difference as baby stepping once RESUME restores it.
+        stats = self.printer.lookup_object('print_stats', None)
+        if stats is None or stats.get_status(
+                self.printer.get_reactor().monotonic())['state'] != 'paused':
+            self.cmd_verify_nozzle_z(gcmd)
+            return
+        origin = self.printer.lookup_object('gcode_move').get_status()[
+            'homing_origin'][2]
+        if not math.isfinite(origin) or not 0.5 <= origin <= 5.:
+            raise gcmd.error('Unsafe nozzle Z offset %.4f; refusing purge'
+                             % origin)
+
     def cmd_purge(self, gcmd):
         length = gcmd.get_float('LENGTH', self.purge_length,
                                 minval=0., maxval=1000.)
         if not math.isfinite(length) or length <= 0.:
             raise gcmd.error('LENGTH must be finite and positive')
+        speed = gcmd.get_float('SPEED', self.purge_speed, above=0., maxval=50.)
         dock, grab, attached = self._preflight(gcmd)
         if attached is None:
             raise gcmd.error('No attached tool for purge')
-        self.cmd_verify_nozzle_z(gcmd)
+        self._verify_purge_z(gcmd)
         extruder = 'extruder' if attached == 0 else 'extruder%d' % attached
         heater = self.printer.lookup_object(extruder)
         if not heater.get_status(self.printer.get_reactor().monotonic()).get(
@@ -2268,8 +2344,7 @@ class Creator5Toolchanger:
                 left = length
                 while left > 0.:
                     step = min(PURGE_CHUNK_MM, left)
-                    self._run('G1 E%.3f F%.0f' % (step,
-                                                  self.purge_speed * 60.))
+                    self._run('G1 E%.3f F%.0f' % (step, speed * 60.))
                     left -= step
                 self._run('G1 E-5 F1200')
                 self._run('M400')
