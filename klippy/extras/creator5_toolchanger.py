@@ -179,6 +179,8 @@ class Creator5Toolchanger:
             'pickup_minimum_cruise_ratio', None, minval=0., below=1.)
         self.clear_travel_speed = config.getfloat(
             'clear_travel_speed', 80., above=0.)
+        self.fixture_travel_speed = config.getfloat(
+            'fixture_travel_speed', 150., above=0.)
         self.clearance_z_speed = config.getfloat(
             'clearance_z_speed', 20., above=0.)
         self.lower_bed_speed = config.getfloat(
@@ -1774,7 +1776,7 @@ class Creator5Toolchanger:
 
     def _probe_fixture_z(self, gcmd, x, y, target=None):
         self._move(z=self.safe_z, feed=1200)
-        self._move(x=x, y=y, feed=1200)
+        self._move(x=x, y=y, feed=self.fixture_travel_speed * 60.)
         if target is None:
             target = self.z_probe_target
             if self._stock_pin_approach_z is not None:
