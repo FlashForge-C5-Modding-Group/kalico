@@ -21,6 +21,7 @@ COMPILE_ARGS = (
 NATIVE_FLAGS = "-march=native -mtune=native"
 SOURCE_FILES = [
     "pyhelper.c",
+    "c5_buzzer.c",
     "serialqueue.c",
     "stepcompress.c",
     "steppersync.c",
@@ -254,8 +255,22 @@ defs_std = """
     void free(void*);
 """
 
+defs_c5_buzzer = """
+    struct c5_buzzer_event {
+        uint32_t at_ms;
+        uint8_t kind, channel, note, value;
+    };
+
+    int c5_buzzer_play(const char *channel,
+        const struct c5_buzzer_event *song, int count,
+        uint32_t song_length_ms, const uint32_t *steps, float level);
+    void c5_buzzer_stop(void);
+    int c5_buzzer_active(void);
+"""
+
 defs_all = [
     defs_pyhelper,
+    defs_c5_buzzer,
     defs_serialqueue,
     defs_std,
     defs_stepcompress,
