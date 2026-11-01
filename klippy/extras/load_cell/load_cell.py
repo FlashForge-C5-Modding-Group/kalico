@@ -465,6 +465,11 @@ class LoadCellSampleCollector:
         self._errors = 0
         overflows = self._overflows
         self._overflows = 0
+        if self._mcu.is_fileoutput():
+            ncols = len(
+                SampleStructure.header_labels(self._load_cell.channel_count)
+            )
+            samples = [(0.0,) * ncols]
         return samples, (errors, overflows) if errors or overflows else 0
 
     def _collect_until(self, timeout):
@@ -473,7 +478,7 @@ class LoadCellSampleCollector:
         now = self._reactor.monotonic()
         print_time = self._mcu.estimated_print_time(now)
         wake_time = now + (timeout - print_time)
-        if self.is_started:
+        if self.is_started and not self._mcu.is_fileoutput():
             self._completion = self._reactor.completion()
             result = self._completion.wait(waketime=wake_time)
             if result is None:
@@ -647,7 +652,7 @@ class LoadCell:
         # startup, when klippy is ready, start capturing data
         printer.register_event_handler("klippy:ready", self._handle_ready)
 
-    def _handle_ready(self):
+    def _handle_do_ready(self, eventtime):
         self.sensor.add_client(self._sensor_data_event)
         self.add_client(self._track_force)
         # announce calibration status on ready
@@ -655,6 +660,9 @@ class LoadCell:
             self.printer.send_event("load_cell:calibrate", self)
         if self.is_tared():
             self.printer.send_event("load_cell:tare", self)
+
+    def _handle_ready(self):
+        self.printer.get_reactor().register_callback(self._handle_do_ready)
 
     # convert raw counts to grams and broadcast to clients
     def _sensor_data_event(self, msg):

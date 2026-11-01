@@ -372,32 +372,33 @@ class ToolHead:
             self._calc_print_time()
         # Queue moves into trapezoid motion queue (trapq)
         next_move_time = self.print_time
-        for move in moves:
-            if move.is_kinematic_move:
-                self.trapq_append(
-                    self.trapq,
-                    next_move_time,
-                    move.accel_t,
-                    move.cruise_t,
-                    move.decel_t,
-                    move.start_pos[0],
-                    move.start_pos[1],
-                    move.start_pos[2],
-                    move.axes_r[0],
-                    move.axes_r[1],
-                    move.axes_r[2],
-                    move.start_v,
-                    move.cruise_v,
-                    move.accel,
+        with self.reactor.assert_no_pause():
+            for move in moves:
+                if move.is_kinematic_move:
+                    self.trapq_append(
+                        self.trapq,
+                        next_move_time,
+                        move.accel_t,
+                        move.cruise_t,
+                        move.decel_t,
+                        move.start_pos[0],
+                        move.start_pos[1],
+                        move.start_pos[2],
+                        move.axes_r[0],
+                        move.axes_r[1],
+                        move.axes_r[2],
+                        move.start_v,
+                        move.cruise_v,
+                        move.accel,
+                    )
+                for e_index, ea in enumerate(self.extra_axes):
+                    if move.axes_d[e_index + 3]:
+                        ea.process_move(next_move_time, move, e_index + 3)
+                next_move_time = (
+                    next_move_time + move.accel_t + move.cruise_t + move.decel_t
                 )
-            for e_index, ea in enumerate(self.extra_axes):
-                if move.axes_d[e_index + 3]:
-                    ea.process_move(next_move_time, move, e_index + 3)
-            next_move_time = (
-                next_move_time + move.accel_t + move.cruise_t + move.decel_t
-            )
-            for cb in move.timing_callbacks:
-                cb(next_move_time)
+                for cb in move.timing_callbacks:
+                    cb(next_move_time)
         # Generate steps for moves
         self._advance_move_time(next_move_time)
         self.motion_queuing.note_mcu_movequeue_activity(next_move_time)
@@ -452,12 +453,14 @@ class ToolHead:
             if not self.can_pause:
                 self.need_check_pause = self.reactor.NEVER
                 return
-            eventtime = self.reactor.pause(eventtime + min(1.0, pause_time))
+            eventtime = self.reactor.pause(
+                eventtime + max(0.005, min(1.0, pause_time))
+            )
             est_print_time = self.mcu.estimated_print_time(eventtime)
             buffer_time = self.print_time - est_print_time
         if not self.special_queuing_state:
             # In main state - defer pause checking until needed
-            self.need_check_pause = est_print_time + BUFFER_TIME_HIGH + 0.100
+            self.need_check_pause = est_print_time + BUFFER_TIME_HIGH
 
     def _priming_handler(self, eventtime):
         self.reactor.unregister_timer(self.priming_timer)
@@ -475,7 +478,7 @@ class ToolHead:
             return
         # In "main" state - flush lookahead if buffer runs low
         kin_flush_delay = self.motion_queuing.get_kin_flush_delay()
-        if step_gen_time >= self.print_time - kin_flush_delay:
+        if step_gen_time >= self.print_time - kin_flush_delay - 0.001:
             self._flush_lookahead(is_runout=True)
 
     # Movement commands
@@ -522,6 +525,7 @@ class ToolHead:
         self.printer.send_event("toolhead:manual_move")
 
     def dwell(self, delay):
+        self._flush_lookahead()
         next_print_time = self.get_last_move_time() + max(0.0, delay)
         self._advance_move_time(next_print_time)
         self._check_pause()
