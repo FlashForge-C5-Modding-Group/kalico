@@ -3,6 +3,12 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import subprocess
 
+NORMAL_PRESCALE = 6
+NORMAL_CLOCK = 64000000.
+LOW_PRESCALE = 48
+LOW_CLOCK = 8000000.
+MAX_COUNT = 65535
+
 
 class Creator5Beeper:
     def __init__(self, config):
@@ -86,17 +92,27 @@ class Creator5Beeper:
 
     @staticmethod
     def wave_counts(frequency, level):
-        """cmd_pwm set_wc's high and low counts for a tone."""
-        period = max(2, int(round(50000000. / frequency)))
+        """(prescale, high, low) for cmd_pwm. The clock is measured at 8 MHz at
+        prescale 48, and each count is 16 bits, so low tones need the slower
+        prescale; anything lower than that plays an octave up to fit."""
+        prescale = NORMAL_PRESCALE
+        period = max(2, int(round(NORMAL_CLOCK / frequency)))
+        if period > MAX_COUNT:
+            prescale = LOW_PRESCALE
+            while frequency * MAX_COUNT < LOW_CLOCK:
+                frequency *= 2
+            period = max(2, int(round(LOW_CLOCK / frequency)))
         # LEVEL is a duty-based intensity percentage: 100 preserves the
         # factory 50% duty tone; 0 is silent. Perceived volume is not linear.
         high = period * level // 200
-        return high, period - high
+        return prescale, high, period - high
 
     def _play_tone(self, duration_ms, frequency, level):
         self.ensure_configured(self._run)
-        high, low = self.wave_counts(frequency, level)
+        prescale, high, low = self.wave_counts(frequency, level)
         try:
+            if prescale != NORMAL_PRESCALE:
+                self._run('set_prescale', self.channel, str(prescale))
             # Program the intended waveform before enabling the channel.
             self._run('set_wc', self.channel, str(high), str(low))
             self._run('enable_channels', self.channel)
@@ -106,6 +122,9 @@ class Creator5Beeper:
                 self._run('set_wc', self.channel, '1', '0')
             finally:
                 self._run('disable_channels', self.channel)
+                if prescale != NORMAL_PRESCALE:
+                    self._run('set_prescale', self.channel,
+                              str(NORMAL_PRESCALE))
 
 
 def load_config(config):

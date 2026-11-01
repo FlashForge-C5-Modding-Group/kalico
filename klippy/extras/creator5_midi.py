@@ -1,42 +1,19 @@
-# Play MIDI files on the Creator 5's single-voice host PWM buzzer.
+# Play MIDI files on the Creator 5's host PWM buzzer.
 # Copyright (C) 2026
 # This file may be distributed under the terms of the GNU GPLv3 license.
 #
-# The buzzer plays one tone at a time, so a file is reduced to one line: at
-# every moment the highest note sounding (usually the melody). Drums (MIDI
-# channel 10) are left out. Playback runs on its own thread: the channel is
-# configured once (shared with [creator5_beeper]), enabled, and only its
-# waveform changes from note to note.
+# Every instrument plays at once: chelper/c5_buzzer.c mixes square waves and
+# noise for drums, and writes each sample to the PWM driver from a real-time
+# thread. The channel is configured once (shared with [creator5_beeper]).
 import os
 import struct
 import threading
-import time
 
-MIN_NOTE = 0.02     # s: notes shorter than this are merged into the next
-REPEAT_GAP = 0.03   # s: silence that separates a note from its own repeat
+SAMPLE_RATE = 16000
+DEFAULT_TRANSPOSE = 12  # semitones: the buzzer is thin below this
+EV_NOTE_OFF, EV_NOTE_ON, EV_VOLUME, EV_ALL_OFF = range(4)
+DRUM_CHANNEL = 9
 
-
-# In creator5_beeper.py
-
-class Creator5Beeper:
-    def __init__(self, config):
-        # ... existing setup ...
-        self._configured = False
-
-    def ensure_configured(self, run):
-        """Configure the PWM channel once per session."""
-        if not self._configured:
-            try:
-                run('disable', self.channel)
-                run('config', self.channel, 'freq=50000000',
-                    'max_level=300', 'active_level=1',
-                    'accuracy_priority=freq')
-                run('set_level', self.channel, '100')
-                run('set_prescale', self.channel, '6')
-            except self.printer.command_error as exc:
-                self._config_error = exc
-                raise
-            self._configured = True
 
 class MidiError(Exception):
     pass
@@ -107,69 +84,57 @@ def parse_midi(data):
                 events.append((tick, order, "on", channel, note, velocity))
             elif kind in (0x80, 0x90):
                 events.append((tick, order, "off", channel, note, 0))
+            elif kind == 0xb0 and note == 7:
+                events.append((tick, order, "volume", channel, 0, velocity))
+            elif kind == 0xb0 and note in (120, 123):
+                events.append((tick, order, "all_off", channel, 0, 0))
             order += 1
         pos = end
     # Same tick: tempo first, then note-offs, then note-ons
-    rank = {"tempo": 0, "off": 1, "on": 2}
+    rank = {"tempo": 0, "volume": 0, "off": 1, "all_off": 1, "on": 2}
     events.sort(key=lambda e: (e[0], rank[e[2]], e[1]))
     return division, events
 
 
-def melody(data, channel=None, transpose=0):
-    """[(start s, frequency Hz or None)] for the highest sounding note,
-    ending with (end s, None)."""
+def song_events(data, channel=None, speed=1.):
+    """([(ms, kind, channel, note, value)], length ms) with leading silence
+    removed; channel limits the song to that one, without its drums."""
     division, events = parse_midi(data)
     tempo = 500000.         # us per quarter note until a tempo event
     last_tick = 0
     now = 0.
-    sounding = {}
-    segments = []
+    out = []
+    first_note = None
     for tick, _, kind, chan, note, value in events:
-        now += (tick - last_tick) * tempo / division / 1e6
+        now += (tick - last_tick) * tempo / division / 1e3 / speed
         last_tick = tick
         if kind == "tempo":
             tempo = float(value)
             continue
-        if chan == 9 or (channel is not None and chan != channel):
+        if channel is not None and chan != channel:
             continue
-        key = (chan, note)
         if kind == "on":
-            sounding[key] = sounding.get(key, 0) + 1
-        elif key in sounding:
-            sounding[key] -= 1
-            if not sounding[key]:
-                del sounding[key]
-        top = max((n for _, n in sounding), default=None)
-        freq = None if top is None else 440. * 2 ** ((top + transpose - 69) / 12.)
-        # Never before the previous segment (a re-strike starts REPEAT_GAP late)
-        at = max(now, segments[-1][0]) if segments else now
-        # Every note-on of the top note is heard as its own note: one tone can
-        # only repeat a pitch with a gap, so it is never merged into the last
-        strike = kind == "on" and note == top
-        if (strike and segments and segments[-1][1] == freq
-                and segments[-1][0] < at):
-            segments.append((at, None))
-            segments.append((at + REPEAT_GAP, freq))
-        elif (strike and len(segments) >= 2 and segments[-1] == (at, None)
-                and segments[-2][1] == freq):
-            segments.append((at + REPEAT_GAP, freq))
-        elif segments and segments[-1][0] == at:
-            segments[-1] = (at, freq)
-        elif not segments or segments[-1][1] != freq:
-            segments.append((at, freq))
-    if not segments:
-        raise MidiError("no notes to play")
-    segments.append((now, None))
-    # Drop notes too short for cmd_pwm to switch to in time
-    result = [segments[0]]
-    for start, freq in segments[1:]:
-        if start - result[-1][0] < MIN_NOTE and len(result) > 1:
-            result[-1] = (result[-1][0], freq)
+            if first_note is None:
+                first_note = now
+            out.append((now, EV_NOTE_ON, chan, note, value))
+        elif kind == "off":
+            out.append((now, EV_NOTE_OFF, chan, note, 0))
+        elif kind == "volume":
+            out.append((now, EV_VOLUME, chan, 0, value))
         else:
-            result.append((start, freq))
-    # Leading silence isn't played
-    offset = result[0][0]
-    return [(start - offset, freq) for start, freq in result]
+            out.append((now, EV_ALL_OFF, chan, 0, 0))
+    if first_note is None:
+        raise MidiError("no notes to play")
+    return ([(int(max(at - first_note, 0.)), kind, chan, note, value)
+             for at, kind, chan, note, value in out],
+            int(now - first_note) + 1)
+
+
+def note_steps(transpose):
+    """Oscillator step per sample for each MIDI note."""
+    return [int(440. * 2 ** ((note + transpose - 69) / 12.)
+                * 4294967296. / SAMPLE_RATE) & 0xffffffff
+            for note in range(128)]
 
 
 class Creator5Midi:
@@ -181,7 +146,7 @@ class Creator5Midi:
             self.printer.get_start_args().get('config_file', ''))
         self.folder = os.path.expanduser(
             config.get('folder', os.path.join(config_dir, 'midi')))
-        self.default_level = config.getint('level', 60, minval=1, maxval=100)
+        self.default_level = config.getint('level', 100, minval=1, maxval=100)
         self.beeper = None
         self.thread = None
         self.stop = threading.Event()
@@ -245,59 +210,66 @@ class Creator5Midi:
             raise gcmd.error("No %s in %s" % (os.path.basename(name),
                                                self.folder))
         speed = gcmd.get_float('SPEED', 1., minval=0.1, maxval=10.)
-        transpose = gcmd.get_int('TRANSPOSE', 0, minval=-48, maxval=48)
+        transpose = gcmd.get_int('TRANSPOSE', DEFAULT_TRANSPOSE,
+                                 minval=-48, maxval=48)
         level = gcmd.get_int('LEVEL', self.default_level, minval=1, maxval=100)
         channel = gcmd.get_int('CHANNEL', 0, minval=0, maxval=16)
         try:
             with open(path, 'rb') as f:
-                segments = melody(f.read(), channel - 1 if channel else None,
-                                  transpose)
+                events, length_ms = song_events(
+                    f.read(), channel - 1 if channel else None, speed)
         except (MidiError, IndexError, struct.error) as exc:
             raise gcmd.error("Can't play %s: %s" % (os.path.basename(path),
                                                     exc))
         # The channel is configured here, on the gcode thread, so a failure
-        # is reported to the caller; the thread only changes the waveform.
+        # is reported to the caller.
         self.beeper.ensure_configured(self.beeper._run)
         self.stop.clear()
         self.playing = os.path.basename(path)
         self.beeper.busy = True
         self.thread = threading.Thread(
-            target=self._play, args=(segments, speed, level),
+            target=self._play, args=(events, length_ms, transpose, level),
             name='c5-midi', daemon=True)
         self.thread.start()
         gcmd.respond_info("Playing %s (%.0f s)" % (
-            self.playing, segments[-1][0] / speed))
+            self.playing, length_ms / 1000.))
 
-    def _play(self, segments, speed, level, clock=time.monotonic):
+    def _printing(self):
+        stats = self.printer.lookup_object('print_stats', None)
+        return stats is not None and stats.get_status(
+            self.reactor.monotonic())['state'] in ('printing', 'paused')
+
+    def _get_ffi(self):
+        from klippy import chelper
+        return chelper.get_ffi()
+
+    def _play(self, events, length_ms, transpose, level):
         run = self.beeper.execute
         channel = self.beeper.channel
+        ffi_main, ffi_lib = self._get_ffi()
         enabled = False
-        start = clock()
         try:
-            for i, (at, freq) in enumerate(segments):
-                wait = start + at / speed - clock()
-                if wait > 0 and self.stop.wait(wait):
+            run('set_wc', channel, '1', '0')
+            run('enable_channels', channel)
+            enabled = True
+            song = ffi_main.new('struct c5_buzzer_event[]', [
+                (at, kind, chan, note, value)
+                for at, kind, chan, note, value in events])
+            steps = ffi_main.new('uint32_t[]', note_steps(transpose))
+            name = ffi_main.new('char[]', channel.encode())
+            if ffi_lib.c5_buzzer_play(name, song, len(events), length_ms,
+                                      steps, level / 100.):
+                raise RuntimeError("can't open the PWM driver")
+            while ffi_lib.c5_buzzer_active() and not self._printing():
+                if self.stop.wait(.05):
                     break
-                if self.stop.is_set():
-                    break
-                # Behind schedule: go straight to the newest due note
-                if (i + 1 < len(segments)
-                        and start + segments[i + 1][0] / speed <= clock()):
-                    continue
-                if freq is None:
-                    run('set_wc', channel, '1', '0')
-                    continue
-                high, low = self.beeper.wave_counts(freq, level)
-                run('set_wc', channel, str(high), str(low))
-                if not enabled:
-                    run('enable_channels', channel)
-                    enabled = True
         except Exception as exc:
             # Not on the reactor's thread: hand the message to it
             msg = "MIDI playback stopped: %s" % (exc,)
             self.reactor.register_async_callback(
                 lambda eventtime: self.gcode.respond_info(msg))
         finally:
+            ffi_lib.c5_buzzer_stop()
             try:
                 run('set_wc', channel, '1', '0')
             except Exception:
