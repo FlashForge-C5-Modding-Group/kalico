@@ -4,8 +4,10 @@
 //
 // This file may be distributed under the terms of the GNU GPLv3 license.
 //
-// A real-time thread mixes square waves and noise and writes each sample as a
-// PWM duty cycle, which Python is too slow and too jittery to do.
+// A real-time thread mixes square waves and noise and writes them as a PWM duty
+// cycle, which Python is too slow and too jittery to do. Sound is mixed a
+// millisecond at a time, and the duty is only written when it changes, so the
+// thread sleeps through the runs of equal samples square waves are made of.
 #define _GNU_SOURCE
 #include <fcntl.h> // open
 #include <pthread.h> // pthread_create
@@ -22,6 +24,7 @@
 #define SAMPLES_PER_MS (SAMPLE_RATE / 1000)
 #define PWM_PERIOD 1000 // counts: 64 MHz at prescale 6 makes a 64 kHz carrier
 #define PWM_MARGIN 20
+#define DUTY_STEP 4 // duty is rounded to this, a power of 2, to make longer runs
 #define PWM_REQUEST 0x8001500B // /dev/jz_pwm, as libhardware2 calls it
 #define PWM_SET_WC 0xC004502D
 #define PWM_RETRIES 20 // refused until the last sample has latched
@@ -60,7 +63,7 @@ static pthread_t thread;
 static volatile int thread_started, keep_running, finished;
 static struct c5_buzzer_event *events;
 static int event_count, next_event;
-static uint32_t length_ms, sample_count, note_steps[128], noise = 0xace1;
+static uint32_t length_ms, song_ms, note_steps[128], noise = 0xace1;
 static int pwm_fd = -1, pwm_index, next_drum;
 static float master;
 static struct voice voices[VOICES];
@@ -151,52 +154,81 @@ run_event(const struct c5_buzzer_event *ev)
     }
 }
 
-// -1 to 1
-static float
-next_sample(void)
+// One millisecond of sound, -1 to 1
+static void
+mix_block(float *out)
 {
-    const uint32_t now_ms = sample_count / SAMPLES_PER_MS;
-    const int tick_ms = sample_count % SAMPLES_PER_MS == 0;
-    float mix = 0.f;
-    int i;
-    while (next_event < event_count && events[next_event].at_ms <= now_ms)
+    const float gain = GAIN * master;
+    int i, s;
+    while (next_event < event_count && events[next_event].at_ms <= song_ms)
         run_event(&events[next_event++]);
-    sample_count++;
+    song_ms++;
+    for (s = 0; s < SAMPLES_PER_MS; s++)
+        out[s] = 0.f;
     for (i = 0; i < VOICES; i++) {
         struct voice *v = &voices[i];
         float level;
+        uint32_t phase;
         if (!v->on)
             continue;
-        v->phase += v->step;
         level = v->amp * v->env * channel_volume[v->channel];
-        mix += v->phase & 0x80000000u ? level : -level;
-        if (tick_ms && v->env > HELD_FLOOR)
+        phase = v->phase;
+        for (s = 0; s < SAMPLES_PER_MS; s++) {
+            phase += v->step;
+            out[s] += phase & 0x80000000u ? level : -level;
+        }
+        v->phase = phase;
+        if (v->env > HELD_FLOOR)
             v->env -= v->env * HELD_FADE;
     }
     for (i = 0; i < DRUMS; i++) {
         struct drum *d = &drums[i];
         if (d->env < 0.01f)
             continue;
-        if (d->count-- <= 0) {
-            d->count = d->hold - 1;
-            noise = noise * 1664525u + 1013904223u;
-            d->value = noise & 0x80000000u ? 1.f : -1.f;
+        for (s = 0; s < SAMPLES_PER_MS; s++) {
+            if (d->count-- <= 0) {
+                d->count = d->hold - 1;
+                noise = noise * 1664525u + 1013904223u;
+                d->value = noise & 0x80000000u ? 1.f : -1.f;
+            }
+            out[s] += d->value * d->amp * d->env * channel_volume[DRUM_CHANNEL];
+            d->env *= d->fade;
         }
-        mix += d->value * d->amp * d->env * channel_volume[DRUM_CHANNEL];
-        d->env *= d->fade;
     }
-    mix *= GAIN * master;
-    return mix > 1.f ? 1.f : mix < -1.f ? -1.f : mix;
+    for (s = 0; s < SAMPLES_PER_MS; s++) {
+        const float mix = out[s] * gain;
+        out[s] = mix > 1.f ? 1.f : mix < -1.f ? -1.f : mix;
+    }
 }
 
-static void
+static int
 write_wc(int high, int low)
 {
     uint32_t arg[2] = {pwm_index, (uint32_t)high << 16 | (uint32_t)low};
     int i;
     for (i = 0; i < PWM_RETRIES; i++)
         if (ioctl(pwm_fd, PWM_SET_WC, arg) == 0)
-            return;
+            return 1;
+    return 0;
+}
+
+static void
+sleep_until(double when)
+{
+    const double wait = when - now_s();
+    if (wait > 0) {
+        struct timespec ts = {0, (long)(wait * 1e9)};
+        nanosleep(&ts, NULL);
+    }
+}
+
+// sleeps to just before the moment, then spins, as a late write would be heard
+static void
+wait_until(double when)
+{
+    sleep_until(when - SPIN_S);
+    while (now_s() < when)
+        ;
 }
 
 static void *
@@ -213,21 +245,28 @@ sound_thread(void *unused)
 
     const double step = 1.0 / SAMPLE_RATE;
     const int swing = PWM_PERIOD / 2 - PWM_MARGIN;
-    double next = now_s();
-    while (keep_running && sample_count / SAMPLES_PER_MS < length_ms) {
-        const int high = PWM_PERIOD / 2 + (int)(next_sample() * swing);
-        const double wait = next - now_s() - SPIN_S;
+    float mix[SAMPLES_PER_MS];
+    double start = now_s();
+    int last = -1;
+    while (keep_running && song_ms < length_ms) {
         double now;
-        if (wait > 0) {
-            struct timespec ts = {0, (long)(wait * 1e9)};
-            nanosleep(&ts, NULL);
+        int s;
+        sleep_until(start - step); // a block is mixed just before it's due
+        mix_block(mix);
+        for (s = 0; s < SAMPLES_PER_MS; s++) {
+            const int high = (PWM_PERIOD / 2 + (int)(mix[s] * swing))
+                             & ~(DUTY_STEP - 1);
+            if (high == last)
+                continue;
+            wait_until(start + s * step);
+            // refused stays different from last, so the next sample tries again
+            if (write_wc(high, PWM_PERIOD - high))
+                last = high;
         }
-        while ((now = now_s()) < next)
-            ;
-        if (now - next > RESYNC_S)
-            next = now;
-        write_wc(high, PWM_PERIOD - high);
-        next += step;
+        start += SAMPLES_PER_MS * step;
+        now = now_s();
+        if (now - start > RESYNC_S)
+            start = now;
     }
     write_wc(1, 0);
     finished = 1;
@@ -277,7 +316,7 @@ c5_buzzer_play(const char *channel, const struct c5_buzzer_event *song,
         channel_volume[i] = 100 / 127.f;
     event_count = count;
     next_event = 0;
-    sample_count = 0;
+    song_ms = 0;
     length_ms = song_length_ms;
     master = level;
     finished = 0;
