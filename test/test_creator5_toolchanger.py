@@ -93,6 +93,8 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board._ui_sensor_cache = None
         self.board.busy = False
         self.board.toolchange_sensor_settle_ms = 0
+        self.board.dock_seat_timeout_ms = 1000
+        self.board.dock_seat_attempts = 3
         self.board.pullback_slow_distance = 20.
         self.board.pickup_departure_speed = 80.
         self.board.clear_travel_speed = 600.
@@ -762,7 +764,10 @@ class Creator5OffsetTests(unittest.TestCase):
         board._pause_ms = mock.Mock()
         board._verify = mock.Mock()
         board._travel_to_lane = mock.Mock()
-        board._button = lambda name, gcmd: {'d0': seated, 'g0': at_mount}.get(name, False)
+        if callable(seated):
+            board._button = seated
+        else:
+            board._button = lambda name, gcmd: {'d0': seated, 'g0': at_mount}.get(name, False)
         board.z_adjustments = [0.] * 4
         board.printer.lookup_object.return_value.get_status.return_value = {
             'homing_origin': (0., 0., 2., 0.)}
@@ -784,6 +789,54 @@ class Creator5OffsetTests(unittest.TestCase):
                 self.assertNotIn('MOTOR_RELEASE', commands)
                 self.assertIn('TURN_OFF_HEATERS', commands)
                 board._verify.assert_not_called()
+
+    def test_dock_error_names_the_open_sensor(self):
+        board = self._dock_board(seated=True, at_mount=False)
+        with self.assertRaisesRegex(
+                RuntimeError, r'dock sensor closed, mount sensor open at '
+                r'X=298\.000 Y=50\.000 after 3 approaches'):
+            board._dock(GCmd(), 0, raise_z=False)
+
+    def test_dock_waits_for_a_head_that_seats_late(self):
+        reads = {'d0': 0}
+
+        def button(name, gcmd):
+            if name == 'd0':
+                reads['d0'] += 1
+                return reads['d0'] > 5
+            return name == 'g0'
+        board = self._dock_board(button, None)
+        board._dock(GCmd(), 0, raise_z=False)
+        board._run.assert_any_call('MOTOR_RELEASE')
+        # One approach: no back-off and re-approach was needed.
+        self.assertEqual(
+            [c for c in board._move.call_args_list if c.kwargs.get('x') == 298.],
+            [mock.call(x=298., feed=1500.)])
+
+    def test_dock_backs_out_and_reapproaches_before_releasing(self):
+        moves = []
+
+        def button(name, gcmd):
+            # Seats only once the head has been backed out and pushed in again.
+            if name == 'd0':
+                return moves.count(298.) >= 2
+            return name == 'g0'
+        board = self._dock_board(button, None)
+        board._move.side_effect = lambda x=None, **kw: moves.append(x)
+        board._dock(GCmd(), 0, raise_z=False)
+        board._run.assert_any_call('MOTOR_RELEASE')
+        # Pre-dock, approach, then back out 10 mm and push in again before
+        # the release and the departure to approach_x.
+        self.assertEqual(moves, [278., 288., 298., 288., 298., 250.])
+
+    def test_dock_gives_up_after_configured_approaches(self):
+        board = self._dock_board(seated=False, at_mount=True)
+        board.dock_seat_attempts = 2
+        with self.assertRaisesRegex(RuntimeError, 'after 2 approaches'):
+            board._dock(GCmd(), 0, raise_z=False)
+        self.assertEqual(
+            [c for c in board._move.call_args_list
+             if c.kwargs.get('x') == 298.], [mock.call(x=298., feed=1500.)] * 2)
 
     def test_pickup_speeds_come_from_config(self):
         board = self.board

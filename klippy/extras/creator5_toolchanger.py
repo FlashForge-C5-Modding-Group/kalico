@@ -28,6 +28,8 @@ FACTORY_MEASUREMENTS = ((15.800, 215.280, 1.460),
 HOLDER_REFERENCE_X = 305.
 HOLDER_REFERENCE_Y_BASE = 80.
 HOLDER_REFERENCE_Y_PITCH = 50.
+# Dock seat switch poll interval; stock polls the buttons every 50 ms.
+DOCK_SEAT_POLL_MS = 50
 # Longest single extrude of a purge (max_extrude_only_distance is 500)
 PURGE_CHUNK_MM = 100.
 
@@ -217,6 +219,13 @@ class Creator5Toolchanger:
                                               minval=0)
         self.toolchange_sensor_settle_ms = config.getint(
             'toolchange_sensor_settle_ms', 150, minval=0)
+        # A head braking into its holder can bounce, or reach the dock and
+        # mount switches a little after the move ends. Stock polls for about
+        # a second and approaches up to three times before giving up.
+        self.dock_seat_timeout_ms = config.getint(
+            'dock_seat_timeout_ms', 1000, minval=0)
+        self.dock_seat_attempts = config.getint(
+            'dock_seat_attempts', 3, minval=1)
         self.position_calibration_timeout = config.getfloat(
             'position_calibration_timeout', 30., above=0.)
         self.position_calibration_release_wait_ms = config.getint(
@@ -1201,6 +1210,19 @@ class Creator5Toolchanger:
         extruder = self._afc_extruder(physical_name, afc)
         return afc.lanes.get(extruder.name) if extruder is not None else None
 
+    def _wait_dock_seated(self, gcmd, tool):
+        # Poll instead of a single read: the switches can settle after the
+        # move ends. Returns the last (dock, mount) switch states.
+        polls = max(1, -(-self.dock_seat_timeout_ms // DOCK_SEAT_POLL_MS))
+        for poll in range(polls + 1):
+            if poll:
+                self._pause_ms(DOCK_SEAT_POLL_MS)
+            seated = self._button(self.dock_buttons[tool], gcmd)
+            mounted = self._button(self.grab_buttons[tool], gcmd)
+            if seated and mounted:
+                break
+        return seated, mounted
+
     def _dock(self, gcmd, tool, raise_z=True):
         x, y = self.docks[tool]
         clear_feed = self.clear_travel_speed * 60.
@@ -1216,24 +1238,35 @@ class Creator5Toolchanger:
         self._run('SET_GCODE_OFFSET X=0 Y=0 MOVE=0')
         if raise_z:
             self._raise_z()
+        approach_feed = self.dock_approach_speed * 60.
         self._travel_to_lane(y, clear_feed)
         self._move(x=x - self.dock_predock_offset, feed=clear_feed)
-        self._move(x=x - 10., feed=self.dock_approach_speed * 60.)
-        self._move(x=x, feed=self.dock_approach_speed * 60.)
-        self._run('M400')
+        self._move(x=x - 10., feed=approach_feed)
         # Release only with the head seated in its holder and the carriage at
         # the mount. After lost steps the dock position is wrong, and an
         # unchecked release dropped the head; keep it locked on instead.
-        self._pause_ms(self.toolchange_sensor_settle_ms)
-        if not (self._button(self.dock_buttons[tool], gcmd)
-                and self._button(self.grab_buttons[tool], gcmd)):
+        for attempt in range(self.dock_seat_attempts):
+            if attempt:
+                # The head is still latched: back it out and approach again.
+                self._move(x=x - 10., feed=approach_feed)
+            self._move(x=x, feed=approach_feed)
+            self._run('M400')
+            self._pause_ms(self.toolchange_sensor_settle_ms)
+            seated, mounted = self._wait_dock_seated(gcmd, tool)
+            if seated and mounted:
+                break
+        else:
             try:
                 self._run('TURN_OFF_HEATERS')
             except Exception:
                 logging.exception('Creator 5 heater shutdown failed after dock check')
             raise gcmd.error(
-                'T%d is not seated in its dock; not releasing it (heaters '
-                'off). XY may have lost steps: re-home before docking' % tool)
+                'T%d is not seated in its dock (dock sensor %s, mount sensor '
+                '%s at X=%.3f Y=%.3f after %d approaches); not releasing it '
+                '(heaters off). XY may have lost steps: re-home before '
+                'docking' % (tool, 'closed' if seated else 'open',
+                             'closed' if mounted else 'open', x, y,
+                             self.dock_seat_attempts))
         self._run('MOTOR_RELEASE')
         self._pause_ms(self.release_latch_wait_ms)
         self._move(x=self.approach_x,
