@@ -221,11 +221,14 @@ class Creator5Toolchanger:
             'toolchange_sensor_settle_ms', 150, minval=0)
         # A head braking into its holder can bounce, or reach the dock and
         # mount switches a little after the move ends. Stock polls for about
-        # a second and approaches up to three times before giving up.
+        # a second and approaches up to three times before giving up; the
+        # retries go in slower so the head seats instead of bouncing.
         self.dock_seat_timeout_ms = config.getint(
             'dock_seat_timeout_ms', 1000, minval=0)
-        self.dock_seat_attempts = config.getint(
-            'dock_seat_attempts', 3, minval=1)
+        self.dock_seat_retries = config.getint(
+            'dock_seat_retries', 2, minval=0)
+        self.dock_retry_speed = config.getfloat(
+            'dock_retry_speed', 40., above=0.)
         self.position_calibration_timeout = config.getfloat(
             'position_calibration_timeout', 30., above=0.)
         self.position_calibration_release_wait_ms = config.getint(
@@ -1246,11 +1249,14 @@ class Creator5Toolchanger:
         # Release only with the head seated in its holder and the carriage at
         # the mount. After lost steps the dock position is wrong, and an
         # unchecked release dropped the head; keep it locked on instead.
-        for attempt in range(self.dock_seat_attempts):
+        approaches = self.dock_seat_retries + 1
+        for attempt in range(approaches):
+            feed = approach_feed
             if attempt:
                 # The head is still latched: back it out and approach again.
-                self._move(x=x - 10., feed=approach_feed)
-            self._move(x=x, feed=approach_feed)
+                feed = self.dock_retry_speed * 60.
+                self._move(x=x - 10., feed=feed)
+            self._move(x=x, feed=feed)
             self._run('M400')
             self._pause_ms(self.toolchange_sensor_settle_ms)
             seated, mounted, polls = self._wait_dock_seated(gcmd, tool)
@@ -1261,13 +1267,13 @@ class Creator5Toolchanger:
                     gcmd.respond_info(
                         'T%d dock seated after %d ms (approach %d of %d)' % (
                             tool, polls * DOCK_SEAT_POLL_MS, attempt + 1,
-                            self.dock_seat_attempts))
+                            approaches))
                 break
-            if attempt + 1 < self.dock_seat_attempts:
+            if attempt + 1 < approaches:
                 gcmd.respond_info(
                     'T%d not seated after approach %d of %d (dock sensor %s, '
                     'mount sensor %s); backing out to retry' % (
-                        tool, attempt + 1, self.dock_seat_attempts,
+                        tool, attempt + 1, approaches,
                         'closed' if seated else 'open',
                         'closed' if mounted else 'open'))
         else:
@@ -1281,7 +1287,7 @@ class Creator5Toolchanger:
                 '(heaters off). XY may have lost steps: re-home before '
                 'docking' % (tool, 'closed' if seated else 'open',
                              'closed' if mounted else 'open', x, y,
-                             self.dock_seat_attempts))
+                             approaches))
         self._run('MOTOR_RELEASE')
         self._pause_ms(self.release_latch_wait_ms)
         self._move(x=self.approach_x,

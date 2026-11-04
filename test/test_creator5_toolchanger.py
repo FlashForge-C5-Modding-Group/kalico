@@ -94,7 +94,8 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board.busy = False
         self.board.toolchange_sensor_settle_ms = 0
         self.board.dock_seat_timeout_ms = 1000
-        self.board.dock_seat_attempts = 3
+        self.board.dock_seat_retries = 2
+        self.board.dock_retry_speed = 40.
         self.board.pullback_slow_distance = 20.
         self.board.pickup_departure_speed = 80.
         self.board.clear_travel_speed = 600.
@@ -840,14 +841,16 @@ class Creator5OffsetTests(unittest.TestCase):
         # the release and the departure to approach_x.
         self.assertEqual(moves, [278., 288., 298., 288., 298., 250.])
 
-    def test_dock_gives_up_after_configured_approaches(self):
+    def test_dock_retries_slower_and_gives_up_after_configured_retries(self):
         board = self._dock_board(seated=False, at_mount=True)
-        board.dock_seat_attempts = 2
+        board.dock_seat_retries = 1
         with self.assertRaisesRegex(RuntimeError, 'after 2 approaches'):
             board._dock(GCmd(), 0, raise_z=False)
-        self.assertEqual(
-            [c for c in board._move.call_args_list
-             if c.kwargs.get('x') == 298.], [mock.call(x=298., feed=1500.)] * 2)
+        # The retry backs out and goes back in at dock_retry_speed.
+        self.assertEqual(board._move.call_args_list[-3:], [
+            mock.call(x=298., feed=1500.),
+            mock.call(x=288., feed=2400.),
+            mock.call(x=298., feed=2400.)])
 
     def test_pickup_speeds_come_from_config(self):
         board = self.board
