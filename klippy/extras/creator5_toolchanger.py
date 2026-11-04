@@ -1212,7 +1212,8 @@ class Creator5Toolchanger:
 
     def _wait_dock_seated(self, gcmd, tool):
         # Poll instead of a single read: the switches can settle after the
-        # move ends. Returns the last (dock, mount) switch states.
+        # move ends. Returns the last (dock, mount) switch states and how
+        # many polls it waited before them.
         polls = max(1, -(-self.dock_seat_timeout_ms // DOCK_SEAT_POLL_MS))
         for poll in range(polls + 1):
             if poll:
@@ -1221,7 +1222,7 @@ class Creator5Toolchanger:
             mounted = self._button(self.grab_buttons[tool], gcmd)
             if seated and mounted:
                 break
-        return seated, mounted
+        return seated, mounted, poll
 
     def _dock(self, gcmd, tool, raise_z=True):
         x, y = self.docks[tool]
@@ -1252,9 +1253,23 @@ class Creator5Toolchanger:
             self._move(x=x, feed=approach_feed)
             self._run('M400')
             self._pause_ms(self.toolchange_sensor_settle_ms)
-            seated, mounted = self._wait_dock_seated(gcmd, tool)
+            seated, mounted, polls = self._wait_dock_seated(gcmd, tool)
             if seated and mounted:
+                # Near misses are the evidence for a late-seating head; a
+                # first-read dock stays silent.
+                if attempt or polls:
+                    gcmd.respond_info(
+                        'T%d dock seated after %d ms (approach %d of %d)' % (
+                            tool, polls * DOCK_SEAT_POLL_MS, attempt + 1,
+                            self.dock_seat_attempts))
                 break
+            if attempt + 1 < self.dock_seat_attempts:
+                gcmd.respond_info(
+                    'T%d not seated after approach %d of %d (dock sensor %s, '
+                    'mount sensor %s); backing out to retry' % (
+                        tool, attempt + 1, self.dock_seat_attempts,
+                        'closed' if seated else 'open',
+                        'closed' if mounted else 'open'))
         else:
             try:
                 self._run('TURN_OFF_HEATERS')

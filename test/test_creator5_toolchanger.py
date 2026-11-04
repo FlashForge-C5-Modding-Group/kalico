@@ -775,9 +775,12 @@ class Creator5OffsetTests(unittest.TestCase):
 
     def test_dock_releases_only_when_seated_at_mount(self):
         board = self._dock_board(seated=True, at_mount=True)
-        board._dock(GCmd(), 0, raise_z=False)
+        gcmd = GCmd()
+        board._dock(gcmd, 0, raise_z=False)
         board._run.assert_any_call('MOTOR_RELEASE')
         board._verify.assert_called_once_with(mock.ANY, None, parked=0)
+        # A dock that passes on the first read logs nothing.
+        self.assertEqual(gcmd.messages, [])
 
     def test_dock_keeps_head_locked_when_not_seated(self):
         for seated, at_mount in ((False, True), (True, False), (False, False)):
@@ -806,8 +809,11 @@ class Creator5OffsetTests(unittest.TestCase):
                 return reads['d0'] > 5
             return name == 'g0'
         board = self._dock_board(button, None)
-        board._dock(GCmd(), 0, raise_z=False)
+        gcmd = GCmd()
+        board._dock(gcmd, 0, raise_z=False)
         board._run.assert_any_call('MOTOR_RELEASE')
+        self.assertEqual(gcmd.messages,
+                         ['T0 dock seated after 250 ms (approach 1 of 3)'])
         # One approach: no back-off and re-approach was needed.
         self.assertEqual(
             [c for c in board._move.call_args_list if c.kwargs.get('x') == 298.],
@@ -823,8 +829,13 @@ class Creator5OffsetTests(unittest.TestCase):
             return name == 'g0'
         board = self._dock_board(button, None)
         board._move.side_effect = lambda x=None, **kw: moves.append(x)
-        board._dock(GCmd(), 0, raise_z=False)
+        gcmd = GCmd()
+        board._dock(gcmd, 0, raise_z=False)
         board._run.assert_any_call('MOTOR_RELEASE')
+        self.assertEqual(gcmd.messages, [
+            'T0 not seated after approach 1 of 3 (dock sensor open, mount '
+            'sensor closed); backing out to retry',
+            'T0 dock seated after 0 ms (approach 2 of 3)'])
         # Pre-dock, approach, then back out 10 mm and push in again before
         # the release and the departure to approach_x.
         self.assertEqual(moves, [278., 288., 298., 288., 298., 250.])
