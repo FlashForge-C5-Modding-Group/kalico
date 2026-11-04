@@ -291,6 +291,10 @@ class Creator5Toolchanger:
         self.purge_line_switch = Creator5MiscSwitch(
             self.printer, self.gcode, 'purge_line',
             config.getboolean('purge_line_default', True))
+        # Every tool the print uses gets its own purge line, not only the first
+        self.purge_line_all_tools_switch = Creator5MiscSwitch(
+            self.printer, self.gcode, 'purge_line_all_tools',
+            config.getboolean('purge_line_all_tools_default', False))
         self.bed_leveling_switch = Creator5MiscSwitch(
             self.printer, self.gcode, 'bed_leveling',
             config.getboolean('bed_leveling_default', True))

@@ -86,6 +86,12 @@ def creator5_start_command(header, footer=""):
     tools = [index for index, value in enumerate(used[:4]) if value > 0]
     if tools:
         command += " USED_TOOLS=%s" % ",".join(map(str, tools))
+    # The other tools' own first-layer temperatures, for their purge lines
+    temps = creator5_slot_list(r"nozzle_temperature_initial_layer",
+                               footer, material_header)
+    for index in tools:
+        if index != tool and index < len(temps) and temps[index] > 0:
+            command += " HOTEND%d=%g" % (index, temps[index])
     idle = creator5_slot_list(r"idle_temperature", footer, material_header)
     for index, value in enumerate(idle[:4]):
         if value > 0:
