@@ -229,6 +229,12 @@ class Creator5Toolchanger:
             'dock_seat_retries', 2, minval=0)
         self.dock_retry_speed = config.getfloat(
             'dock_retry_speed', 40., above=0.)
+        # A lock that turns without catching the head leaves it in its holder
+        # when the carriage pulls back; grab it again this many times. Unlike
+        # stock, which re-approaches until the mount switch closes and then
+        # locks once, this retries the lock itself.
+        self.pickup_grab_retries = config.getint(
+            'pickup_grab_retries', 2, minval=0)
         self.position_calibration_timeout = config.getfloat(
             'position_calibration_timeout', 30., above=0.)
         self.position_calibration_release_wait_ms = config.getint(
@@ -1179,13 +1185,26 @@ class Creator5Toolchanger:
                 or self.purge_x + self.flow_sweep_x / 2. > self.purge_max_x):
             raise error('Purge/flow X path exceeds purge_max_x')
 
-    def _verify(self, gcmd, expected, parked=None):
+    def _verify(self, gcmd, expected, parked=None, grab=None):
+        # grab is (attempt, attempts) for a pickup. A missed grab (every head
+        # still docked) returns None before the last attempt so the caller
+        # can grab again, and fails with heaters off on the last one.
         try:
             self._run('M400')
             self._pause_ms(self.toolchange_sensor_settle_ms)
             dock, _, attached = self._sensor_state(gcmd)
+            # Must come first: a head neither docked nor attached fails here,
+            # so a missed grab below always means every head is docked.
             self._validate_sensor_state(gcmd, dock, attached)
             if attached != expected:
+                if grab is not None and attached is None:
+                    attempt, attempts = grab
+                    if attempt < attempts:
+                        return None
+                    raise gcmd.error(
+                        'T%d stayed in its dock after %d grab%s; heaters '
+                        'disabled' % (expected, attempts,
+                                      '' if attempts == 1 else 's'))
                 raise gcmd.error('Tool sensor verification failed; heaters disabled')
             if parked is not None and not dock[parked]:
                 raise gcmd.error('T%d was not confirmed in its dock' % parked)
@@ -1354,23 +1373,36 @@ class Creator5Toolchanger:
         if raise_z:
             self._raise_z()
         self._travel_to_lane(y, clear_feed)
-        self._move(x=self.pre_dock_x,
-                   feed=self.pickup_predock_speed * 60.)
-        self._move(x=x, feed=self.pickup_latch_speed * 60.)
-        self._run('M400')
-        if not self._button(self.grab_buttons[tool], gcmd):
-            raise gcmd.error('T%d grab sensor did not engage at mount' % tool)
-        self._run('MOTOR_GRAB')
-        slow_distance = min(self.pullback, self.pullback_slow_distance)
-        self._move(x=x - slow_distance,
-                   feed=self.pullback_speed * 60.)
-        if self.pullback > slow_distance:
-            self._move(x=x - self.pullback, feed=clear_feed)
-        self._run('MOTOR_GRAB2')
-        self._pause_ms(self.pickup_latch_wait_ms)
-        # Verify the physical sensors at the clear pullback point before
-        # activation. The final departure can flow into AFC's return move.
-        self._verify(gcmd, tool)
+        grabs = self.pickup_grab_retries + 1
+        for attempt in range(grabs):
+            if attempt:
+                # The head is still in its holder and nothing is on the
+                # carriage: open the lock (stock releases away from the dock
+                # after a failed grab too) and go back in for it.
+                gcmd.respond_info(
+                    'T%d stayed in its dock after grab %d of %d; releasing '
+                    'the lock to grab again' % (tool, attempt, grabs))
+                self._run('MOTOR_RELEASE')
+                self._pause_ms(self.release_latch_wait_ms)
+            self._move(x=self.pre_dock_x,
+                       feed=self.pickup_predock_speed * 60.)
+            self._move(x=x, feed=self.pickup_latch_speed * 60.)
+            self._run('M400')
+            if not self._button(self.grab_buttons[tool], gcmd):
+                raise gcmd.error(
+                    'T%d grab sensor did not engage at mount' % tool)
+            self._run('MOTOR_GRAB')
+            slow_distance = min(self.pullback, self.pullback_slow_distance)
+            self._move(x=x - slow_distance,
+                       feed=self.pullback_speed * 60.)
+            if self.pullback > slow_distance:
+                self._move(x=x - self.pullback, feed=clear_feed)
+            self._run('MOTOR_GRAB2')
+            self._pause_ms(self.pickup_latch_wait_ms)
+            # Verify the physical sensors at the clear pullback point before
+            # activation. The final departure can flow into AFC's return move.
+            if self._verify(gcmd, tool, grab=(attempt + 1, grabs)) is not None:
+                break
         extruder = 'extruder' if tool == 0 else 'extruder%d' % tool
         self._run('ACTIVATE_EXTRUDER EXTRUDER=%s' % extruder)
         self._restore_pressure_advance(extruder)
