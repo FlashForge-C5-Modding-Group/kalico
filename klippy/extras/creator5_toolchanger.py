@@ -28,8 +28,8 @@ FACTORY_MEASUREMENTS = ((15.800, 215.280, 1.460),
 HOLDER_REFERENCE_X = 305.
 HOLDER_REFERENCE_Y_BASE = 80.
 HOLDER_REFERENCE_Y_PITCH = 50.
-# Dock seat switch poll interval; stock polls the buttons every 50 ms.
-DOCK_SEAT_POLL_MS = 50
+# Dock and mount switch poll interval; stock polls the buttons every 50 ms.
+SWITCH_POLL_MS = 50
 # Longest single extrude of a purge (max_extrude_only_distance is 500)
 PURGE_CHUNK_MM = 100.
 
@@ -235,6 +235,11 @@ class Creator5Toolchanger:
         # locks once, this retries the lock itself.
         self.pickup_grab_retries = config.getint(
             'pickup_grab_retries', 2, minval=0)
+        # The carriage stops hard against the head; give the mount switch
+        # this long to close before the pickup gives up. Stock polls it for
+        # about a second before locking.
+        self.pickup_mount_timeout_ms = config.getint(
+            'pickup_mount_timeout_ms', 1000, minval=0)
         self.position_calibration_timeout = config.getfloat(
             'position_calibration_timeout', 30., above=0.)
         self.position_calibration_release_wait_ms = config.getint(
@@ -1232,18 +1237,24 @@ class Creator5Toolchanger:
         extruder = self._afc_extruder(physical_name, afc)
         return afc.lanes.get(extruder.name) if extruder is not None else None
 
-    def _wait_dock_seated(self, gcmd, tool):
+    def _poll_switches(self, gcmd, names, timeout_ms):
         # Poll instead of a single read: the switches can settle after the
-        # move ends. Returns the last (dock, mount) switch states and how
-        # many polls it waited before them.
-        polls = max(1, -(-self.dock_seat_timeout_ms // DOCK_SEAT_POLL_MS))
+        # move ends. Returns the last states and how many polls it waited
+        # before them.
+        polls = max(1, -(-timeout_ms // SWITCH_POLL_MS))
         for poll in range(polls + 1):
             if poll:
-                self._pause_ms(DOCK_SEAT_POLL_MS)
-            seated = self._button(self.dock_buttons[tool], gcmd)
-            mounted = self._button(self.grab_buttons[tool], gcmd)
-            if seated and mounted:
+                self._pause_ms(SWITCH_POLL_MS)
+            states = [self._button(name, gcmd) for name in names]
+            if all(states):
                 break
+        return states, poll
+
+    def _wait_dock_seated(self, gcmd, tool):
+        # Returns the last (dock, mount) switch states and the polls waited.
+        (seated, mounted), poll = self._poll_switches(
+            gcmd, [self.dock_buttons[tool], self.grab_buttons[tool]],
+            self.dock_seat_timeout_ms)
         return seated, mounted, poll
 
     def _dock(self, gcmd, tool, raise_z=True):
@@ -1285,7 +1296,7 @@ class Creator5Toolchanger:
                 if attempt or polls:
                     gcmd.respond_info(
                         'T%d dock seated after %d ms (approach %d of %d)' % (
-                            tool, polls * DOCK_SEAT_POLL_MS, attempt + 1,
+                            tool, polls * SWITCH_POLL_MS, attempt + 1,
                             approaches))
                 break
             if attempt + 1 < approaches:
@@ -1388,9 +1399,17 @@ class Creator5Toolchanger:
                        feed=self.pickup_predock_speed * 60.)
             self._move(x=x, feed=self.pickup_latch_speed * 60.)
             self._run('M400')
-            if not self._button(self.grab_buttons[tool], gcmd):
+            # Lock only once the carriage has settled on the head: stopping
+            # hard against it, the mount switch can close on first contact.
+            self._pause_ms(self.toolchange_sensor_settle_ms)
+            (mounted,), polls = self._poll_switches(
+                gcmd, [self.grab_buttons[tool]], self.pickup_mount_timeout_ms)
+            if not mounted:
                 raise gcmd.error(
                     'T%d grab sensor did not engage at mount' % tool)
+            if polls:
+                gcmd.respond_info('T%d mount sensor closed after %d ms' % (
+                    tool, polls * SWITCH_POLL_MS))
             self._run('MOTOR_GRAB')
             slow_distance = min(self.pullback, self.pullback_slow_distance)
             self._move(x=x - slow_distance,
