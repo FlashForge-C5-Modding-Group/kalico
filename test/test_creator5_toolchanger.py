@@ -96,6 +96,7 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board.dock_seat_timeout_ms = 1000
         self.board.dock_seat_retries = 2
         self.board.dock_retry_speed = 40.
+        self.board.pickup_grab_retries = 2
         self.board.pullback_slow_distance = 20.
         self.board.pickup_departure_speed = 80.
         self.board.clear_travel_speed = 600.
@@ -911,7 +912,7 @@ class Creator5OffsetTests(unittest.TestCase):
             mock.call(x=278., feed=4800.),
             mock.call(x=238., feed=36000.),
             mock.call(x=250., feed=36000.)])
-        board._verify.assert_called_once_with(mock.ANY, 0)
+        board._verify.assert_called_once_with(mock.ANY, 0, missed_grab_ok=True)
         self.assertEqual(activation_move_counts, [6])
         board._apply_offsets.assert_called_once_with(0)
         self.assertEqual(board._run.call_args_list[-1],
@@ -940,6 +941,69 @@ class Creator5OffsetTests(unittest.TestCase):
         self.assertEqual(board._move.call_count, 6)
         self.assertFalse(any('ACTIVATE_EXTRUDER' in call.args[0]
                              for call in board._run.call_args_list))
+
+    def _grab_board(self, readings):
+        # Real _verify over scripted (dock, grab) switch readings, one per
+        # verification; picking up T1.
+        board = self.board
+        board.approach_x, board.pre_dock_x = 250., 280.
+        board.pullback, board.pullback_slow_distance = 60., 20.
+        board.pickup_predock_speed = board.pickup_latch_speed = 60.
+        board.pullback_speed = 80.
+        board.pickup_latch_wait_ms = board.release_latch_wait_ms = 0
+        board._button = mock.Mock(return_value=True)
+        board._raise_z = mock.Mock()
+        board._travel_to_lane = mock.Mock()
+        board._move = mock.Mock()
+        board._pause_ms = mock.Mock()
+        board._apply_offsets = mock.Mock()
+        board._apply_print_z = mock.Mock()
+        board.active = None
+        states = []
+        for dock, grab in readings:
+            attached = [i for i in range(4) if grab[i] and not dock[i]]
+            states.append((dock, grab, attached[0] if attached else None))
+        board._sensor_state = mock.Mock(side_effect=states)
+        commands = []
+        board._run = commands.append
+        return board, commands
+
+    ALL_DOCKED = ([True] * 4, [False] * 4)
+    T1_ATTACHED = ([True, False, True, True], [False, True, False, False])
+
+    def test_pickup_grabs_again_when_head_stays_in_dock(self):
+        board, commands = self._grab_board([self.ALL_DOCKED, self.T1_ATTACHED])
+        gcmd = GCmd()
+        board._pickup(gcmd, 1)
+        latch = [c for c in commands if c.startswith(('MOTOR_', 'ACTIVATE_'))]
+        self.assertEqual(latch, [
+            'MOTOR_GRAB', 'MOTOR_GRAB2', 'MOTOR_RELEASE',
+            'MOTOR_GRAB', 'MOTOR_GRAB2', 'ACTIVATE_EXTRUDER EXTRUDER=extruder1'])
+        self.assertNotIn('TURN_OFF_HEATERS', commands)
+        self.assertEqual(board.active, 1)
+        self.assertEqual(gcmd.messages, [
+            'T1 stayed in its dock after grab 1 of 3; releasing the lock to '
+            'grab again'])
+
+    def test_pickup_fails_closed_after_every_grab_misses(self):
+        board, commands = self._grab_board([self.ALL_DOCKED] * 3)
+        with self.assertRaisesRegex(RuntimeError, 'Tool sensor verification failed'):
+            board._pickup(GCmd(), 1)
+        self.assertEqual(commands.count('MOTOR_GRAB'), 3)
+        self.assertEqual(commands.count('MOTOR_RELEASE'), 2)
+        self.assertIn('TURN_OFF_HEATERS', commands)
+        self.assertFalse(any(c.startswith('ACTIVATE_EXTRUDER') for c in commands))
+
+    def test_pickup_never_retries_when_another_head_reads_attached(self):
+        # Only "every head docked" is safe to grab again; T2 on the carriage
+        # while picking T1 is not.
+        wrong = ([True, True, False, True], [False, False, True, False])
+        board, commands = self._grab_board([wrong])
+        with self.assertRaisesRegex(RuntimeError, 'Tool sensor verification failed'):
+            board._pickup(GCmd(), 1)
+        self.assertEqual(commands.count('MOTOR_GRAB'), 1)
+        self.assertNotIn('MOTOR_RELEASE', commands)
+        self.assertIn('TURN_OFF_HEATERS', commands)
 
     def test_select_sets_part_accel_only_after_success(self):
         board = self.board
