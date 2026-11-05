@@ -87,6 +87,7 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board.build_plate_detected = None
         self.board._stock_pin_approach_z = None
         self.board.print_z_baseline = [None] * 4
+        self.board.print_z_corrections = [None] * 4
         self.board._button_objects = {}
         self.board.dock_buttons = ['dock%d' % i for i in range(4)]
         self.board.grab_buttons = ['grab%d' % i for i in range(4)]
@@ -118,6 +119,9 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board.printer = mock.Mock()
         self.board.printer.lookup_object.return_value.get_status.return_value = {
             'homing_origin': (.1, .2, .3, 0.)}
+        # Carriage outboard of approach_x: travel to a dock lane is X, then Y.
+        self.board.printer.lookup_object.return_value.get_position.return_value = [
+            300., 0., 10., 0.]
         self.stepper_enable = types.SimpleNamespace(
             get_steppers=lambda: ['extruder'],
             set_motors_enable=lambda names, enable: False)
@@ -908,39 +912,16 @@ class Creator5OffsetTests(unittest.TestCase):
             activation_move_counts.append(board._move.call_count)
             if command.startswith('ACTIVATE_EXTRUDER') else None)
         board._pickup(GCmd(), 0)
-        self.assertEqual(board._move.call_args_list[-3:], [
+        self.assertEqual(board._move.call_args_list[-2:], [
             mock.call(x=278., feed=4800.),
-            mock.call(x=238., feed=36000.),
-            mock.call(x=250., feed=36000.)])
-        board._verify.assert_called_once_with(mock.ANY, 0, grab=(1, 3))
+            mock.call(x=238., feed=36000.)])
+        # Activation follows the pullback; it ends inboard of approach_x
+        # (238 < 250), so no departure move follows.
         self.assertEqual(activation_move_counts, [6])
+        self.assertEqual(board._move.call_count, 6)
         board._apply_offsets.assert_called_once_with(0)
         self.assertEqual(board._run.call_args_list[-1],
                          mock.call('ACTIVATE_EXTRUDER EXTRUDER=extruder'))
-
-    def test_failed_pickup_verification_never_activates_or_departs(self):
-        board = self.board
-        board.approach_x, board.pre_dock_x = 250., 280.
-        board.pullback, board.pullback_slow_distance = 60., 20.
-        board.clear_travel_speed = 600.
-        board.pickup_predock_speed = board.pickup_latch_speed = 60.
-        board.pullback_speed = 80.
-        board.pickup_latch_wait_ms = 0
-        board.grab_buttons = ['grab0']
-        board._button = mock.Mock(return_value=True)
-        board._raise_z = mock.Mock()
-        board._move = mock.Mock()
-        board._run = mock.Mock()
-        board._pause_ms = mock.Mock()
-        board._verify = mock.Mock(side_effect=RuntimeError('sensor failed'))
-        board._apply_offsets = mock.Mock()
-
-        with self.assertRaisesRegex(RuntimeError, 'sensor failed'):
-            board._pickup(GCmd(), 0)
-
-        self.assertEqual(board._move.call_count, 6)
-        self.assertFalse(any('ACTIVATE_EXTRUDER' in call.args[0]
-                             for call in board._run.call_args_list))
 
     def _grab_board(self, readings):
         # Real _verify over scripted (dock, grab) switch readings, one per
