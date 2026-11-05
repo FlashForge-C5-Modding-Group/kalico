@@ -912,7 +912,7 @@ class Creator5OffsetTests(unittest.TestCase):
             mock.call(x=278., feed=4800.),
             mock.call(x=238., feed=36000.),
             mock.call(x=250., feed=36000.)])
-        board._verify.assert_called_once_with(mock.ANY, 0, missed_grab_ok=True)
+        board._verify.assert_called_once_with(mock.ANY, 0, grab=(1, 3))
         self.assertEqual(activation_move_counts, [6])
         board._apply_offsets.assert_called_once_with(0)
         self.assertEqual(board._run.call_args_list[-1],
@@ -984,10 +984,15 @@ class Creator5OffsetTests(unittest.TestCase):
         self.assertEqual(gcmd.messages, [
             'T1 stayed in its dock after grab 1 of 3; releasing the lock to '
             'grab again'])
+        # Every grab goes back in to the mount before it locks.
+        approach = [mock.call(x=280., feed=3600.), mock.call(x=298., feed=3600.),
+                    mock.call(x=278., feed=4800.), mock.call(x=238., feed=36000.)]
+        self.assertEqual(board._move.call_args_list, approach * 2)
 
     def test_pickup_fails_closed_after_every_grab_misses(self):
         board, commands = self._grab_board([self.ALL_DOCKED] * 3)
-        with self.assertRaisesRegex(RuntimeError, 'Tool sensor verification failed'):
+        with self.assertRaisesRegex(
+                RuntimeError, 'T1 stayed in its dock after 3 grabs; heaters disabled'):
             board._pickup(GCmd(), 1)
         self.assertEqual(commands.count('MOTOR_GRAB'), 3)
         self.assertEqual(commands.count('MOTOR_RELEASE'), 2)
@@ -1000,6 +1005,17 @@ class Creator5OffsetTests(unittest.TestCase):
         wrong = ([True, True, False, True], [False, False, True, False])
         board, commands = self._grab_board([wrong])
         with self.assertRaisesRegex(RuntimeError, 'Tool sensor verification failed'):
+            board._pickup(GCmd(), 1)
+        self.assertEqual(commands.count('MOTOR_GRAB'), 1)
+        self.assertNotIn('MOTOR_RELEASE', commands)
+        self.assertIn('TURN_OFF_HEATERS', commands)
+
+    def test_pickup_never_retries_when_target_is_neither_docked_nor_attached(self):
+        # A head out of its holder and not on the carriage may be loose or
+        # dropped: fail closed, never open the lock and go back in.
+        loose = ([True, False, True, True], [False] * 4)
+        board, commands = self._grab_board([loose])
+        with self.assertRaisesRegex(RuntimeError, 'Missing dock confirmation for T1'):
             board._pickup(GCmd(), 1)
         self.assertEqual(commands.count('MOTOR_GRAB'), 1)
         self.assertNotIn('MOTOR_RELEASE', commands)

@@ -230,7 +230,9 @@ class Creator5Toolchanger:
         self.dock_retry_speed = config.getfloat(
             'dock_retry_speed', 40., above=0.)
         # A lock that turns without catching the head leaves it in its holder
-        # when the carriage pulls back. Stock grabs up to three times.
+        # when the carriage pulls back; grab it again this many times. Unlike
+        # stock, which re-approaches until the mount switch closes and then
+        # locks once, this retries the lock itself.
         self.pickup_grab_retries = config.getint(
             'pickup_grab_retries', 2, minval=0)
         self.position_calibration_timeout = config.getfloat(
@@ -1183,19 +1185,26 @@ class Creator5Toolchanger:
                 or self.purge_x + self.flow_sweep_x / 2. > self.purge_max_x):
             raise error('Purge/flow X path exceeds purge_max_x')
 
-    def _verify(self, gcmd, expected, parked=None, missed_grab_ok=False):
-        # With missed_grab_ok, a pickup that left every head in its dock
-        # returns None instead of failing, so the caller can grab again.
+    def _verify(self, gcmd, expected, parked=None, grab=None):
+        # grab is (attempt, attempts) for a pickup. A missed grab (every head
+        # still docked) returns None before the last attempt so the caller
+        # can grab again, and fails with heaters off on the last one.
         try:
             self._run('M400')
             self._pause_ms(self.toolchange_sensor_settle_ms)
             dock, _, attached = self._sensor_state(gcmd)
+            # Must come first: a head neither docked nor attached fails here,
+            # so a missed grab below always means every head is docked.
             self._validate_sensor_state(gcmd, dock, attached)
             if attached != expected:
-                # Validation passed with nothing attached, so every head
-                # reads docked: the carriage left without the head.
-                if missed_grab_ok and attached is None:
-                    return None
+                if grab is not None and attached is None:
+                    attempt, attempts = grab
+                    if attempt < attempts:
+                        return None
+                    raise gcmd.error(
+                        'T%d stayed in its dock after %d grab%s; heaters '
+                        'disabled' % (expected, attempts,
+                                      '' if attempts == 1 else 's'))
                 raise gcmd.error('Tool sensor verification failed; heaters disabled')
             if parked is not None and not dock[parked]:
                 raise gcmd.error('T%d was not confirmed in its dock' % parked)
@@ -1392,8 +1401,7 @@ class Creator5Toolchanger:
             self._pause_ms(self.pickup_latch_wait_ms)
             # Verify the physical sensors at the clear pullback point before
             # activation. The final departure can flow into AFC's return move.
-            if self._verify(gcmd, tool,
-                            missed_grab_ok=attempt + 1 < grabs) is not None:
+            if self._verify(gcmd, tool, grab=(attempt + 1, grabs)) is not None:
                 break
         extruder = 'extruder' if tool == 0 else 'extruder%d' % tool
         self._run('ACTIVATE_EXTRUDER EXTRUDER=%s' % extruder)
