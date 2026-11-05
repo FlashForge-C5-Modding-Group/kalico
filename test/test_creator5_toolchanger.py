@@ -98,6 +98,7 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board.dock_seat_retries = 2
         self.board.dock_retry_speed = 40.
         self.board.pickup_grab_retries = 2
+        self.board.pickup_mount_timeout_ms = 1000
         self.board.pullback_slow_distance = 20.
         self.board.pickup_departure_speed = 80.
         self.board.clear_travel_speed = 600.
@@ -888,7 +889,7 @@ class Creator5OffsetTests(unittest.TestCase):
             mock.call(x=278., feed=4200.),
             mock.call(x=250., feed=5400.),
         ])
-        board._pause_ms.assert_called_once_with(1800)
+        board._pause_ms.assert_any_call(1800)
 
     def test_pickup_uses_fast_travel_only_after_latch_clearance(self):
         board = self.board
@@ -1001,6 +1002,40 @@ class Creator5OffsetTests(unittest.TestCase):
         self.assertEqual(commands.count('MOTOR_GRAB'), 1)
         self.assertNotIn('MOTOR_RELEASE', commands)
         self.assertIn('TURN_OFF_HEATERS', commands)
+
+    def _mount_board(self, mount_reads):
+        # Picking up T1; records settle pauses and mount switch reads in order.
+        board, commands = self._grab_board([self.T1_ATTACHED])
+        board.toolchange_sensor_settle_ms = 50
+        events = []
+        reads = iter(mount_reads)
+        board._pause_ms = lambda ms: events.append(('pause', ms))
+        def read(name, gcmd):
+            value = next(reads)
+            events.append((name, value))
+            return value
+        board._button = read
+        return board, commands, events
+
+    def test_pickup_locks_only_after_mount_settles_and_closes(self):
+        board, commands, events = self._mount_board([False, False, True])
+        gcmd = GCmd()
+        board._pickup(gcmd, 1)
+        self.assertEqual(events[:6], [
+            ('pause', 50), ('grab1', False), ('pause', 50), ('grab1', False),
+            ('pause', 50), ('grab1', True)])
+        self.assertIn('MOTOR_GRAB', commands)
+        self.assertEqual(board.active, 1)
+        self.assertEqual(gcmd.messages, ['T1 mount sensor closed after 100 ms'])
+
+    def test_pickup_never_locks_when_mount_sensor_stays_open(self):
+        board, commands, events = self._mount_board([False] * 3)
+        board.pickup_mount_timeout_ms = 100
+        with self.assertRaisesRegex(RuntimeError, 'T1 grab sensor did not engage'):
+            board._pickup(GCmd(), 1)
+        self.assertEqual([e for e in events if e[0] == 'grab1'],
+                         [('grab1', False)] * 3)
+        self.assertNotIn('MOTOR_GRAB', commands)
 
     def test_select_sets_part_accel_only_after_success(self):
         board = self.board
