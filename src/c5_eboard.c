@@ -17,6 +17,9 @@
 #define C5_STABILITY_TIME_US 2000000
 #define C5_LARGE_DELTA 150
 #define C5_PA_SAMPLE_COUNT 2000
+// Every SG_RESULT reading of a capture, with its clock, for the host.
+#define C5_PA_STREAM_COUNT 6000
+#define C5_PA_STREAM_CHUNK 8
 
 struct c5_detector {
     struct timer calibration_timer;
@@ -49,6 +52,12 @@ static struct c5_detector eboard = {
     .effective_threshold = -20,
 };
 static struct c5_pa_state pa;
+static struct {
+    uint32_t start_clock;
+    volatile uint16_t count;
+    uint16_t value[C5_PA_STREAM_COUNT];
+    uint32_t clock[C5_PA_STREAM_COUNT];
+} pa_stream;
 static struct task_wake classifier_wake;
 
 static uint32_t
@@ -443,10 +452,17 @@ c5_eboard_pa_receive(volatile uint8_t *frame, uint16_t remaining)
             if (frame[i] != prefix[i])
                 break;
         if (i == sizeof(prefix) && c5_tmc_crc8(&frame[4], 7) == frame[11]) {
+            uint16_t value = ((uint16_t)frame[9] << 8) | frame[10];
             uint16_t index = pa.index;
-            pa.samples[index] = ((uint16_t)frame[9] << 8) | frame[10];
+            pa.samples[index] = value;
             index++;
             pa.index = index > 1989 ? 1990 : index;
+            uint16_t count = pa_stream.count;
+            if (count < C5_PA_STREAM_COUNT) {
+                pa_stream.value[count] = value;
+                pa_stream.clock[count] = timer_read_time();
+                pa_stream.count = count + 1;
+            }
         }
     }
     for (i = 0; i < 15; i++)
@@ -560,6 +576,8 @@ command_pa_action(uint32_t *args)
         pa.index = 0;
         for (uint_fast16_t i = 0; i < sizeof(pa.samples); i++)
             ((volatile uint8_t *)pa.samples)[i] = 0;
+        pa_stream.count = 0;
+        pa_stream.start_clock = timer_read_time();
         pa.state = C5_PA_ACQUIRING;
         c5_eboard_set_pa_mode(1);
     } else {
@@ -581,5 +599,29 @@ command_get_emcu_pa_value(uint32_t *args)
     sendf("pa_value value=%u", pa.verdict);
 }
 DECL_COMMAND(command_get_emcu_pa_value, "get_emcu_pa_value");
+
+// Read back C5_PA_STREAM_CHUNK readings of the last capture from INDEX:
+// each is SG_RESULT (u16) and its clock (u32), little endian.
+void
+command_get_pa_stream(uint32_t *args)
+{
+    uint16_t index = args[0], count = pa_stream.count, n = 0;
+    uint8_t data[C5_PA_STREAM_CHUNK * 6];
+    while (n < C5_PA_STREAM_CHUNK && index + n < count) {
+        uint16_t value = pa_stream.value[index + n];
+        uint32_t clock = pa_stream.clock[index + n];
+        uint8_t *d = &data[n * 6];
+        d[0] = value;
+        d[1] = value >> 8;
+        d[2] = clock;
+        d[3] = clock >> 8;
+        d[4] = clock >> 16;
+        d[5] = clock >> 24;
+        n++;
+    }
+    sendf("pa_stream index=%hu total=%hu start=%u data=%*s", index, count,
+          pa_stream.start_clock, n * 6, data);
+}
+DECL_COMMAND(command_get_pa_stream, "get_pa_stream index=%hu");
 
 DECL_CONSTANT("ADC_MAX", 4095);

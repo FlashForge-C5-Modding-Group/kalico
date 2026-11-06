@@ -123,6 +123,7 @@ class Creator5OffsetTests(unittest.TestCase):
         # Carriage outboard of approach_x: travel to a dock lane is X, then Y.
         self.board.printer.lookup_object.return_value.get_position.return_value = [
             300., 0., 10., 0.]
+        self.board.pickup_minimum_cruise_ratio = None
         self.stepper_enable = types.SimpleNamespace(
             get_steppers=lambda: ['extruder'],
             set_motors_enable=lambda names, enable: False)
@@ -161,6 +162,8 @@ class Creator5OffsetTests(unittest.TestCase):
                 objects = {
                     'AFC': afc,
                     'AFC_extruder ' + alias: extruder,
+                    'toolhead': types.SimpleNamespace(
+                        get_position=lambda: [300., 0., 10., 0.]),
                     'gcode_move': types.SimpleNamespace(
                         get_status=lambda: {'homing_origin': (0., 0., 2., 0.)})}
                 self.board.printer.lookup_object.side_effect = (
@@ -552,6 +555,58 @@ class Creator5OffsetTests(unittest.TestCase):
         self.assertEqual(switch.get_status(0.), {'value': 0.})
         switch.cmd_set(GCmd(VALUE=1))
         self.assertEqual(switch.get_status(0.), {'value': 1.})
+
+    def test_host_pressure_advance_switch_starts_disabled(self):
+        printer, gcode = mock.Mock(), mock.Mock()
+        switch = MODULE.Creator5MiscSwitch(
+            printer, gcode, 'host_pressure_advance', False)
+        printer.add_object.assert_called_once_with(
+            'output_pin host_pressure_advance', switch)
+        self.assertEqual(switch.saved_key, 'c5_host_pressure_advance')
+        self.assertEqual(switch.get_status(0.), {'value': 0.})
+
+    def _host_flow_board(self):
+        board = self.board
+        tmc = mock.Mock()
+        tmc.get_status.return_value = {'run_current': .7}
+        tmc.mcu_tmc.get_fields.return_value.get_field.return_value = 4
+        extruder = mock.Mock()
+        extruder.extruder_stepper.stepper.get_step_dist.return_value = .001
+        board.printer.lookup_object.side_effect = (
+            lambda name, *default: tmc if name.startswith('tmc2209')
+            else extruder)
+        board._run = mock.Mock()
+        board._flow_capture = mock.Mock(return_value=[])
+        board._flow_write_csv = mock.Mock()
+        return board
+
+    def _host_flow(self, board, gcmd, current):
+        spec = importlib.util.spec_from_file_location(
+            'klippy.extras.c5_pa_analysis', EXTRAS_DIR / 'c5_pa_analysis.py')
+        analysis = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(analysis)
+        with mock.patch.dict(sys.modules, {
+                'klippy': types.ModuleType('klippy'),
+                'klippy.extras': extras_package,
+                'klippy.extras.c5_pa_analysis': analysis}), \
+                mock.patch.object(MODULE, '__package__', 'klippy.extras'):
+            board._flow_host(gcmd, 1, 'extruder1', 'eboard', (0., .05, .1),
+                             1, 10.4, 1., .25, 6, (.4, .5, .4), 600., 9,
+                             24, current)
+
+    def test_host_flow_lowers_current_and_restores_it(self):
+        board = self._host_flow_board()
+        gcmd = GCmd()
+        self._host_flow(board, gcmd, .8)     # no strokes: the fit fails
+        self.assertEqual(board._run.call_args_list, [
+            mock.call('SET_TMC_CURRENT STEPPER=extruder1 CURRENT=0.560'),
+            mock.call('SET_TMC_CURRENT STEPPER=extruder1 CURRENT=0.700')])
+        self.assertIn('host flow test failed', gcmd.messages[-1])
+
+    def test_host_flow_keeps_current_by_default(self):
+        board = self._host_flow_board()
+        self._host_flow(board, GCmd(), 1.)
+        board._run.assert_not_called()
 
     def test_misc_switch_restores_and_saves_fluidd_changes(self):
         printer, gcode = mock.Mock(), mock.Mock()
@@ -1718,7 +1773,8 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board.printer.lookup_objects.return_value = []
         command = GCmd()
         self.board.cmd_flow_strokes(command)
-        self.assertEqual(pa.pa_get_value.call_count, 35)
+        # Three failed passes of ten values: three of five can't succeed.
+        self.assertEqual(pa.pa_get_value.call_count, 30)
         self.board._run.assert_any_call(
             'SET_PRESSURE_ADVANCE EXTRUDER=extruder ADVANCE=0.02000')
         self.assertIn('pressure advance unchanged', command.message)
@@ -2132,9 +2188,9 @@ class Creator5OffsetTests(unittest.TestCase):
                                                    SAVE=0))
         self.assertEqual(self.board._probe_stock_pin.call_count, 2)
         self.assertEqual(self.board._probe_stock_pin.call_args_list[0].args[1:],
-                         (43., 226.))
+                         (43., 226., 3))
         self.assertEqual(self.board._probe_stock_pin.call_args_list[1].args[1:],
-                         (28.5, 214.5))
+                         (28.5, 214.5, 3))
         self.assertEqual(self.board._run.call_args_list[0].args[0],
                          'C5_LEVELBOARD_REFERENCE_CALIBRATE SAVE=0 '
                          'BUILDPLATE_REMOVED=1')

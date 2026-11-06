@@ -308,6 +308,9 @@ class Creator5Toolchanger:
         self.flow_switch = Creator5FlowSwitch(
             self.printer, self.gcode,
             config.getboolean('flow_calibration_default', True))
+        self.host_pa_switch = Creator5MiscSwitch(
+            self.printer, self.gcode, 'host_pressure_advance',
+            config.getboolean('host_pressure_advance_default', False))
         self.purge_switch = Creator5MiscSwitch(
             self.printer, self.gcode, 'purge',
             config.getboolean('purge_default', True))
@@ -1641,6 +1644,8 @@ class Creator5Toolchanger:
         afc.position_saved = position_saved
         lane._perform_creator5_infinite_runout(replacement, target_temp=temp)
         if afc.error_state:
+            # Still paused: offer the other tools or a reload again.
+            self._run('_OC_RUNOUT_PROMPT')
             return
         # PAUSE marked the print paused; the switch resumed it directly.
         self.printer.lookup_object('pause_resume').is_paused = False
@@ -2726,8 +2731,54 @@ class Creator5Toolchanger:
         gcmd.respond_info('Starting T%d flow calibration strokes'
                           % attached)
         old_pa = heater_status.get('pressure_advance', 0.)
-        candidates = (.0100, .0200, .0150, .0350, .0250, .0300, .0400)
-        minimum_candidate = min(candidates)
+        # Stock tries .010 .020 .015 .035 .025 .030 .040 and keeps each pass's
+        # smallest accepted value; ascending order finds the same value and
+        # can stop there.  The values above .040 are only reached when none
+        # of the stock ones is accepted.
+        candidates = (.0100, .0150, .0200, .0250, .0300, .0350, .0400,
+                      .0450, .0500, .0600)
+        # DEBUG=1 leaves the eboard out and logs a sensor trace to a CSV.
+        # METHOD=host also scores that trace here instead of asking the
+        # eboard (see c5_pa_analysis).
+        debug = gcmd.get_int('DEBUG', 0, minval=0, maxval=1)
+        method = gcmd.get('METHOD', 'eboard').lower()
+        if method not in ('eboard', 'host'):
+            raise gcmd.error('METHOD must be eboard or host')
+        host = method == 'host'
+        if debug or host:
+            # The tested advances bracket the answer; it is interpolated,
+            # not picked from them.
+            candidates = tuple(float(v) for v in gcmd.get(
+                'ADVANCES', '0,0.05,0.10' if host else '0,0.01,0.04'
+            ).split(','))
+            repeats = gcmd.get_int('REPEATS', 1, minval=1, maxval=5)
+            refine = gcmd.get_int('REFINE', 1, minval=0, maxval=1)
+            host_max_runs = gcmd.get_int('MAX_RUNS', 9, minval=3, maxval=20)
+            # A filament whose pressure settles fast (PLA) moves the load
+            # reading very little; it needs many more strokes
+            host_weak_runs = gcmd.get_int('WEAK_RUNS', 24, minval=0,
+                                          maxval=40)
+            apply_result = gcmd.get_int('APPLY', 0, minval=0, maxval=1)
+            host_fast = gcmd.get_float('FAST', 10.4, above=1., maxval=25.)
+            host_ratio = gcmd.get_float('RATIO', .25, above=.01, maxval=.5)
+            host_strokes = gcmd.get_int('STROKES', 6, minval=2, maxval=16)
+            host_slow = gcmd.get_float('SLOW', 1., above=0., below=host_fast)
+            # Extruder run current during the strokes, as a fraction of the
+            # configured one; lower makes the load reading respond more to
+            # nozzle pressure
+            host_current = gcmd.get_float('CURRENT', 1., minval=.3,
+                                          maxval=1.)
+            host_times = (gcmd.get_float('LEAD', .4, minval=.2, maxval=2.),
+                          gcmd.get_float('FAST_TIME', .5, minval=.35,
+                                         maxval=2.),
+                          gcmd.get_float('SLOW_TIME', .4, minval=.2,
+                                         maxval=2.))
+            sensors = ('eboard', 'sg') + (() if host else ('eddy', 'both'))
+            sensor = gcmd.get('SENSOR', 'eboard' if pa.has_stream()
+                              else 'sg').lower()
+            if sensor not in sensors:
+                raise gcmd.error('SENSOR must be one of %s'
+                                 % ', '.join(sensors))
         # The eboard classifies the *motor-current waveform*, not a bead on
         # the plate.  Klipper only applies pressure advance to moves with
         # XY motion, so like the stock firmware the strokes are XY moves,
@@ -2746,6 +2797,7 @@ class Creator5Toolchanger:
             calibrated = False
             paused = []
             locked = None
+            senddelay_set = False
             try:
                 self._run('G90')
                 self._run('M83')
@@ -2755,9 +2807,33 @@ class Creator5Toolchanger:
                 self._run('M400')
                 self._enable_extruder_driver(extruder)
                 paused = self._pause_extruder_tmc_checks()
+                # The eboard takes a reply that pauses after the request echo
+                # as two frames and drops both; Klippy's senddelay=2 does that.
+                self._run('SET_TMC_FIELD STEPPER=%s FIELD=senddelay VALUE=0'
+                          % extruder)
+                senddelay_set = True
                 locked = self._lock_xy()
                 self._run('SET_VELOCITY_LIMIT ACCEL=%.0f '
                           'SQUARE_CORNER_VELOCITY=9' % self.flow_test_accel)
+                if host:
+                    self._flow_host(gcmd, attached, extruder, sensor,
+                                    candidates * repeats, refine,
+                                    host_fast, host_slow, host_ratio,
+                                    host_strokes, host_times, fast_feed,
+                                    host_max_runs, host_weak_runs,
+                                    host_current)
+                    calibrated = apply_result and self._flow_host_apply(
+                        gcmd, attached, extruder)
+                    return
+                if debug:
+                    runs = self._flow_capture(
+                        gcmd, extruder, candidates * repeats, segments,
+                        fast_feed, sensor)
+                    path = '/tmp/c5_flow_T%d.csv' % attached
+                    self._flow_write_csv(runs, path)
+                    gcmd.respond_info('T%d flow trace: %d runs written to %s'
+                                      % (attached, len(runs), path))
+                    return
                 for repeat in range(5):
                     successful = []
                     for index, advance in enumerate(candidates):
@@ -2782,13 +2858,12 @@ class Creator5Toolchanger:
                             gcmd.respond_info(
                                 'T%d flow valid: PA %.4f (pass %d)'
                                 % (attached, advance, repeat + 1))
-                            # The remaining candidates cannot improve this
-                            # pass once the lowest PA has been accepted.
-                            if advance == minimum_candidate:
-                                break
+                            break
                     if successful:
                         picks.append(min(successful))
-                    if len(picks) >= 3:
+                    # Three of the five passes must succeed; stop once that
+                    # can no longer happen.
+                    if len(picks) >= 3 or len(picks) + 4 - repeat < 3:
                         break
                 if len(picks) >= 3:
                     result = sum(picks[:3]) / 3.
@@ -2814,9 +2889,212 @@ class Creator5Toolchanger:
                         self._run('RESTORE_GCODE_STATE NAME=C5_FLOW_TEST '
                                   'MOVE=0')
                     finally:
+                        if senddelay_set:
+                            self._run('SET_TMC_FIELD STEPPER=%s '
+                                      'FIELD=senddelay VALUE=2' % extruder)
                         self._resume_tmc_checks(paused)
 
         self._with_motion(gcmd, measure)
+
+    def _flow_capture(self, gcmd, extruder, candidates, segments, fast_feed,
+                      sensor):
+        """Run the strokes once per candidate while recording SENSOR.
+
+        Returns [(advance, rows, grid)].  Each row is (t, e, sg, eddy,
+        reserve, v, a) with unread sensors -1; grid is the commanded motor
+        velocity every 2 ms as [(t, v)].  Times are relative to the strokes'
+        start.  SENSOR=eboard has the eboard record every SG_RESULT with its
+        own clock (and keeps Klippy off the driver's UART meanwhile).
+        """
+        reactor = self.printer.get_reactor()
+        toolhead = self.printer.lookup_object('toolhead')
+        mcu = self.printer.lookup_object('mcu')
+        mcu_tmc = self.printer.lookup_object('tmc2209 ' + extruder).mcu_tmc
+        extruder_obj = self.printer.lookup_object(extruder)
+        eddy = self.printer.lookup_object('ff_eddy eboard', None)
+        pa = self.printer.lookup_object('pa_adjust', None)
+        if sensor in ('eddy', 'both') and eddy is None:
+            raise gcmd.error('SENSOR=%s needs [ff_eddy eboard]' % sensor)
+        if sensor == 'eboard' and (pa is None or not pa.has_stream()):
+            raise gcmd.error('SENSOR=eboard needs the OpenCreator eboard '
+                             'firmware')
+        state = {'active': False}
+
+        def sample(eventtime):
+            while state['active']:
+                sg = value = reserve = -1
+                try:
+                    if sensor in ('sg', 'both'):
+                        sg = mcu_tmc.get_register('SG_RESULT') & 0x3ff
+                    if sensor in ('eddy', 'both'):
+                        # Returns the previous reading, then re-baselines.
+                        result = eddy.get_basic_param_cmd.send([0])
+                        value, reserve = result['value'], result['reserve']
+                except Exception:
+                    pass
+                now = reactor.monotonic()
+                state['rows'].append((mcu.estimated_print_time(now),
+                                      sg, value, reserve))
+                reactor.pause(now + .002)
+
+        pos = extruder_obj.find_past_position
+
+        def velocity(print_time):
+            # Positions are whole steps; difference over wide enough spans
+            # that step noise stays well under the edges' size.
+            return (pos(print_time + .01) - pos(print_time - .01)) / .02
+
+        runs = []
+        for index, advance in enumerate(candidates):
+            self._run('SET_PRESSURE_ADVANCE EXTRUDER=%s ADVANCE=%.4f'
+                      % (extruder, advance))
+            self._run('G1 X40 Y%.1f F%.0f' % (50. + 5. * (index % 7),
+                                              fast_feed))
+            start = toolhead.get_last_move_time()
+            state['rows'] = []
+            if sensor == 'eboard':
+                pa.pa_action(11, 666)
+            else:
+                state['active'] = True
+                reactor.register_callback(sample)
+            try:
+                for x, feed, amount in segments:
+                    self._run('G1 X%.1f E%.5f F%.0f' % (x, amount, feed))
+                self._run('M400')
+                self._pause_ms(300)
+            finally:
+                state['active'] = False
+                if sensor == 'eboard':
+                    pa.pa_action(0, 666)
+                self._pause_ms(50)
+            end = toolhead.get_last_move_time()
+            if sensor == 'eboard':
+                state['rows'] = [(print_time, sg, -1, -1)
+                                 for print_time, sg in pa.read_stream()]
+            rows = []
+            for print_time, sg, value, reserve in state['rows']:
+                v0 = (pos(print_time) - pos(print_time - .02)) / .02
+                v1 = (pos(print_time + .02) - pos(print_time)) / .02
+                rows.append((print_time - start, pos(print_time), sg, value,
+                             reserve, velocity(print_time), (v1 - v0) / .02))
+            grid = [(t, velocity(start + t))
+                    for t in (i * .002 - .3
+                              for i in range(int((end - start + .3) / .002)))]
+            runs.append((advance, rows, grid))
+        return runs
+
+    def _flow_host(self, gcmd, attached, extruder, sensor, candidates,
+                   refine, fast, slow, ratio, strokes, times, fast_feed,
+                   max_runs, weak_runs=0, current=1.):
+        """Host-scored flow test; leaves the fit in self._flow_host_fit."""
+        from . import c5_pa_analysis
+        lead, fast_time, slow_time = times
+        segments, x = [], 40.
+
+        def add(speed, duration):
+            # XY only carries the extrusion so pressure advance applies;
+            # the XY steppers are detached.
+            dx = speed / ratio * duration
+            segments.append((x + dx, speed / ratio * 60., dx * ratio))
+            return x + dx
+        x = add(slow, lead)
+        for i in range(strokes):
+            x = add(fast, fast_time)
+            x = add(slow, slow_time)
+        if x > 280.:
+            raise gcmd.error('Flow strokes need %.0f mm of (virtual) X travel; '
+                             'raise RATIO or shorten them' % (x - 40.))
+        # The load reading ripples with the motor's electrical cycle (four
+        # full steps); its length in filament lets the fit remove it.
+        stepper = self.printer.lookup_object(extruder).extruder_stepper.stepper
+        mcu_tmc = self.printer.lookup_object('tmc2209 ' + extruder).mcu_tmc
+        microsteps = 256 >> mcu_tmc.get_fields().get_field('mres')
+        period = stepper.get_step_dist() * microsteps * 4.
+        points, all_runs = [], []
+        path = '/tmp/c5_flow_T%d.csv' % attached
+        # Written a run at a time: formatting a long test's whole trace at
+        # once stalls the reactor long enough to miss an MCU clock wrap.
+        self._flow_write_csv([], path)
+
+        def measure(advances):
+            runs = self._flow_capture(gcmd, extruder, advances, segments,
+                                      fast_feed, sensor)
+            for advance, rows, grid in runs:
+                rows = [r for r in rows if r[2] >= 0]
+                drifts = c5_pa_analysis.stroke_drifts(
+                    [r[0] for r in rows], [r[2] for r in rows],
+                    [r[5] for r in rows], [r[1] for r in rows], fast, period)
+                points.extend((advance, d) for d in drifts)
+                gcmd.respond_info('T%d flow PA %.4f: drift %s' % (
+                    attached, advance,
+                    ' '.join('%+.4f' % d for d in drifts) or 'none'))
+            self._flow_write_csv(runs, path, first=len(all_runs))
+            all_runs.extend(runs)
+        self._flow_host_fit = None
+        tmc = self.printer.lookup_object('tmc2209 ' + extruder)
+        run_current = tmc.get_status(None)['run_current']
+        if current < 1.:
+            self._run('SET_TMC_CURRENT STEPPER=%s CURRENT=%.3f'
+                      % (extruder, run_current * current))
+        try:
+            measure(candidates)
+            fit = c5_pa_analysis.fit_zero(points)
+            # Repeat the tested advances while the load barely responds,
+            # up to WEAK_RUNS; extra runs around a noise estimate would
+            # not help
+            while (refine and len(all_runs) + len(candidates) <= weak_runs
+                   and abs(fit.t_stat) < c5_pa_analysis.MIN_T_STAT):
+                gcmd.respond_info('T%d host flow test: weak load signal '
+                                  '(t=%.1f); repeating' % (attached,
+                                                           fit.t_stat))
+                measure(candidates)
+                fit = c5_pa_analysis.fit_zero(points)
+            # Leave the repeats as much room to refine as a normal run has
+            max_runs = max(max_runs,
+                           len(all_runs) + max_runs - len(candidates))
+            # Add runs either side of the estimate while it is too
+            # uncertain, up to MAX_RUNS.
+            while (refine and len(all_runs) + 2 <= max_runs
+                   and 0. <= fit.advance <= max(candidates) + .05):
+                measure((max(0., fit.advance - .01), fit.advance + .01))
+                fit = c5_pa_analysis.fit_zero(points)
+                if fit.high - fit.low <= c5_pa_analysis.MAX_INTERVAL:
+                    break
+        except ValueError as e:
+            gcmd.respond_info('T%d host flow test failed: %s; pressure '
+                              'advance unchanged' % (attached, e))
+            return
+        finally:
+            if current < 1.:
+                self._run('SET_TMC_CURRENT STEPPER=%s CURRENT=%.3f'
+                          % (extruder, run_current))
+        self._flow_host_fit = fit
+        problem = fit.problem()
+        gcmd.respond_info(
+            'T%d host flow test: pressure advance %.4f (95%%: %.4f-%.4f, '
+            't=%.1f, %d strokes, %d runs)%s' % (
+                attached, fit.advance, fit.low, fit.high, fit.t_stat,
+                len(fit.points), len(all_runs),
+                '; not used: ' + problem if problem else ''))
+
+    def _flow_host_apply(self, gcmd, attached, extruder):
+        fit = self._flow_host_fit
+        if fit is None or fit.problem():
+            return False
+        self._run('SET_PRESSURE_ADVANCE EXTRUDER=%s ADVANCE=%.5f'
+                  % (extruder, fit.advance))
+        gcmd.respond_info('T%d pressure advance set to %.4f'
+                          % (attached, fit.advance))
+        return True
+
+    def _flow_write_csv(self, runs, path, first=None):
+        with open(path, 'w' if first is None else 'a') as f:
+            if first is None:
+                f.write('run,advance,t,e,sg,eddy,reserve,v,a\n')
+            for run, (advance, rows, grid) in enumerate(runs, first or 0):
+                for t, e, sg, value, reserve, v, a in rows:
+                    f.write('%d,%.4f,%.4f,%.5f,%d,%d,%d,%.3f,%.1f\n' % (
+                        run, advance, t, e, sg, value, reserve, v, a))
 
     def cmd_cool_for_dock(self, gcmd):
         hotend = gcmd.get_float('HOTEND', above=0.)
