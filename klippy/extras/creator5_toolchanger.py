@@ -23,9 +23,15 @@ FACTORY_MEASUREMENTS = ((15.800, 215.280, 1.460),
                         (15.864, 215.340, 1.437))
 # CommMgr::cmdXYCalibrationManualFrontHome() in firmwareExe.i64 uses this
 # temporary coordinate after the operator aligns the carriage by hand.
-HOLDER_REFERENCE_X = 295.
+# High enough that the X measurement stays above position_min. The result is
+# a distance, so this frame doesn't change it.
+HOLDER_REFERENCE_X = 305.
 HOLDER_REFERENCE_Y_BASE = 80.
 HOLDER_REFERENCE_Y_PITCH = 50.
+# Dock and mount switch poll interval; stock polls the buttons every 50 ms.
+SWITCH_POLL_MS = 50
+# Longest single extrude of a purge (max_extrude_only_distance is 500)
+PURGE_CHUNK_MM = 100.
 
 
 class Creator5MiscSwitch:
@@ -120,6 +126,7 @@ class Creator5Toolchanger:
         self.printer.register_event_handler(
             'klippy:disconnect', self.toolchange_count_writer.close)
         self.print_z_baseline = [None] * 4
+        self.print_z_corrections = [None] * 4
         self._button_objects = {}
         # UI status may be polled many times per second on a small MIPS host.
         # Motion interlocks always bypass this one-second status cache.
@@ -174,6 +181,8 @@ class Creator5Toolchanger:
             'pickup_minimum_cruise_ratio', None, minval=0., below=1.)
         self.clear_travel_speed = config.getfloat(
             'clear_travel_speed', 80., above=0.)
+        self.fixture_travel_speed = config.getfloat(
+            'fixture_travel_speed', 150., above=0.)
         self.clearance_z_speed = config.getfloat(
             'clearance_z_speed', 20., above=0.)
         self.lower_bed_speed = config.getfloat(
@@ -210,6 +219,27 @@ class Creator5Toolchanger:
                                               minval=0)
         self.toolchange_sensor_settle_ms = config.getint(
             'toolchange_sensor_settle_ms', 150, minval=0)
+        # A head braking into its holder can bounce, or reach the dock and
+        # mount switches a little after the move ends. Stock polls for about
+        # a second and approaches up to three times before giving up; the
+        # retries go in slower so the head seats instead of bouncing.
+        self.dock_seat_timeout_ms = config.getint(
+            'dock_seat_timeout_ms', 1000, minval=0)
+        self.dock_seat_retries = config.getint(
+            'dock_seat_retries', 2, minval=0)
+        self.dock_retry_speed = config.getfloat(
+            'dock_retry_speed', 40., above=0.)
+        # A lock that turns without catching the head leaves it in its holder
+        # when the carriage pulls back; grab it again this many times. Unlike
+        # stock, which re-approaches until the mount switch closes and then
+        # locks once, this retries the lock itself.
+        self.pickup_grab_retries = config.getint(
+            'pickup_grab_retries', 2, minval=0)
+        # The carriage stops hard against the head; give the mount switch
+        # this long to close before the pickup gives up. Stock polls it for
+        # about a second before locking.
+        self.pickup_mount_timeout_ms = config.getint(
+            'pickup_mount_timeout_ms', 1000, minval=0)
         self.position_calibration_timeout = config.getfloat(
             'position_calibration_timeout', 30., above=0.)
         self.position_calibration_release_wait_ms = config.getint(
@@ -284,6 +314,13 @@ class Creator5Toolchanger:
         self.purge_switch = Creator5MiscSwitch(
             self.printer, self.gcode, 'purge',
             config.getboolean('purge_default', True))
+        self.purge_line_switch = Creator5MiscSwitch(
+            self.printer, self.gcode, 'purge_line',
+            config.getboolean('purge_line_default', True))
+        # Every tool the print uses gets its own purge line, not only the first
+        self.purge_line_all_tools_switch = Creator5MiscSwitch(
+            self.printer, self.gcode, 'purge_line_all_tools',
+            config.getboolean('purge_line_all_tools_default', False))
         self.bed_leveling_switch = Creator5MiscSwitch(
             self.printer, self.gcode, 'bed_leveling',
             config.getboolean('bed_leveling_default', True))
@@ -345,6 +382,7 @@ class Creator5Toolchanger:
             ('C5_CLEAR_BABYSTEP', self.cmd_clear_babystep),
             ('C5_LIST_BABYSTEP', self.cmd_list_babystep),
             ('C5_AUTO_NOZZLE_Z', self.cmd_auto_nozzle_z),
+            ('C5_PRINT_Z_PLAN', self.cmd_print_z_plan),
             ('C5_VERIFY_NOZZLE_Z', self.cmd_verify_nozzle_z),
             ('C5_CALIBRATE_ATTACHED', self.cmd_calibrate_attached),
             ('C5_MOUNT_COORDS', self.cmd_mount_coords),
@@ -727,6 +765,48 @@ class Creator5Toolchanger:
             'T%d: %d\n' % (index, count) for index, count in enumerate(counts))
         self.toolchange_count_writer.submit(text)
 
+    def _print_correction(self, hotend, temp_coefficient, bed, first_layer):
+        return ((hotend - 120.) * temp_coefficient
+                - (0.08 if bed >= 100. else 0.)
+                - (0.06 if first_layer < 0.11 else 0.))
+
+    def cmd_print_z_plan(self, gcmd):
+        # Each tool's thermal Z correction for this print, for the pickups
+        # and re-selects that happen once it is running.
+        bed = gcmd.get_float('BED', 0., minval=0.)
+        first_layer = gcmd.get_float('FIRST_LAYER_HEIGHT', 0.2, above=0.)
+        hotends = [gcmd.get_float('HOTEND%d' % tool, 0., minval=0.)
+                   for tool in range(4)]
+        try:
+            test_data, _ = self._read_stock_json(self.test_json_path)
+            temp_coefficient = float(test_data['tempOffset'])
+            if not math.isfinite(temp_coefficient):
+                raise ValueError('non-finite tempOffset')
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            raise gcmd.error('Invalid automatic nozzle Z calibration: %s' % exc)
+        self.print_z_corrections = [
+            self._print_correction(hotend, temp_coefficient, bed, first_layer)
+            if hotend > 0. else None for hotend in hotends]
+
+    def _apply_print_z(self, tool):
+        correction = self.print_z_corrections[tool]
+        if correction is None or not self._printing():
+            return
+        baseline = self.measurements[tool][2] - self.station_z + correction
+        offset = baseline + self.z_adjustments[tool]
+        if not math.isfinite(offset) or not 0.5 <= offset <= 5.:
+            raise self.printer.command_error(
+                'Unsafe T%d nozzle Z offset; refusing tool motion' % tool)
+        self._run('SET_GCODE_OFFSET Z=%.4f MOVE=0' % offset)
+        self._applied_z = (tool, offset)
+        self.print_z_baseline[tool] = baseline
+
+    def _keeps_print_z(self, tool):
+        origin = self.printer.lookup_object('gcode_move').get_status()[
+            'homing_origin'][2]
+        return (self._printing() and self.print_z_baseline[tool] is not None
+                and math.isfinite(origin) and 0.5 <= origin <= 5.)
+
     def cmd_auto_nozzle_z(self, gcmd):
         tool = gcmd.get_int('T', minval=0, maxval=3)
         hotend = gcmd.get_float('HOTEND', 120., minval=0.)
@@ -758,9 +838,8 @@ class Creator5Toolchanger:
         except (OSError, ValueError, TypeError, KeyError) as exc:
             raise gcmd.error('Invalid automatic nozzle Z calibration: %s' % exc)
         baseline = tool_z - station_z
-        correction = ((hotend - 120.) * temp_coefficient
-                      - (0.08 if bed >= 100. else 0.)
-                      - (0.06 if first_layer < 0.11 else 0.))
+        correction = self._print_correction(hotend, temp_coefficient, bed,
+                                            first_layer)
         offset = baseline + correction + self.z_adjustments[tool]
         if not 0.5 <= offset <= 5.:
             raise gcmd.error('Automatic T%d nozzle Z %.4f mm outside 0.5..5 mm'
@@ -1114,13 +1193,26 @@ class Creator5Toolchanger:
                 or self.purge_x + self.flow_sweep_x / 2. > self.purge_max_x):
             raise error('Purge/flow X path exceeds purge_max_x')
 
-    def _verify(self, gcmd, expected, parked=None):
+    def _verify(self, gcmd, expected, parked=None, grab=None):
+        # grab is (attempt, attempts) for a pickup. A missed grab (every head
+        # still docked) returns None before the last attempt so the caller
+        # can grab again, and fails with heaters off on the last one.
         try:
             self._run('M400')
             self._pause_ms(self.toolchange_sensor_settle_ms)
             dock, _, attached = self._sensor_state(gcmd)
+            # Must come first: a head neither docked nor attached fails here,
+            # so a missed grab below always means every head is docked.
             self._validate_sensor_state(gcmd, dock, attached)
             if attached != expected:
+                if grab is not None and attached is None:
+                    attempt, attempts = grab
+                    if attempt < attempts:
+                        return None
+                    raise gcmd.error(
+                        'T%d stayed in its dock after %d grab%s; heaters '
+                        'disabled' % (expected, attempts,
+                                      '' if attempts == 1 else 's'))
                 raise gcmd.error('Tool sensor verification failed; heaters disabled')
             if parked is not None and not dock[parked]:
                 raise gcmd.error('T%d was not confirmed in its dock' % parked)
@@ -1148,6 +1240,26 @@ class Creator5Toolchanger:
         extruder = self._afc_extruder(physical_name, afc)
         return afc.lanes.get(extruder.name) if extruder is not None else None
 
+    def _poll_switches(self, gcmd, names, timeout_ms):
+        # Poll instead of a single read: the switches can settle after the
+        # move ends. Returns the last states and how many polls it waited
+        # before them.
+        polls = max(1, -(-timeout_ms // SWITCH_POLL_MS))
+        for poll in range(polls + 1):
+            if poll:
+                self._pause_ms(SWITCH_POLL_MS)
+            states = [self._button(name, gcmd) for name in names]
+            if all(states):
+                break
+        return states, poll
+
+    def _wait_dock_seated(self, gcmd, tool):
+        # Returns the last (dock, mount) switch states and the polls waited.
+        (seated, mounted), poll = self._poll_switches(
+            gcmd, [self.dock_buttons[tool], self.grab_buttons[tool]],
+            self.dock_seat_timeout_ms)
+        return seated, mounted, poll
+
     def _dock(self, gcmd, tool, raise_z=True):
         x, y = self.docks[tool]
         clear_feed = self.clear_travel_speed * 60.
@@ -1163,24 +1275,52 @@ class Creator5Toolchanger:
         self._run('SET_GCODE_OFFSET X=0 Y=0 MOVE=0')
         if raise_z:
             self._raise_z()
+        approach_feed = self.dock_approach_speed * 60.
         self._travel_to_lane(y, clear_feed)
         self._move(x=x - self.dock_predock_offset, feed=clear_feed)
-        self._move(x=x - 10., feed=self.dock_approach_speed * 60.)
-        self._move(x=x, feed=self.dock_approach_speed * 60.)
-        self._run('M400')
+        self._move(x=x - 10., feed=approach_feed)
         # Release only with the head seated in its holder and the carriage at
         # the mount. After lost steps the dock position is wrong, and an
         # unchecked release dropped the head; keep it locked on instead.
-        self._pause_ms(self.toolchange_sensor_settle_ms)
-        if not (self._button(self.dock_buttons[tool], gcmd)
-                and self._button(self.grab_buttons[tool], gcmd)):
+        approaches = self.dock_seat_retries + 1
+        for attempt in range(approaches):
+            feed = approach_feed
+            if attempt:
+                # The head is still latched: back it out and approach again.
+                feed = self.dock_retry_speed * 60.
+                self._move(x=x - 10., feed=feed)
+            self._move(x=x, feed=feed)
+            self._run('M400')
+            self._pause_ms(self.toolchange_sensor_settle_ms)
+            seated, mounted, polls = self._wait_dock_seated(gcmd, tool)
+            if seated and mounted:
+                # Near misses are the evidence for a late-seating head; a
+                # first-read dock stays silent.
+                if attempt or polls:
+                    gcmd.respond_info(
+                        'T%d dock seated after %d ms (approach %d of %d)' % (
+                            tool, polls * SWITCH_POLL_MS, attempt + 1,
+                            approaches))
+                break
+            if attempt + 1 < approaches:
+                gcmd.respond_info(
+                    'T%d not seated after approach %d of %d (dock sensor %s, '
+                    'mount sensor %s); backing out to retry' % (
+                        tool, attempt + 1, approaches,
+                        'closed' if seated else 'open',
+                        'closed' if mounted else 'open'))
+        else:
             try:
                 self._run('TURN_OFF_HEATERS')
             except Exception:
                 logging.exception('Creator 5 heater shutdown failed after dock check')
             raise gcmd.error(
-                'T%d is not seated in its dock; not releasing it (heaters '
-                'off). XY may have lost steps: re-home before docking' % tool)
+                'T%d is not seated in its dock (dock sensor %s, mount sensor '
+                '%s at X=%.3f Y=%.3f after %d approaches); not releasing it '
+                '(heaters off). XY may have lost steps: re-home before '
+                'docking' % (tool, 'closed' if seated else 'open',
+                             'closed' if mounted else 'open', x, y,
+                             approaches))
         self._run('MOTOR_RELEASE')
         self._pause_ms(self.release_latch_wait_ms)
         self._move(x=self.approach_x,
@@ -1240,28 +1380,51 @@ class Creator5Toolchanger:
         clear_feed = self.clear_travel_speed * 60.
         # Establish a calibrated, positive nozzle clearance before the latch
         # can make the tool physically attached.  Print-specific thermal Z
-        # compensation is applied later by C5_AUTO_NOZZLE_Z.
+        # compensation is applied later by C5_AUTO_NOZZLE_Z, or here for a
+        # pickup during a print.
         self._apply_offsets(tool)
+        self._apply_print_z(tool)
         if raise_z:
             self._raise_z()
         self._travel_to_lane(y, clear_feed)
-        self._move(x=self.pre_dock_x,
-                   feed=self.pickup_predock_speed * 60.)
-        self._move(x=x, feed=self.pickup_latch_speed * 60.)
-        self._run('M400')
-        if not self._button(self.grab_buttons[tool], gcmd):
-            raise gcmd.error('T%d grab sensor did not engage at mount' % tool)
-        self._run('MOTOR_GRAB')
-        slow_distance = min(self.pullback, self.pullback_slow_distance)
-        self._move(x=x - slow_distance,
-                   feed=self.pullback_speed * 60.)
-        if self.pullback > slow_distance:
-            self._move(x=x - self.pullback, feed=clear_feed)
-        self._run('MOTOR_GRAB2')
-        self._pause_ms(self.pickup_latch_wait_ms)
-        # Verify the physical sensors at the clear pullback point before
-        # activation. The final departure can flow into AFC's return move.
-        self._verify(gcmd, tool)
+        grabs = self.pickup_grab_retries + 1
+        for attempt in range(grabs):
+            if attempt:
+                # The head is still in its holder and nothing is on the
+                # carriage: open the lock (stock releases away from the dock
+                # after a failed grab too) and go back in for it.
+                gcmd.respond_info(
+                    'T%d stayed in its dock after grab %d of %d; releasing '
+                    'the lock to grab again' % (tool, attempt, grabs))
+                self._run('MOTOR_RELEASE')
+                self._pause_ms(self.release_latch_wait_ms)
+            self._move(x=self.pre_dock_x,
+                       feed=self.pickup_predock_speed * 60.)
+            self._move(x=x, feed=self.pickup_latch_speed * 60.)
+            self._run('M400')
+            # Lock only once the carriage has settled on the head: stopping
+            # hard against it, the mount switch can close on first contact.
+            self._pause_ms(self.toolchange_sensor_settle_ms)
+            (mounted,), polls = self._poll_switches(
+                gcmd, [self.grab_buttons[tool]], self.pickup_mount_timeout_ms)
+            if not mounted:
+                raise gcmd.error(
+                    'T%d grab sensor did not engage at mount' % tool)
+            if polls:
+                gcmd.respond_info('T%d mount sensor closed after %d ms' % (
+                    tool, polls * SWITCH_POLL_MS))
+            self._run('MOTOR_GRAB')
+            slow_distance = min(self.pullback, self.pullback_slow_distance)
+            self._move(x=x - slow_distance,
+                       feed=self.pullback_speed * 60.)
+            if self.pullback > slow_distance:
+                self._move(x=x - self.pullback, feed=clear_feed)
+            self._run('MOTOR_GRAB2')
+            self._pause_ms(self.pickup_latch_wait_ms)
+            # Verify the physical sensors at the clear pullback point before
+            # activation. The final departure can flow into AFC's return move.
+            if self._verify(gcmd, tool, grab=(attempt + 1, grabs)) is not None:
+                break
         extruder = 'extruder' if tool == 0 else 'extruder%d' % tool
         self._run('ACTIVATE_EXTRUDER EXTRUDER=%s' % extruder)
         self._restore_pressure_advance(extruder)
@@ -1509,7 +1672,14 @@ class Creator5Toolchanger:
         if attached == tool:
             # AFC may select a head that was already mounted at Klippy start.
             # Restore its active extruder and offsets even without pickup motion.
-            self._apply_offsets(tool)
+            # A running print keeps its Z: thermal correction and baby stepping.
+            if self._keeps_print_z(tool):
+                self._run('SET_GCODE_OFFSET X=%.4f Y=%.4f MOVE=0' % tuple(
+                    self.measurements[tool][axis] - self.measurements[0][axis]
+                    for axis in range(2)))
+            else:
+                self._apply_offsets(tool)
+                self._apply_print_z(tool)
             extruder = 'extruder' if tool == 0 else 'extruder%d' % tool
             self._run('ACTIVATE_EXTRUDER EXTRUDER=%s' % extruder)
             self._restore_pressure_advance(extruder)
@@ -1720,7 +1890,7 @@ class Creator5Toolchanger:
 
     def _probe_fixture_z(self, gcmd, x, y, target=None):
         self._move(z=self.safe_z, feed=1200)
-        self._move(x=x, y=y, feed=1200)
+        self._move(x=x, y=y, feed=self.fixture_travel_speed * 60.)
         if target is None:
             target = self.z_probe_target
             if self._stock_pin_approach_z is not None:
@@ -2018,7 +2188,7 @@ class Creator5Toolchanger:
         self._move(x=240., feed=12000)
         self._move(x=min(240., HOLDER_REFERENCE_X - old_x + approach),
                    feed=12000)
-        x_result = x_home.measure_axis(-5.)
+        x_result = x_home.measure_axis(HOLDER_REFERENCE_X - 300.)
         self._move(y=min(y_reference, y_reference - old_y + approach),
                    feed=12000)
         y_result = y_home.measure_axis(0.)
@@ -2128,7 +2298,14 @@ class Creator5Toolchanger:
                                 toolhead.get_kinematics().clear_homing_state('xy')
                 finally:
                     if state_saved and not complete:
-                        self._run('RESTORE_GCODE_STATE NAME=C5_HOLDER_CALIBRATE MOVE=0')
+                        # Saved with no tool attached, so its zero nozzle Z is
+                        # refused once one is: keep the error that got us here.
+                        try:
+                            self._run('RESTORE_GCODE_STATE '
+                                      'NAME=C5_HOLDER_CALIBRATE MOVE=0')
+                        except self.printer.command_error as exc:
+                            gcmd.respond_info('G-code state not restored: %s'
+                                              % exc)
         self._with_motion(gcmd, calibrate)
 
     # Fluidd/Mainsail prompt flow for offset calibration without arguments:
@@ -2238,15 +2415,30 @@ class Creator5Toolchanger:
             self._move_to_prep_bucket()
         self._with_motion(gcmd, move)
 
+    def _verify_purge_z(self, gcmd):
+        # A paused print keeps the offset it was printing with. C5_AUTO_NOZZLE_Z
+        # here would count the difference as baby stepping once RESUME restores it.
+        stats = self.printer.lookup_object('print_stats', None)
+        if stats is None or stats.get_status(
+                self.printer.get_reactor().monotonic())['state'] != 'paused':
+            self.cmd_verify_nozzle_z(gcmd)
+            return
+        origin = self.printer.lookup_object('gcode_move').get_status()[
+            'homing_origin'][2]
+        if not math.isfinite(origin) or not 0.5 <= origin <= 5.:
+            raise gcmd.error('Unsafe nozzle Z offset %.4f; refusing purge'
+                             % origin)
+
     def cmd_purge(self, gcmd):
         length = gcmd.get_float('LENGTH', self.purge_length,
-                                minval=0., maxval=80.)
+                                minval=0., maxval=1000.)
         if not math.isfinite(length) or length <= 0.:
             raise gcmd.error('LENGTH must be finite and positive')
+        speed = gcmd.get_float('SPEED', self.purge_speed, above=0., maxval=50.)
         dock, grab, attached = self._preflight(gcmd)
         if attached is None:
             raise gcmd.error('No attached tool for purge')
-        self.cmd_verify_nozzle_z(gcmd)
+        self._verify_purge_z(gcmd)
         extruder = 'extruder' if attached == 0 else 'extruder%d' % attached
         heater = self.printer.lookup_object(extruder)
         if not heater.get_status(self.printer.get_reactor().monotonic()).get(
@@ -2263,8 +2455,13 @@ class Creator5Toolchanger:
                 self._move_to_prep_bucket()
                 self._move(z=self.purge_z, feed=600, machine=False)
                 self._run('M83')
-                self._run('G1 E%.3f F%.0f' % (length,
-                                              self.purge_speed * 60.))
+                # One extrude-only move may not exceed
+                # max_extrude_only_distance; queued back to back they run as one
+                left = length
+                while left > 0.:
+                    step = min(PURGE_CHUNK_MM, left)
+                    self._run('G1 E%.3f F%.0f' % (step, speed * 60.))
+                    left -= step
                 self._run('G1 E-5 F1200')
                 self._run('M400')
             finally:

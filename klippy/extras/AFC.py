@@ -1343,6 +1343,11 @@ class afc:
         # Move toolhead to previous z location with z-hop added
         if move_z_first:
             newpos[2] = self.move_z_pos(target[2] + self.z_hop, "restore_pos")
+        elif newpos[2] < target[2] + self.z_hop:
+            # Keep the current height for the XY return, but never below the
+            # saved one: a new tool whose nozzle sits lower would otherwise
+            # cross the print below its last layer
+            newpos[2] = self.move_z_pos(target[2] + self.z_hop, "restore_pos")
 
         # Move to previous x,y location
         newpos[:2] = target[:2]
@@ -2678,9 +2683,10 @@ class afc:
             try:
                 cur_lane.tool_swap()
                 if restore_pos and saved_here:
-                    # Creator 5 has already raised Z for clear tool travel.
-                    # Keep that clearance for the XY return, then descend at
-                    # the saved print position instead of lowering first.
+                    # Creator 5 raises Z to safe_z for tool travel. Keep that
+                    # clearance for the XY return (restore_pos lifts first if
+                    # the new nozzle would be below the print), then descend
+                    # at the saved print position instead of lowering first.
                     self.restore_pos(move_z_first=False, keep_offsets=True)
             finally:
                 self.in_toolchange = was_changing

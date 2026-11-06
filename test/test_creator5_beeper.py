@@ -49,7 +49,7 @@ class Creator5BeeperTest(unittest.TestCase):
         self.assertEqual(commands[1], [
             'cmd_pwm', 'config', 'pc12', 'freq=50000000',
             'max_level=300', 'active_level=1', 'accuracy_priority=freq'])
-        self.assertIn(['cmd_pwm', 'set_wc', 'pc12', '10000', '10000'],
+        self.assertIn(['cmd_pwm', 'set_wc', 'pc12', '12800', '12800'],
                       commands)
         self.assertEqual(commands[-2:], [
             ['cmd_pwm', 'set_wc', 'pc12', '1', '0'],
@@ -62,9 +62,28 @@ class Creator5BeeperTest(unittest.TestCase):
         self.beeper.cmd_C5_BUZZER(GCmd(DURATION=250, FREQUENCY=1000,
                                        LEVEL=75))
         commands = [call.args[0] for call in run.call_args_list]
-        self.assertIn(['cmd_pwm', 'set_wc', 'pc12', '18750', '31250'],
+        self.assertIn(['cmd_pwm', 'set_wc', 'pc12', '24000', '40000'],
                       commands)
         self.beeper.reactor.pause.assert_called_once_with(10.25)
+
+    @mock.patch.object(MODULE.subprocess, 'run')
+    def test_low_tone_uses_slower_clock_then_restores_it(self, run):
+        run.return_value = mock.Mock(returncode=0, stderr=b'')
+        self.beeper.cmd_C5_BUZZER(GCmd(DURATION=100, FREQUENCY=440))
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertIn(['cmd_pwm', 'set_wc', 'pc12', '9091', '9091'], commands)
+        at = [cmd[1] for cmd in commands].index('set_wc')
+        self.assertEqual(commands[at - 1],
+                         ['cmd_pwm', 'set_prescale', 'pc12', '48'])
+        self.assertEqual(commands[-1],
+                         ['cmd_pwm', 'set_prescale', 'pc12', '6'])
+
+    def test_counts_always_fit_sixteen_bits(self):
+        for frequency in (20, 60, 122, 123, 440, 977, 2500, 20000):
+            for level in (0, 1, 50, 100):
+                _, high, low = self.beeper.wave_counts(frequency, level)
+                self.assertLessEqual(high, MODULE.MAX_COUNT)
+                self.assertLessEqual(low, MODULE.MAX_COUNT)
 
     @mock.patch.object(MODULE.subprocess, 'run')
     def test_reuses_configuration_for_later_notes(self, run):

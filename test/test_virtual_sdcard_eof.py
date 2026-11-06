@@ -623,6 +623,43 @@ class VirtualSDEOFTests(unittest.TestCase):
         sd.print_stats.note_error.assert_called_once()
         self.assertEqual(sd.gcode.run_script.call_args_list[0].args[0],
                          'TURN_OFF_HEATERS')
+        message = sd.gcode.respond_raw.call_args.args[0]
+        self.assertTrue(message.startswith('!! No hotend temperature'))
+
+    def orca_single_tool(self, tool_line):
+        return ('M140 S60\nM191 S0\nG90\nM83\n' + tool_line + 'G1 X10\n'
+                '; filament used [mm] = 0.00, 0.00, 0.00, 0.00\n'
+                '; CONFIG_BLOCK_START\n'
+                '; nozzle_temperature_initial_layer = 220,230,240,250\n'
+                '; CONFIG_BLOCK_END\n')
+
+    def test_t0_only_job_without_heating_uses_slicer_temperature(self):
+        text = self.orca_single_tool('T0\n').replace(
+            '0.00, 0.00, 0.00, 0.00', '812.40, 0.00, 0.00, 0.00')
+        self.assertEqual(
+            MODULE.creator5_start_command(text, ''),
+            'C5_PRINT_START TOOL=0 HOTEND=220 BED=60 '
+            'MATERIAL0=UNKNOWN MATERIAL1=UNKNOWN '
+            'MATERIAL2=UNKNOWN MATERIAL3=UNKNOWN USED_TOOLS=0')
+
+    def test_slicer_temperature_follows_the_initial_tool(self):
+        command = MODULE.creator5_start_command(
+            self.orca_single_tool('T2\n'), '')
+        self.assertTrue(command.startswith(
+            'C5_PRINT_START TOOL=2 HOTEND=240 BED=60 '))
+
+    def test_job_without_tool_change_starts_on_its_used_tool(self):
+        text = self.orca_single_tool('').replace(
+            '0.00, 0.00, 0.00, 0.00', '0.00, 431.20, 0.00, 0.00')
+        command = MODULE.creator5_start_command(text, '')
+        self.assertTrue(command.startswith(
+            'C5_PRINT_START TOOL=1 HOTEND=230 BED=60 '))
+
+    def test_heating_command_still_beats_slicer_temperature(self):
+        command = MODULE.creator5_start_command(
+            self.orca_single_tool('T0\nM109 S215 T0\n'), '')
+        self.assertTrue(command.startswith(
+            'C5_PRINT_START TOOL=0 HOTEND=215 BED=60 '))
 
 
 if __name__ == '__main__':

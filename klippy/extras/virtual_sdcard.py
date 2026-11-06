@@ -24,7 +24,7 @@ def creator5_start_command(header, footer=""):
         return None
     tool = 0
     tool_seen = False
-    hotend = bed = preheat = first_layer = None
+    hotend = bed = preheat = first_layer = chamber = None
     for raw in header.splitlines():
         meta = re.match(r"^\s*;\s*first_layer_height\s*=\s*([0-9.]+)", raw, re.I)
         if meta and first_layer is None:
@@ -48,14 +48,27 @@ def creator5_start_command(header, footer=""):
             value = float(match.group(2))
             if value > 0:
                 bed = value
-    if hotend is None:
-        hotend = preheat
-    if hotend is None:
-        raise ValueError("No hotend temperature found in G-code header; "
-                         "add C5_PRINT_START TOOL=n HOTEND=n BED=n")
+        match = re.match(r"^M(141|191)\b.*?\bS\s*([0-9.]+)", line, re.I)
+        if match and chamber is None and float(match.group(2)) > 0:
+            chamber = float(match.group(2))
     material_header = header
     if len(header) >= 65536 and not header.endswith(("\n", "\r")):
         material_header = header.rpartition("\n")[0]
+    used = creator5_slot_list(r"filament used \[mm\]", footer, material_header)
+    tools = [index for index, value in enumerate(used[:4]) if value > 0]
+    if not tool_seen and tools:
+        tool = tools[0]
+    # Orca's per-filament first-layer nozzle temperatures
+    temps = creator5_slot_list(r"nozzle_temperature_initial_layer",
+                               footer, material_header)
+    if hotend is None:
+        hotend = preheat
+    if hotend is None and tool < len(temps) and temps[tool] > 0:
+        # Single-tool Orca jobs can heat inside the start G-code only
+        hotend = temps[tool]
+    if hotend is None:
+        raise ValueError("No hotend temperature found in G-code header; "
+                         "add C5_PRINT_START TOOL=n HOTEND=n BED=n")
     materials = ()
     for source in (footer, material_header):
         meta = None
@@ -79,14 +92,27 @@ def creator5_start_command(header, footer=""):
             if re.fullmatch(r"[A-Za-z0-9+_./-]+", value):
                 material = value.upper()
         command += " MATERIAL%d=%s" % (index, material)
-    used = creator5_slot_list(r"filament used \[mm\]", footer, material_header)
-    tools = [index for index, value in enumerate(used[:4]) if value > 0]
     if tools:
         command += " USED_TOOLS=%s" % ",".join(map(str, tools))
+    # The other tools' own first-layer temperatures, for their purge lines
+    for index in tools:
+        if index != tool and index < len(temps) and temps[index] > 0:
+            command += " HOTEND%d=%g" % (index, temps[index])
     idle = creator5_slot_list(r"idle_temperature", footer, material_header)
     for index, value in enumerate(idle[:4]):
         if value > 0:
             command += " IDLE%d=%g" % (index, value)
+    if chamber is None:
+        # Orca's per-filament chamber temperature, for the slots this print
+        # uses that have chamber control on
+        temps = creator5_slot_list(r"chamber_temperature", footer, material_header)
+        active = creator5_slot_list(r"activate_chamber_temp_control",
+                                    footer, material_header)
+        chamber = max([temps[index] for index in (tools or [tool])
+                       if index < len(temps)
+                       and (index >= len(active) or active[index] > 0)] or [0.])
+    if chamber > 0:
+        command += " CHAMBER=%g" % chamber
     return command
 
 
@@ -146,9 +172,6 @@ def creator5_object_definitions(header):
 class VirtualSD:
     def __init__(self, config):
         self.printer = config.get_printer()
-        self.printer.register_event_handler(
-            "klippy:shutdown", self.handle_shutdown
-        )
         # sdcard state
         sd = config.get("path")
         self.with_subdirs = config.getboolean("with_subdirs", False)
@@ -189,8 +212,11 @@ class VirtualSD:
             self.cmd_SDCARD_PRINT_FILE,
             desc=self.cmd_SDCARD_PRINT_FILE_help,
         )
+        self.printer.register_event_handler(
+            "klippy:analyze_shutdown", self._handle_analyze_shutdown
+        )
 
-    def handle_shutdown(self):
+    def _handle_analyze_shutdown(self, msg, details):
         if self.work_timer is not None:
             self.must_pause_work = True
             try:
@@ -483,6 +509,8 @@ class VirtualSD:
                 logging.exception("virtual_sdcard Creator 5 print start")
                 error_message = "Creator 5 print start failed"
             if error_message is not None:
+                # on_error_gcode may cancel, which hides the print_stats error
+                self.gcode.respond_raw("!! " + error_message)
                 try:
                     self._run_worker_script(self.on_error_gcode.render())
                 except:
