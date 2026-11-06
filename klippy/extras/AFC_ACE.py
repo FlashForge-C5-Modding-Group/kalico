@@ -1141,10 +1141,7 @@ class AceDryerHeater:
         return False
 
     def get_status(self, eventtime=None):
-        # The box humidity too, so the UIs show the ACE as one row: Fluidd
-        # draws humidity under a heater's temperature as it does a sensor's
-        return {"temperature": round(self.temperature, 1), "target": self.target,
-                "humidity": round(self.unit.humidity_sensor.humidity, 1)}
+        return {"temperature": round(self.temperature, 1), "target": self.target}
 
 
 class AceHumiditySensor:
@@ -1158,6 +1155,23 @@ class AceHumiditySensor:
     def get_status(self, eventtime=None):
         return {"humidity": round(self.humidity, 1),
                 "temperature": round(self.temperature, 1)}
+
+
+class AceDryerFan:
+    """The dryer, seen by the UIs as a temperature_fan: Fluidd and Mainsail
+    draw a temperature_fan's settable target and its humidity in one row,
+    where a heater row has no humidity and a sensor row no target. Setting
+    the target (SET_TEMPERATURE_FAN_TARGET) starts or stops drying."""
+
+    def __init__(self, unit: "afcACE") -> None:
+        self.unit = unit
+
+    def get_status(self, eventtime=None):
+        heater = self.unit.dryer_heater
+        return {"temperature": round(heater.temperature, 1),
+                "target": heater.target,
+                "speed": 1.0 if heater.target > 0 else 0.0,
+                "humidity": round(self.unit.humidity_sensor.humidity, 1)}
 
 
 class afcACE(afcUnit):
@@ -1296,10 +1310,23 @@ class afcACE(afcUnit):
         dryer_name = f"ace_dryer_{self.name}"
         hum_name = f"ace_humidity_{self.name}"
         pheaters = self.printer.load_object(config, "heaters")
+        # Kept as a heater for SET_HEATER_TEMPERATURE, but out of the UI
+        # heater list: the temperature_fan below is the ACE's one row there
         pheaters.heaters[dryer_name] = self.dryer_heater
-        pheaters.available_heaters.append(dryer_name)
         self.printer.add_object(dryer_name, self.dryer_heater)
         self.printer.add_object(hum_name, self.humidity_sensor)
+        self.dryer_fan = AceDryerFan(self)
+        fan_name = f"temperature_fan {self.name}"
+        self.printer.add_object(fan_name, self.dryer_fan)
+        # The UIs check a target against the section's min_temp / max_temp in
+        # configfile.settings, which is built from these entries; with none,
+        # Fluidd rejects every target but 0
+        config.access_tracking[(fan_name.lower(), "min_temp")] = 0.0
+        config.access_tracking[(fan_name.lower(), "max_temp")] = float(DRYER_MAX_C)
+        self.gcode.register_mux_command(
+            'SET_TEMPERATURE_FAN_TARGET', "TEMPERATURE_FAN", self.name,
+            self._cmd_SET_DRYER_TEMPERATURE,
+            desc=f"Set {self.name} ACE dryer temperature")
         # Mainline Klipper routes SET_HEATER_TEMPERATURE through
         # heaters.lookup_heater (the dict insert above covers it); Kalico
         # instead registers it as a per-heater mux command, so register ours —
