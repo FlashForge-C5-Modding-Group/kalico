@@ -28,6 +28,8 @@ FACTORY_MEASUREMENTS = ((15.800, 215.280, 1.460),
 HOLDER_REFERENCE_X = 305.
 HOLDER_REFERENCE_Y_BASE = 80.
 HOLDER_REFERENCE_Y_PITCH = 50.
+# Dock and mount switch poll interval; stock polls the buttons every 50 ms.
+SWITCH_POLL_MS = 50
 # Longest single extrude of a purge (max_extrude_only_distance is 500)
 PURGE_CHUNK_MM = 100.
 
@@ -217,6 +219,27 @@ class Creator5Toolchanger:
                                               minval=0)
         self.toolchange_sensor_settle_ms = config.getint(
             'toolchange_sensor_settle_ms', 150, minval=0)
+        # A head braking into its holder can bounce, or reach the dock and
+        # mount switches a little after the move ends. Stock polls for about
+        # a second and approaches up to three times before giving up; the
+        # retries go in slower so the head seats instead of bouncing.
+        self.dock_seat_timeout_ms = config.getint(
+            'dock_seat_timeout_ms', 1000, minval=0)
+        self.dock_seat_retries = config.getint(
+            'dock_seat_retries', 2, minval=0)
+        self.dock_retry_speed = config.getfloat(
+            'dock_retry_speed', 40., above=0.)
+        # A lock that turns without catching the head leaves it in its holder
+        # when the carriage pulls back; grab it again this many times. Unlike
+        # stock, which re-approaches until the mount switch closes and then
+        # locks once, this retries the lock itself.
+        self.pickup_grab_retries = config.getint(
+            'pickup_grab_retries', 2, minval=0)
+        # The carriage stops hard against the head; give the mount switch
+        # this long to close before the pickup gives up. Stock polls it for
+        # about a second before locking.
+        self.pickup_mount_timeout_ms = config.getint(
+            'pickup_mount_timeout_ms', 1000, minval=0)
         self.position_calibration_timeout = config.getfloat(
             'position_calibration_timeout', 30., above=0.)
         self.position_calibration_release_wait_ms = config.getint(
@@ -291,6 +314,10 @@ class Creator5Toolchanger:
         self.purge_line_switch = Creator5MiscSwitch(
             self.printer, self.gcode, 'purge_line',
             config.getboolean('purge_line_default', True))
+        # Every tool the print uses gets its own purge line, not only the first
+        self.purge_line_all_tools_switch = Creator5MiscSwitch(
+            self.printer, self.gcode, 'purge_line_all_tools',
+            config.getboolean('purge_line_all_tools_default', False))
         self.bed_leveling_switch = Creator5MiscSwitch(
             self.printer, self.gcode, 'bed_leveling',
             config.getboolean('bed_leveling_default', True))
@@ -1163,13 +1190,26 @@ class Creator5Toolchanger:
                 or self.purge_x + self.flow_sweep_x / 2. > self.purge_max_x):
             raise error('Purge/flow X path exceeds purge_max_x')
 
-    def _verify(self, gcmd, expected, parked=None):
+    def _verify(self, gcmd, expected, parked=None, grab=None):
+        # grab is (attempt, attempts) for a pickup. A missed grab (every head
+        # still docked) returns None before the last attempt so the caller
+        # can grab again, and fails with heaters off on the last one.
         try:
             self._run('M400')
             self._pause_ms(self.toolchange_sensor_settle_ms)
             dock, _, attached = self._sensor_state(gcmd)
+            # Must come first: a head neither docked nor attached fails here,
+            # so a missed grab below always means every head is docked.
             self._validate_sensor_state(gcmd, dock, attached)
             if attached != expected:
+                if grab is not None and attached is None:
+                    attempt, attempts = grab
+                    if attempt < attempts:
+                        return None
+                    raise gcmd.error(
+                        'T%d stayed in its dock after %d grab%s; heaters '
+                        'disabled' % (expected, attempts,
+                                      '' if attempts == 1 else 's'))
                 raise gcmd.error('Tool sensor verification failed; heaters disabled')
             if parked is not None and not dock[parked]:
                 raise gcmd.error('T%d was not confirmed in its dock' % parked)
@@ -1197,6 +1237,26 @@ class Creator5Toolchanger:
         extruder = self._afc_extruder(physical_name, afc)
         return afc.lanes.get(extruder.name) if extruder is not None else None
 
+    def _poll_switches(self, gcmd, names, timeout_ms):
+        # Poll instead of a single read: the switches can settle after the
+        # move ends. Returns the last states and how many polls it waited
+        # before them.
+        polls = max(1, -(-timeout_ms // SWITCH_POLL_MS))
+        for poll in range(polls + 1):
+            if poll:
+                self._pause_ms(SWITCH_POLL_MS)
+            states = [self._button(name, gcmd) for name in names]
+            if all(states):
+                break
+        return states, poll
+
+    def _wait_dock_seated(self, gcmd, tool):
+        # Returns the last (dock, mount) switch states and the polls waited.
+        (seated, mounted), poll = self._poll_switches(
+            gcmd, [self.dock_buttons[tool], self.grab_buttons[tool]],
+            self.dock_seat_timeout_ms)
+        return seated, mounted, poll
+
     def _dock(self, gcmd, tool, raise_z=True):
         x, y = self.docks[tool]
         clear_feed = self.clear_travel_speed * 60.
@@ -1212,24 +1272,52 @@ class Creator5Toolchanger:
         self._run('SET_GCODE_OFFSET X=0 Y=0 MOVE=0')
         if raise_z:
             self._raise_z()
+        approach_feed = self.dock_approach_speed * 60.
         self._travel_to_lane(y, clear_feed)
         self._move(x=x - self.dock_predock_offset, feed=clear_feed)
-        self._move(x=x - 10., feed=self.dock_approach_speed * 60.)
-        self._move(x=x, feed=self.dock_approach_speed * 60.)
-        self._run('M400')
+        self._move(x=x - 10., feed=approach_feed)
         # Release only with the head seated in its holder and the carriage at
         # the mount. After lost steps the dock position is wrong, and an
         # unchecked release dropped the head; keep it locked on instead.
-        self._pause_ms(self.toolchange_sensor_settle_ms)
-        if not (self._button(self.dock_buttons[tool], gcmd)
-                and self._button(self.grab_buttons[tool], gcmd)):
+        approaches = self.dock_seat_retries + 1
+        for attempt in range(approaches):
+            feed = approach_feed
+            if attempt:
+                # The head is still latched: back it out and approach again.
+                feed = self.dock_retry_speed * 60.
+                self._move(x=x - 10., feed=feed)
+            self._move(x=x, feed=feed)
+            self._run('M400')
+            self._pause_ms(self.toolchange_sensor_settle_ms)
+            seated, mounted, polls = self._wait_dock_seated(gcmd, tool)
+            if seated and mounted:
+                # Near misses are the evidence for a late-seating head; a
+                # first-read dock stays silent.
+                if attempt or polls:
+                    gcmd.respond_info(
+                        'T%d dock seated after %d ms (approach %d of %d)' % (
+                            tool, polls * SWITCH_POLL_MS, attempt + 1,
+                            approaches))
+                break
+            if attempt + 1 < approaches:
+                gcmd.respond_info(
+                    'T%d not seated after approach %d of %d (dock sensor %s, '
+                    'mount sensor %s); backing out to retry' % (
+                        tool, attempt + 1, approaches,
+                        'closed' if seated else 'open',
+                        'closed' if mounted else 'open'))
+        else:
             try:
                 self._run('TURN_OFF_HEATERS')
             except Exception:
                 logging.exception('Creator 5 heater shutdown failed after dock check')
             raise gcmd.error(
-                'T%d is not seated in its dock; not releasing it (heaters '
-                'off). XY may have lost steps: re-home before docking' % tool)
+                'T%d is not seated in its dock (dock sensor %s, mount sensor '
+                '%s at X=%.3f Y=%.3f after %d approaches); not releasing it '
+                '(heaters off). XY may have lost steps: re-home before '
+                'docking' % (tool, 'closed' if seated else 'open',
+                             'closed' if mounted else 'open', x, y,
+                             approaches))
         self._run('MOTOR_RELEASE')
         self._pause_ms(self.release_latch_wait_ms)
         self._move(x=self.approach_x,
@@ -1301,23 +1389,44 @@ class Creator5Toolchanger:
         if raise_z:
             self._raise_z()
         self._travel_to_lane(y, clear_feed)
-        self._move(x=self.pre_dock_x,
-                   feed=self.pickup_predock_speed * 60.)
-        self._move(x=x, feed=self.pickup_latch_speed * 60.)
-        self._run('M400')
-        if not self._button(self.grab_buttons[tool], gcmd):
-            raise gcmd.error('T%d grab sensor did not engage at mount' % tool)
-        self._run('MOTOR_GRAB')
-        slow_distance = min(self.pullback, self.pullback_slow_distance)
-        self._move(x=x - slow_distance,
-                   feed=self.pullback_speed * 60.)
-        if self.pullback > slow_distance:
-            self._move(x=x - self.pullback, feed=clear_feed)
-        self._run('MOTOR_GRAB2')
-        self._pause_ms(self.pickup_latch_wait_ms)
-        # Verify the physical sensors at the clear pullback point before
-        # activation. The final departure can flow into AFC's return move.
-        self._verify(gcmd, tool)
+        grabs = self.pickup_grab_retries + 1
+        for attempt in range(grabs):
+            if attempt:
+                # The head is still in its holder and nothing is on the
+                # carriage: open the lock (stock releases away from the dock
+                # after a failed grab too) and go back in for it.
+                gcmd.respond_info(
+                    'T%d stayed in its dock after grab %d of %d; releasing '
+                    'the lock to grab again' % (tool, attempt, grabs))
+                self._run('MOTOR_RELEASE')
+                self._pause_ms(self.release_latch_wait_ms)
+            self._move(x=self.pre_dock_x,
+                       feed=self.pickup_predock_speed * 60.)
+            self._move(x=x, feed=self.pickup_latch_speed * 60.)
+            self._run('M400')
+            # Lock only once the carriage has settled on the head: stopping
+            # hard against it, the mount switch can close on first contact.
+            self._pause_ms(self.toolchange_sensor_settle_ms)
+            (mounted,), polls = self._poll_switches(
+                gcmd, [self.grab_buttons[tool]], self.pickup_mount_timeout_ms)
+            if not mounted:
+                raise gcmd.error(
+                    'T%d grab sensor did not engage at mount' % tool)
+            if polls:
+                gcmd.respond_info('T%d mount sensor closed after %d ms' % (
+                    tool, polls * SWITCH_POLL_MS))
+            self._run('MOTOR_GRAB')
+            slow_distance = min(self.pullback, self.pullback_slow_distance)
+            self._move(x=x - slow_distance,
+                       feed=self.pullback_speed * 60.)
+            if self.pullback > slow_distance:
+                self._move(x=x - self.pullback, feed=clear_feed)
+            self._run('MOTOR_GRAB2')
+            self._pause_ms(self.pickup_latch_wait_ms)
+            # Verify the physical sensors at the clear pullback point before
+            # activation. The final departure can flow into AFC's return move.
+            if self._verify(gcmd, tool, grab=(attempt + 1, grabs)) is not None:
+                break
         extruder = 'extruder' if tool == 0 else 'extruder%d' % tool
         self._run('ACTIVATE_EXTRUDER EXTRUDER=%s' % extruder)
         self._restore_pressure_advance(extruder)

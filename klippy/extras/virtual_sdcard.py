@@ -58,14 +58,14 @@ def creator5_start_command(header, footer=""):
     tools = [index for index, value in enumerate(used[:4]) if value > 0]
     if not tool_seen and tools:
         tool = tools[0]
+    # Orca's per-filament first-layer nozzle temperatures
+    temps = creator5_slot_list(r"nozzle_temperature_initial_layer",
+                               footer, material_header)
     if hotend is None:
         hotend = preheat
-    if hotend is None:
+    if hotend is None and tool < len(temps) and temps[tool] > 0:
         # Single-tool Orca jobs can heat inside the start G-code only
-        temps = creator5_slot_list(r"nozzle_temperature_initial_layer",
-                                   footer, material_header)
-        if tool < len(temps) and temps[tool] > 0:
-            hotend = temps[tool]
+        hotend = temps[tool]
     if hotend is None:
         raise ValueError("No hotend temperature found in G-code header; "
                          "add C5_PRINT_START TOOL=n HOTEND=n BED=n")
@@ -94,6 +94,10 @@ def creator5_start_command(header, footer=""):
         command += " MATERIAL%d=%s" % (index, material)
     if tools:
         command += " USED_TOOLS=%s" % ",".join(map(str, tools))
+    # The other tools' own first-layer temperatures, for their purge lines
+    for index in tools:
+        if index != tool and index < len(temps) and temps[index] > 0:
+            command += " HOTEND%d=%g" % (index, temps[index])
     idle = creator5_slot_list(r"idle_temperature", footer, material_header)
     for index, value in enumerate(idle[:4]):
         if value > 0:

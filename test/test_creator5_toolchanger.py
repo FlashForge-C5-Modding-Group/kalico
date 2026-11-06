@@ -87,12 +87,18 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board.build_plate_detected = None
         self.board._stock_pin_approach_z = None
         self.board.print_z_baseline = [None] * 4
+        self.board.print_z_corrections = [None] * 4
         self.board._button_objects = {}
         self.board.dock_buttons = ['dock%d' % i for i in range(4)]
         self.board.grab_buttons = ['grab%d' % i for i in range(4)]
         self.board._ui_sensor_cache = None
         self.board.busy = False
         self.board.toolchange_sensor_settle_ms = 0
+        self.board.dock_seat_timeout_ms = 1000
+        self.board.dock_seat_retries = 2
+        self.board.dock_retry_speed = 40.
+        self.board.pickup_grab_retries = 2
+        self.board.pickup_mount_timeout_ms = 1000
         self.board.pullback_slow_distance = 20.
         self.board.pickup_departure_speed = 80.
         self.board.clear_travel_speed = 600.
@@ -114,6 +120,9 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board.printer = mock.Mock()
         self.board.printer.lookup_object.return_value.get_status.return_value = {
             'homing_origin': (.1, .2, .3, 0.)}
+        # Carriage outboard of approach_x: travel to a dock lane is X, then Y.
+        self.board.printer.lookup_object.return_value.get_position.return_value = [
+            300., 0., 10., 0.]
         self.stepper_enable = types.SimpleNamespace(
             get_steppers=lambda: ['extruder'],
             set_motors_enable=lambda names, enable: False)
@@ -791,7 +800,10 @@ class Creator5OffsetTests(unittest.TestCase):
         board._pause_ms = mock.Mock()
         board._verify = mock.Mock()
         board._travel_to_lane = mock.Mock()
-        board._button = lambda name, gcmd: {'d0': seated, 'g0': at_mount}.get(name, False)
+        if callable(seated):
+            board._button = seated
+        else:
+            board._button = lambda name, gcmd: {'d0': seated, 'g0': at_mount}.get(name, False)
         board.z_adjustments = [0.] * 4
         board.printer.lookup_object.return_value.get_status.return_value = {
             'homing_origin': (0., 0., 2., 0.)}
@@ -799,9 +811,12 @@ class Creator5OffsetTests(unittest.TestCase):
 
     def test_dock_releases_only_when_seated_at_mount(self):
         board = self._dock_board(seated=True, at_mount=True)
-        board._dock(GCmd(), 0, raise_z=False)
+        gcmd = GCmd()
+        board._dock(gcmd, 0, raise_z=False)
         board._run.assert_any_call('MOTOR_RELEASE')
         board._verify.assert_called_once_with(mock.ANY, None, parked=0)
+        # A dock that passes on the first read logs nothing.
+        self.assertEqual(gcmd.messages, [])
 
     def test_dock_keeps_head_locked_when_not_seated(self):
         for seated, at_mount in ((False, True), (True, False), (False, False)):
@@ -813,6 +828,64 @@ class Creator5OffsetTests(unittest.TestCase):
                 self.assertNotIn('MOTOR_RELEASE', commands)
                 self.assertIn('TURN_OFF_HEATERS', commands)
                 board._verify.assert_not_called()
+
+    def test_dock_error_names_the_open_sensor(self):
+        board = self._dock_board(seated=True, at_mount=False)
+        with self.assertRaisesRegex(
+                RuntimeError, r'dock sensor closed, mount sensor open at '
+                r'X=298\.000 Y=50\.000 after 3 approaches'):
+            board._dock(GCmd(), 0, raise_z=False)
+
+    def test_dock_waits_for_a_head_that_seats_late(self):
+        reads = {'d0': 0}
+
+        def button(name, gcmd):
+            if name == 'd0':
+                reads['d0'] += 1
+                return reads['d0'] > 5
+            return name == 'g0'
+        board = self._dock_board(button, None)
+        gcmd = GCmd()
+        board._dock(gcmd, 0, raise_z=False)
+        board._run.assert_any_call('MOTOR_RELEASE')
+        self.assertEqual(gcmd.messages,
+                         ['T0 dock seated after 250 ms (approach 1 of 3)'])
+        # One approach: no back-off and re-approach was needed.
+        self.assertEqual(
+            [c for c in board._move.call_args_list if c.kwargs.get('x') == 298.],
+            [mock.call(x=298., feed=1500.)])
+
+    def test_dock_backs_out_and_reapproaches_before_releasing(self):
+        moves = []
+
+        def button(name, gcmd):
+            # Seats only once the head has been backed out and pushed in again.
+            if name == 'd0':
+                return moves.count(298.) >= 2
+            return name == 'g0'
+        board = self._dock_board(button, None)
+        board._move.side_effect = lambda x=None, **kw: moves.append(x)
+        gcmd = GCmd()
+        board._dock(gcmd, 0, raise_z=False)
+        board._run.assert_any_call('MOTOR_RELEASE')
+        self.assertEqual(gcmd.messages, [
+            'T0 not seated after approach 1 of 3 (dock sensor open, mount '
+            'sensor closed); backing out to retry',
+            'T0 dock seated after 0 ms (approach 2 of 3)'])
+        # Pre-dock, approach, then back out 10 mm and push in again before
+        # the release and the departure to approach_x.
+        self.assertEqual(moves, [278., 288., 298., 288., 298., 250.])
+
+    def test_dock_retries_slower_and_gives_up_after_configured_retries(self):
+        board = self._dock_board(seated=False, at_mount=True)
+        board.dock_seat_retries = 1
+        with self.assertRaisesRegex(RuntimeError, 'after 2 approaches'):
+            board._dock(GCmd(), 0, raise_z=False)
+        # The retry backs out and goes back in at dock_retry_speed.
+        self.assertEqual(board._move.call_args_list[-3:], [
+            mock.call(x=298., feed=1500.),
+            mock.call(x=288., feed=2400.),
+            mock.call(x=298., feed=2400.)])
 
     def test_pickup_speeds_come_from_config(self):
         board = self.board
@@ -845,7 +918,7 @@ class Creator5OffsetTests(unittest.TestCase):
             mock.call(x=278., feed=4200.),
             mock.call(x=250., feed=5400.),
         ])
-        board._pause_ms.assert_called_once_with(1800)
+        board._pause_ms.assert_any_call(1800)
 
     def test_pickup_uses_fast_travel_only_after_latch_clearance(self):
         board = self.board
@@ -869,39 +942,129 @@ class Creator5OffsetTests(unittest.TestCase):
             activation_move_counts.append(board._move.call_count)
             if command.startswith('ACTIVATE_EXTRUDER') else None)
         board._pickup(GCmd(), 0)
-        self.assertEqual(board._move.call_args_list[-3:], [
+        self.assertEqual(board._move.call_args_list[-2:], [
             mock.call(x=278., feed=4800.),
-            mock.call(x=238., feed=36000.),
-            mock.call(x=250., feed=36000.)])
-        board._verify.assert_called_once_with(mock.ANY, 0)
+            mock.call(x=238., feed=36000.)])
+        # Activation follows the pullback; it ends inboard of approach_x
+        # (238 < 250), so no departure move follows.
         self.assertEqual(activation_move_counts, [6])
+        self.assertEqual(board._move.call_count, 6)
         board._apply_offsets.assert_called_once_with(0)
         self.assertEqual(board._run.call_args_list[-1],
                          mock.call('ACTIVATE_EXTRUDER EXTRUDER=extruder'))
 
-    def test_failed_pickup_verification_never_activates_or_departs(self):
+    def _grab_board(self, readings):
+        # Real _verify over scripted (dock, grab) switch readings, one per
+        # verification; picking up T1.
         board = self.board
         board.approach_x, board.pre_dock_x = 250., 280.
         board.pullback, board.pullback_slow_distance = 60., 20.
-        board.clear_travel_speed = 600.
         board.pickup_predock_speed = board.pickup_latch_speed = 60.
         board.pullback_speed = 80.
-        board.pickup_latch_wait_ms = 0
-        board.grab_buttons = ['grab0']
+        board.pickup_latch_wait_ms = board.release_latch_wait_ms = 0
         board._button = mock.Mock(return_value=True)
         board._raise_z = mock.Mock()
+        board._travel_to_lane = mock.Mock()
         board._move = mock.Mock()
-        board._run = mock.Mock()
         board._pause_ms = mock.Mock()
-        board._verify = mock.Mock(side_effect=RuntimeError('sensor failed'))
         board._apply_offsets = mock.Mock()
+        board._apply_print_z = mock.Mock()
+        board.active = None
+        states = []
+        for dock, grab in readings:
+            attached = [i for i in range(4) if grab[i] and not dock[i]]
+            states.append((dock, grab, attached[0] if attached else None))
+        board._sensor_state = mock.Mock(side_effect=states)
+        commands = []
+        board._run = commands.append
+        return board, commands
 
-        with self.assertRaisesRegex(RuntimeError, 'sensor failed'):
-            board._pickup(GCmd(), 0)
+    ALL_DOCKED = ([True] * 4, [False] * 4)
+    T1_ATTACHED = ([True, False, True, True], [False, True, False, False])
 
-        self.assertEqual(board._move.call_count, 6)
-        self.assertFalse(any('ACTIVATE_EXTRUDER' in call.args[0]
-                             for call in board._run.call_args_list))
+    def test_pickup_grabs_again_when_head_stays_in_dock(self):
+        board, commands = self._grab_board([self.ALL_DOCKED, self.T1_ATTACHED])
+        gcmd = GCmd()
+        board._pickup(gcmd, 1)
+        latch = [c for c in commands if c.startswith(('MOTOR_', 'ACTIVATE_'))]
+        self.assertEqual(latch, [
+            'MOTOR_GRAB', 'MOTOR_GRAB2', 'MOTOR_RELEASE',
+            'MOTOR_GRAB', 'MOTOR_GRAB2', 'ACTIVATE_EXTRUDER EXTRUDER=extruder1'])
+        self.assertNotIn('TURN_OFF_HEATERS', commands)
+        self.assertEqual(board.active, 1)
+        self.assertEqual(gcmd.messages, [
+            'T1 stayed in its dock after grab 1 of 3; releasing the lock to '
+            'grab again'])
+        # Every grab goes back in to the mount before it locks.
+        approach = [mock.call(x=280., feed=3600.), mock.call(x=298., feed=3600.),
+                    mock.call(x=278., feed=4800.), mock.call(x=238., feed=36000.)]
+        self.assertEqual(board._move.call_args_list, approach * 2)
+
+    def test_pickup_fails_closed_after_every_grab_misses(self):
+        board, commands = self._grab_board([self.ALL_DOCKED] * 3)
+        with self.assertRaisesRegex(
+                RuntimeError, 'T1 stayed in its dock after 3 grabs; heaters disabled'):
+            board._pickup(GCmd(), 1)
+        self.assertEqual(commands.count('MOTOR_GRAB'), 3)
+        self.assertEqual(commands.count('MOTOR_RELEASE'), 2)
+        self.assertIn('TURN_OFF_HEATERS', commands)
+        self.assertFalse(any(c.startswith('ACTIVATE_EXTRUDER') for c in commands))
+
+    def test_pickup_never_retries_when_another_head_reads_attached(self):
+        # Only "every head docked" is safe to grab again; T2 on the carriage
+        # while picking T1 is not.
+        wrong = ([True, True, False, True], [False, False, True, False])
+        board, commands = self._grab_board([wrong])
+        with self.assertRaisesRegex(RuntimeError, 'Tool sensor verification failed'):
+            board._pickup(GCmd(), 1)
+        self.assertEqual(commands.count('MOTOR_GRAB'), 1)
+        self.assertNotIn('MOTOR_RELEASE', commands)
+        self.assertIn('TURN_OFF_HEATERS', commands)
+
+    def test_pickup_never_retries_when_target_is_neither_docked_nor_attached(self):
+        # A head out of its holder and not on the carriage may be loose or
+        # dropped: fail closed, never open the lock and go back in.
+        loose = ([True, False, True, True], [False] * 4)
+        board, commands = self._grab_board([loose])
+        with self.assertRaisesRegex(RuntimeError, 'Missing dock confirmation for T1'):
+            board._pickup(GCmd(), 1)
+        self.assertEqual(commands.count('MOTOR_GRAB'), 1)
+        self.assertNotIn('MOTOR_RELEASE', commands)
+        self.assertIn('TURN_OFF_HEATERS', commands)
+
+    def _mount_board(self, mount_reads):
+        # Picking up T1; records settle pauses and mount switch reads in order.
+        board, commands = self._grab_board([self.T1_ATTACHED])
+        board.toolchange_sensor_settle_ms = 50
+        events = []
+        reads = iter(mount_reads)
+        board._pause_ms = lambda ms: events.append(('pause', ms))
+        def read(name, gcmd):
+            value = next(reads)
+            events.append((name, value))
+            return value
+        board._button = read
+        return board, commands, events
+
+    def test_pickup_locks_only_after_mount_settles_and_closes(self):
+        board, commands, events = self._mount_board([False, False, True])
+        gcmd = GCmd()
+        board._pickup(gcmd, 1)
+        self.assertEqual(events[:6], [
+            ('pause', 50), ('grab1', False), ('pause', 50), ('grab1', False),
+            ('pause', 50), ('grab1', True)])
+        self.assertIn('MOTOR_GRAB', commands)
+        self.assertEqual(board.active, 1)
+        self.assertEqual(gcmd.messages, ['T1 mount sensor closed after 100 ms'])
+
+    def test_pickup_never_locks_when_mount_sensor_stays_open(self):
+        board, commands, events = self._mount_board([False] * 3)
+        board.pickup_mount_timeout_ms = 100
+        with self.assertRaisesRegex(RuntimeError, 'T1 grab sensor did not engage'):
+            board._pickup(GCmd(), 1)
+        self.assertEqual([e for e in events if e[0] == 'grab1'],
+                         [('grab1', False)] * 3)
+        self.assertNotIn('MOTOR_GRAB', commands)
 
     def test_select_sets_part_accel_only_after_success(self):
         board = self.board
