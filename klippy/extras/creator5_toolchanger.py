@@ -2552,11 +2552,20 @@ class Creator5Toolchanger:
             repeats = gcmd.get_int('REPEATS', 1, minval=1, maxval=5)
             refine = gcmd.get_int('REFINE', 1, minval=0, maxval=1)
             host_max_runs = gcmd.get_int('MAX_RUNS', 9, minval=3, maxval=20)
+            # A filament whose pressure settles fast (PLA) moves the load
+            # reading very little; it needs many more strokes
+            host_weak_runs = gcmd.get_int('WEAK_RUNS', 24, minval=0,
+                                          maxval=40)
             apply_result = gcmd.get_int('APPLY', 0, minval=0, maxval=1)
             host_fast = gcmd.get_float('FAST', 10.4, above=1., maxval=25.)
             host_ratio = gcmd.get_float('RATIO', .25, above=.01, maxval=.5)
             host_strokes = gcmd.get_int('STROKES', 6, minval=2, maxval=16)
             host_slow = gcmd.get_float('SLOW', 1., above=0., below=host_fast)
+            # Extruder run current during the strokes, as a fraction of the
+            # configured one; lower makes the load reading respond more to
+            # nozzle pressure
+            host_current = gcmd.get_float('CURRENT', 1., minval=.3,
+                                          maxval=1.)
             host_times = (gcmd.get_float('LEAD', .4, minval=.2, maxval=2.),
                           gcmd.get_float('FAST_TIME', .5, minval=.35,
                                          maxval=2.),
@@ -2609,7 +2618,8 @@ class Creator5Toolchanger:
                                     candidates * repeats, refine,
                                     host_fast, host_slow, host_ratio,
                                     host_strokes, host_times, fast_feed,
-                                    host_max_runs)
+                                    host_max_runs, host_weak_runs,
+                                    host_current)
                     calibrated = apply_result and self._flow_host_apply(
                         gcmd, attached, extruder)
                     return
@@ -2773,7 +2783,7 @@ class Creator5Toolchanger:
 
     def _flow_host(self, gcmd, attached, extruder, sensor, candidates,
                    refine, fast, slow, ratio, strokes, times, fast_feed,
-                   max_runs):
+                   max_runs, weak_runs=0, current=1.):
         """Host-scored flow test; leaves the fit in self._flow_host_fit."""
         from . import c5_pa_analysis
         lead, fast_time, slow_time = times
@@ -2819,9 +2829,27 @@ class Creator5Toolchanger:
             self._flow_write_csv(runs, path, first=len(all_runs))
             all_runs.extend(runs)
         self._flow_host_fit = None
+        tmc = self.printer.lookup_object('tmc2209 ' + extruder)
+        run_current = tmc.get_status(None)['run_current']
+        if current < 1.:
+            self._run('SET_TMC_CURRENT STEPPER=%s CURRENT=%.3f'
+                      % (extruder, run_current * current))
         try:
             measure(candidates)
             fit = c5_pa_analysis.fit_zero(points)
+            # Repeat the tested advances while the load barely responds,
+            # up to WEAK_RUNS; extra runs around a noise estimate would
+            # not help
+            while (refine and len(all_runs) + len(candidates) <= weak_runs
+                   and abs(fit.t_stat) < c5_pa_analysis.MIN_T_STAT):
+                gcmd.respond_info('T%d host flow test: weak load signal '
+                                  '(t=%.1f); repeating' % (attached,
+                                                           fit.t_stat))
+                measure(candidates)
+                fit = c5_pa_analysis.fit_zero(points)
+            # Leave the repeats as much room to refine as a normal run has
+            max_runs = max(max_runs,
+                           len(all_runs) + max_runs - len(candidates))
             # Add runs either side of the estimate while it is too
             # uncertain, up to MAX_RUNS.
             while (refine and len(all_runs) + 2 <= max_runs
@@ -2834,6 +2862,10 @@ class Creator5Toolchanger:
             gcmd.respond_info('T%d host flow test failed: %s; pressure '
                               'advance unchanged' % (attached, e))
             return
+        finally:
+            if current < 1.:
+                self._run('SET_TMC_CURRENT STEPPER=%s CURRENT=%.3f'
+                          % (extruder, run_current))
         self._flow_host_fit = fit
         problem = fit.problem()
         gcmd.respond_info(

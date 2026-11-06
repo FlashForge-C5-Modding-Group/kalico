@@ -530,6 +530,49 @@ class Creator5OffsetTests(unittest.TestCase):
         self.assertEqual(switch.saved_key, 'c5_host_pressure_advance')
         self.assertEqual(switch.get_status(0.), {'value': 0.})
 
+    def _host_flow_board(self):
+        board = self.board
+        tmc = mock.Mock()
+        tmc.get_status.return_value = {'run_current': .7}
+        tmc.mcu_tmc.get_fields.return_value.get_field.return_value = 4
+        extruder = mock.Mock()
+        extruder.extruder_stepper.stepper.get_step_dist.return_value = .001
+        board.printer.lookup_object.side_effect = (
+            lambda name, *default: tmc if name.startswith('tmc2209')
+            else extruder)
+        board._run = mock.Mock()
+        board._flow_capture = mock.Mock(return_value=[])
+        board._flow_write_csv = mock.Mock()
+        return board
+
+    def _host_flow(self, board, gcmd, current):
+        spec = importlib.util.spec_from_file_location(
+            'klippy.extras.c5_pa_analysis', EXTRAS_DIR / 'c5_pa_analysis.py')
+        analysis = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(analysis)
+        with mock.patch.dict(sys.modules, {
+                'klippy': types.ModuleType('klippy'),
+                'klippy.extras': extras_package,
+                'klippy.extras.c5_pa_analysis': analysis}), \
+                mock.patch.object(MODULE, '__package__', 'klippy.extras'):
+            board._flow_host(gcmd, 1, 'extruder1', 'eboard', (0., .05, .1),
+                             1, 10.4, 1., .25, 6, (.4, .5, .4), 600., 9,
+                             24, current)
+
+    def test_host_flow_lowers_current_and_restores_it(self):
+        board = self._host_flow_board()
+        gcmd = GCmd()
+        self._host_flow(board, gcmd, .8)     # no strokes: the fit fails
+        self.assertEqual(board._run.call_args_list, [
+            mock.call('SET_TMC_CURRENT STEPPER=extruder1 CURRENT=0.560'),
+            mock.call('SET_TMC_CURRENT STEPPER=extruder1 CURRENT=0.700')])
+        self.assertIn('host flow test failed', gcmd.messages[-1])
+
+    def test_host_flow_keeps_current_by_default(self):
+        board = self._host_flow_board()
+        self._host_flow(board, GCmd(), 1.)
+        board._run.assert_not_called()
+
     def test_misc_switch_restores_and_saves_fluidd_changes(self):
         printer, gcode = mock.Mock(), mock.Mock()
         printer.lookup_object.return_value = mock.Mock(

@@ -19,6 +19,7 @@ EARLY_LEN = .06       # s
 RIPPLE_HARMONICS = 4
 
 MIN_STROKE = .3       # s
+STALL = 20            # a reading at or below this means the motor stalled
 MIN_T_STAT = 4.
 MAX_INTERVAL = .03
 
@@ -51,6 +52,11 @@ def stroke_drifts(t, value, v, e, fast, period, skip=1):
     import numpy as np
     t, y, v, e = (np.asarray(x, float) for x in (t, value, v, e))
     used = strokes(t, v, fast)[skip:]
+    # A stroke whose advance push stalled the motor says nothing about
+    # pressure
+    used = [(a, b) for a, b in used
+            if y[(t >= a + SETTLE) & (t <= b - .02)].min(initial=STALL + 1)
+            > STALL]
     if not used:
         return []
     offsets, earlies, sel = [], [], np.zeros(len(t), bool)
