@@ -64,7 +64,7 @@ def load_classes(filename, names, symbols=None):
 
 
 chelper = types.SimpleNamespace(get_ffi=Mock(return_value=(None, Mock())))
-utils = load_classes('AFC_utils.py', ['AFC_moonraker', 'check_and_return'])
+utils = load_classes('AFC_utils.py', ['AFC_moonraker', 'check_and_return', 'get_led_color'])
 AFC_moonraker = utils.AFC_moonraker
 stats_module = load_classes('AFC_stats.py', ['AFCStats_var', 'AFCStats'],
                            {'check_and_return': utils.check_and_return})
@@ -730,13 +730,14 @@ AFCExtruderStats = load_classes('AFC_extruder.py', ['AFCExtruderStats']).AFCExtr
 lane_types = load_classes('AFC_lane.py', [
     'AssistActive', 'SpeedMode', 'MoveDirection', 'AFCLaneState',
     'AFCHomingPoints', 'AFCMoveWarning', 'AFCLane'],
-    {'AFC_assist': assist, 'EXCLUDE_TYPES': ['HTLF', 'Claymore', 'OpenAMS', 'ViViD'],
+    {'AFC_assist': assist, 'get_led_color': utils.get_led_color, 'EXCLUDE_TYPES': ['HTLF', 'Claymore', 'OpenAMS', 'ViViD'],
      'VALID_DIRECT_HUB': ['direct', 'direct_load']})
 AFCLane = lane_types.AFCLane
 AFC_PrintFileMetaData = load_classes('AFC_utils.py',
                                    ['AFC_PrintFileMetaData']).AFC_PrintFileMetaData
 owner_types = load_classes('AFC.py', ['State', 'afc'],
-                           {**vars(lane_types), 'AFC_VERSION': 'test'})
+                           {**vars(lane_types), 'AFC_VERSION': 'test',
+                            'get_led_color': utils.get_led_color})
 AFC = owner_types.afc
 
 
