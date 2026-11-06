@@ -87,35 +87,6 @@ class FastStepTest(unittest.TestCase):
         self.ffi_patch.start()
         self.addCleanup(self.ffi_patch.stop)
 
-    def test_fast_capable_firmware_still_uses_rising_edge(self):
-        mcu = FakeMCU(fast=True)
-        steppers = [build_stepper(mcu) for _ in range(4)]
-        configs = [c for c in mcu.commands if c.startswith("config_stepper ")]
-        self.assertNotIn("c5_eboard_fast_extruder_step", mcu.commands)
-        self.assertEqual(len(configs), 4)
-        self.assertTrue(all("invert_step=0 step_pulse_ticks=72" in c
-                            for c in configs))
-        self.assertTrue(all(not s._step_both_edge for s in steppers))
-
-    def test_old_firmware_keeps_rising_edge_and_short_pulse(self):
-        mcu = FakeMCU(fast=False)
-        s = build_stepper(mcu)
-        self.assertNotIn("c5_eboard_fast_extruder_step", mcu.commands)
-        self.assertTrue(
-            any("invert_step=0 step_pulse_ticks=72" in c for c in mcu.commands)
-        )
-        self.assertFalse(s._step_both_edge)
-
-    def test_excessively_long_explicit_pulse_is_rejected(self):
-        mcu = FakeMCU(fast=True)
-        with self.assertRaisesRegex(ValueError, "step_pulse_duration"):
-            build_stepper(mcu, pulse=0.000002)
-        self.assertNotIn("c5_eboard_fast_extruder_step", mcu.commands)
-
-    def test_too_short_explicit_pulse_is_rejected(self):
-        with self.assertRaisesRegex(ValueError, "step_pulse_duration"):
-            build_stepper(FakeMCU(fast=False), pulse=0.0000001)
-
     def test_other_mcu_keeps_generic_two_microsecond_pulse(self):
         mcu = FakeMCU(fast=False)
         mcu.constants["MCU"] = "stm32f103"

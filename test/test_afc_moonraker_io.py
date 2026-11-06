@@ -1300,61 +1300,6 @@ class TestAFCLaneHandleMoonrakerConnect:
         assert io.logger.messages == []
 
 
-class TestCreator5InventoryOrdering:
-    def test_connection_event_cannot_publish_before_lane_cleanup_finishes(
-            self, afc_connection, tmp_path):
-        obj, io = afc_connection
-        sync_types = load_classes('creator5_filament_sync.py',
-                                  ['empty_filament', 'Creator5FilamentSync'])
-        config = Config(obj.printer, filename=str(tmp_path / "inventory.json"),
-                        moonraker_url=io.client.host)
-        publisher = sync_types.Creator5FilamentSync(config)
-        io.client.delete_lane_data = types.MethodType(AFC_moonraker.delete_lane_data, io.client)
-        io.responses[0] = {"value": {"stale": "old"}}
-        io.contents[("lane_data", "stale")] = "old"
-        gate = io.gates[1] = threading.Event()
-        completed = threading.Event()
-        errors = []
-
-        def prep():
-            try:
-                obj.handle_moonraker_connect()
-            except BaseException as exc:
-                errors.append(exc)
-            finally:
-                completed.set()
-
-        helper = threading.Thread(target=prep)
-        helper.start()
-        try:
-            io.wait_requests(2)
-            assert io.records == [
-                ("GET", "", "", None), ("DELETE", "lane_data", "stale", None)]
-            assert obj.printer.events == []
-            assert not completed.is_set()
-            assert io.contents == {("lane_data", "stale"): "old"}
-            assert io.escaped == []
-        finally:
-            gate.set()
-            helper.join(WAIT)
-            publisher.executor.shutdown(wait=True)
-        assert not helper.is_alive()
-        assert errors == []
-        assert completed.is_set()
-        io.wait_idle()
-        assert obj.printer.events == ["afc:moonraker_connect"]
-        inventory_posts = [record for record in io.records if record[1] == "lane_data"]
-        assert inventory_posts == [("DELETE", "lane_data", "stale", None)] + [
-            ("POST", "lane_data", f"c5_tool{index}", {
-                "material": "", "color": "", "nozzle_temp": 0, "bed_temp": 0,
-                "spool_id": None, "lane": str(index)}) for index in range(4)]
-        assert ("lane_data", "stale") not in io.contents
-        assert {key for namespace, key in io.contents if namespace == "lane_data"} == {
-            "c5_tool0", "c5_tool1", "c5_tool2", "c5_tool3"}
-        io.reactor.run_callbacks()
-        assert io.logger.messages == [("debug", "Removing stale from lane_data")]
-
-
 class TestCooperativeMoonrakerResults:
     @pytest.mark.parametrize(("operation", "response", "expected", "path"), [
         (lambda client: client.get_spool(7),
@@ -2287,24 +2232,3 @@ class TestSpoolCommandCompletionBoundaries:
         lane.unit_obj.lane_loaded.assert_called_once_with(lane, force=True)
         spool.set_active_spool.assert_called_once_with(8)
         lane.send_lane_data.assert_called_once()
-
-    @pytest.mark.parametrize("response", [None, {"filament": None}])
-    def test_creator5_failed_real_lookup_preserves_record_and_gcode_error(
-            self, afc_connection, response):
-        obj, io = afc_connection
-        obj.moonraker = io.client
-        obj.spoolman = "configured"
-        spool = AFCSpool.__new__(AFCSpool)
-        spool.afc = obj
-        spool.creator5_tool_lanes = {"T2": 2}
-        records = [{"material": "PETG", "color": "#112233"} for _ in range(4)]
-        spool.creator5_filament_sync = Mock(filaments=records)
-        command = types.SimpleNamespace(
-            get=lambda key, default=None: {"LANE": "T2", "SPOOL_ID": "8"}.get(
-                key, default), error=ValueError)
-        io.responses[0] = response
-        with pytest.raises(ValueError, match="Cannot assign spool to T2: Spool ID not found"):
-            spool.cmd_SET_SPOOL_ID(command)
-        assert io.requests[0][0] == "/server/spoolman/proxy"
-        assert records[2] == {"material": "PETG", "color": "#112233"}
-        spool.creator5_filament_sync.set_tool_fields.assert_not_called()

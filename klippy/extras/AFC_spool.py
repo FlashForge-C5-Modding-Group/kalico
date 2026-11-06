@@ -75,12 +75,6 @@ class AFCSpool:
         self.print_task_config_obj = self.printer.lookup_object('print_task_config', None)
 
         self.disable_weight_check = self.afc.disable_weight_check
-        self.creator5_filament_sync = self.printer.lookup_object(
-            'creator5_filament_sync', None)
-        self.creator5_tool_lanes = {}
-        self.printer.register_event_handler(
-            'klippy:ready', self._register_creator5_tool_macros)
-
         # Registering stepper callback so that mux macro can be set properly with valid lane names
         self.printer.register_event_handler("afc_stepper:register_macros",self.register_lane_macros)
 
@@ -88,29 +82,6 @@ class AFCSpool:
         # Old name kept so Creator 5 configs from before the upstream rename keep working.
         self.gcode.register_command("RESET_AFC_MAPPING", self.cmd_AFC_RESET_MAPPING, desc=self.cmd_AFC_RESET_MAPPING_help)
         self.gcode.register_command("SET_NEXT_SPOOL_ID", self.cmd_SET_NEXT_SPOOL_ID, desc=self.cmd_SET_NEXT_SPOOL_ID_help)
-
-    def _register_creator5_tool_macros(self):
-        if self.creator5_filament_sync is None:
-            return
-        for tool in self.afc.tools.values():
-            index = getattr(tool, 'creator5_tool_index', None)
-            if index is None:
-                continue
-            lane = 'T%d' % index
-            self.creator5_tool_lanes[lane] = index
-            tool.creator5_filament_sync = self.creator5_filament_sync
-            for name, handler, desc in (
-                ('SET_COLOR', self.cmd_SET_COLOR, self.cmd_SET_COLOR_help),
-                ('SET_MATERIAL', self.cmd_SET_MATERIAL,
-                 self.cmd_SET_MATERIAL_help),
-                ('AFC_SET_SPOOL_TEMP', self.cmd_AFC_SET_SPOOL_TEMP,
-                 self.cmd_AFC_SET_SPOOL_TEMP_help),
-                ('SET_SPOOL_ID', self.cmd_SET_SPOOL_ID,
-                 self.cmd_SET_SPOOL_ID_help),
-                ('AFC_CLEAR_FILAMENT', self.cmd_AFC_CLEAR_FILAMENT,
-                 self.cmd_AFC_CLEAR_FILAMENT_help)):
-                self.gcode.register_mux_command(name, 'LANE', lane,
-                                                handler, desc=desc)
 
     def register_lane_macros(self, lane_obj: AFCLane) -> None:
         """
@@ -202,20 +173,6 @@ class AFCSpool:
         lane = gcmd.get('LANE', None)
         if lane is None:
             self.logger.info("No LANE parameter provided, please specify a valid LANE parameter.")
-            return
-        if lane in self.creator5_tool_lanes:
-            index = self.creator5_tool_lanes[lane]
-            current = self.creator5_filament_sync.filaments[index]
-            try:
-                self.creator5_filament_sync.set_tool_fields(
-                    index,
-                    bed_temp=gcmd.get_int('BED_TEMP', current['bed_temp'],
-                                          minval=0, maxval=130),
-                    nozzle_temp=gcmd.get_int(
-                        'EXTRUDER_TEMP', current['nozzle_temp'],
-                        minval=0, maxval=350))
-            except (OSError, ValueError) as exc:
-                raise gcmd.error('Cannot update %s filament: %s' % (lane, exc))
             return
         cur_lane = self.afc.lanes.get(lane)
         if cur_lane is None:
@@ -502,14 +459,6 @@ class AFCSpool:
             self.logger.info("No LANE Defined")
             return
         color = gcmd.get('COLOR', '#000000')
-        if lane in self.creator5_tool_lanes:
-            try:
-                self.creator5_filament_sync.set_tool_fields(
-                    self.creator5_tool_lanes[lane], color=color,
-                    spool_id=None)
-            except (OSError, ValueError) as exc:
-                raise gcmd.error('Cannot update %s color: %s' % (lane, exc))
-            return
         if lane not in self.afc.lanes:
             self.logger.info(f"{lane} Unknown")
             return
@@ -586,14 +535,6 @@ class AFCSpool:
         if lane is None:
             self.logger.info("No LANE Defined")
             return
-        if lane in self.creator5_tool_lanes:
-            try:
-                self.creator5_filament_sync.set_tool_fields(
-                    self.creator5_tool_lanes[lane],
-                    material=gcmd.get('MATERIAL'), spool_id=None)
-            except (OSError, ValueError) as exc:
-                raise gcmd.error('Cannot update %s material: %s' % (lane, exc))
-            return
         if lane not in self.afc.lanes:
             self.logger.info(f"{lane} Unknown")
             return
@@ -613,17 +554,6 @@ class AFCSpool:
         cur_lane.send_lane_data()
         self.afc.save_vars()
         self.set_snapmaker_filament_params(cur_lane)
-
-    cmd_AFC_CLEAR_FILAMENT_help = "Clear a Creator 5 standalone tool filament"
-    def cmd_AFC_CLEAR_FILAMENT(self, gcmd):
-        lane = gcmd.get('LANE')
-        if lane not in self.creator5_tool_lanes:
-            raise gcmd.error('Unknown Creator 5 tool: %s' % lane)
-        try:
-            self.creator5_filament_sync.clear_tool(
-                self.creator5_tool_lanes[lane])
-        except OSError as exc:
-            raise gcmd.error('Cannot clear %s filament: %s' % (lane, exc))
 
     def set_active_spool(self, ID: Optional[Union[int, str]]) -> None:
         """
@@ -663,42 +593,6 @@ class AFCSpool:
         ```
         """
         lane = gcmd.get('LANE', None)
-        if lane in self.creator5_tool_lanes:
-            index = self.creator5_tool_lanes[lane]
-            spool_id = gcmd.get('SPOOL_ID', '')
-            if not spool_id:
-                try:
-                    self.creator5_filament_sync.clear_tool(index)
-                except OSError as exc:
-                    raise gcmd.error('Cannot clear %s spool: %s' % (lane, exc))
-                return
-            if self.afc.spoolman is None:
-                raise gcmd.error('Spoolman is not configured; use '
-                                 'SET_MATERIAL and SET_COLOR instead')
-            current_record = dict(self.creator5_filament_sync.filaments[index])
-            try:
-                spool_id = int(spool_id)
-                if spool_id <= 0:
-                    raise ValueError('Spool ID must be positive')
-                spool = self.afc.moonraker.get_spool(spool_id)
-                if not spool or not isinstance(spool.get('filament'), dict):
-                    raise ValueError('Spool ID not found')
-                filament = spool['filament']
-                color = (filament.get('color_hex') or '').split(',')[0]
-                material = filament.get('material') or ''
-            except (OSError, ValueError, TypeError) as exc:
-                raise gcmd.error('Cannot assign spool to %s: %s' % (lane, exc))
-            if self.creator5_filament_sync.filaments[index] != current_record:
-                raise gcmd.error(
-                    'Filament assignment changed while looking up spool; retry SET_SPOOL_ID')
-            try:
-                self.creator5_filament_sync.set_tool_fields(
-                    index, spool_id=spool_id, material=material, color=color,
-                    nozzle_temp=filament.get('settings_extruder_temp') or 0,
-                    bed_temp=filament.get('settings_bed_temp') or 0)
-            except (OSError, ValueError, TypeError) as exc:
-                raise gcmd.error('Cannot assign spool to %s: %s' % (lane, exc))
-            return
         if self.afc.spoolman is not None:
             if lane is None:
                 self.logger.info("No LANE Defined")

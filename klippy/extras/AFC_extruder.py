@@ -1333,10 +1333,6 @@ class AFCExtruder:
         self.response['on_shuttle'] = mounted
         if self.creator5_tool_index is not None:
             self.response['mount_sensor_error'] = self.creator5_mount_error
-            filament_sync = getattr(self, 'creator5_filament_sync', None)
-            if filament_sync is not None:
-                self.response.update(filament_sync.filaments[
-                    self.creator5_tool_index])
         self.response['is_standalone'] = self.is_standalone()
         self.response['auto_load_on_tool_start'] = self.auto_load_on_tool_start
         self.response['next_pickup'] = self.next_pickup

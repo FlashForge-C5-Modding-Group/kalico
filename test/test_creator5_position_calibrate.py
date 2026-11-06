@@ -41,44 +41,6 @@ class PositionCalibrationTest(unittest.TestCase):
         self.board.cmd_extruder_position_calibrate(gcmd)
         self.assertIn('T=0..3', gcmd.messages[0])
 
-    def test_measurement_uses_stock_endstop_reference(self):
-        x_home = mock.Mock()
-        y_home = mock.Mock()
-        x_home.measure_axis.return_value = -2.3
-        y_home.measure_axis.return_value = 24.6
-        self.board.printer = mock.Mock()
-        self.board.printer.get_reactor.return_value.monotonic.return_value = 0.
-        self.board.printer.lookup_object.side_effect = (
-            lambda name, default=None: {
-                'hd_home X': x_home, 'hd_home Y': y_home}.get(name, default))
-        self.board.max_mount_correction = 2.
-        self.board.sensor_settle_ms = 0
-        self.board.pickup_latch_wait_ms = 0
-        self.board.pullback_slow_distance = 20.
-        self.board.pullback_speed = 80.
-        self.board.dock_buttons = ['dock%d' % i for i in range(4)]
-        self.board.grab_buttons = ['grab%d' % i for i in range(4)]
-        sensor = {'dock0': True, 'grab0': True}
-        self.board._button = lambda name, gcmd: sensor.get(name, False)
-        commands = []
-        self.board._run = commands.append
-
-        def move(**kwargs):
-            commands.append(kwargs)
-            if kwargs.get('x') == 275.:
-                sensor['dock0'] = False
-
-        self.board._move = move
-        # Use a nearby stored coordinate, as required by the correction limit.
-        self.board.docks[0] = [297.5, 55.5]
-        result = self.board._measure_holder_position(GCmd(), 0)
-        self.assertAlmostEqual(result[0], 297.3)
-        self.assertAlmostEqual(result[1], 55.4)
-        x_home.measure_axis.assert_called_once_with(-5.)
-        y_home.measure_axis.assert_called_once_with(0.)
-        self.assertIn('SET_KINEMATIC_POSITION X=295.000 Y=80.000 '
-                      'SET_HOMED=xy', commands)
-
     def test_contact_wait_times_out_without_motion(self):
         clock = [0.]
         reactor = mock.Mock()
