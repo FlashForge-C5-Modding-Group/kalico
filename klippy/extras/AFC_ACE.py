@@ -1141,7 +1141,10 @@ class AceDryerHeater:
         return False
 
     def get_status(self, eventtime=None):
-        return {"temperature": round(self.temperature, 1), "target": self.target}
+        # The box humidity too, so the UIs show the ACE as one row: Fluidd
+        # draws humidity under a heater's temperature as it does a sensor's
+        return {"temperature": round(self.temperature, 1), "target": self.target,
+                "humidity": round(self.unit.humidity_sensor.humidity, 1)}
 
 
 class AceHumiditySensor:
@@ -1297,11 +1300,6 @@ class afcACE(afcUnit):
         pheaters.available_heaters.append(dryer_name)
         self.printer.add_object(dryer_name, self.dryer_heater)
         self.printer.add_object(hum_name, self.humidity_sensor)
-        # Fluidd and Mainsail list only temperature_sensor objects (with
-        # their humidity); the same sensor goes in under that name too
-        box_name = f"temperature_sensor {self.name}"
-        pheaters.available_sensors.append(box_name)
-        self.printer.add_object(box_name, self.humidity_sensor)
         # Mainline Klipper routes SET_HEATER_TEMPERATURE through
         # heaters.lookup_heater (the dict insert above covers it); Kalico
         # instead registers it as a per-heater mux command, so register ours —
