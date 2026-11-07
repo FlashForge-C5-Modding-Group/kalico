@@ -439,6 +439,25 @@ class Creator5AfcSensorTest(unittest.TestCase):
         lane.set_tool_unloaded.assert_not_called()
         lane.set_unloaded.assert_not_called()
 
+    def test_on_shuttle_leaves_a_unit_fed_head_alone(self):
+        # Fed by a unit's lane (an ACE), the head's own standalone lane must
+        # not be marked loaded: it would name a lane that no longer exists
+        on_shuttle = load_method('AFC_extruder.py', 'AFCExtruder',
+                                 'on_shuttle', symbols={
+                                     'AFCLaneState': AFCLaneState})
+        toolchanger = mock.Mock()
+        toolchanger.attached_tool_from_pins.return_value = 1
+        lane = mock.Mock(tool_loaded=False, status=AFCLaneState.NONE)
+        source = types.SimpleNamespace(
+            creator5_tool_index=1, tool_start_state=True, tc_lane=lane,
+            creator5_mount_error=None, no_lanes=False,
+            printer=mock.Mock(
+                lookup_object=mock.Mock(return_value=toolchanger)))
+
+        self.assertTrue(on_shuttle(source))
+        lane.set_tool_loaded.assert_not_called()
+        lane.set_loaded.assert_not_called()
+
     def test_on_shuttle_downgrades_tooled_to_loaded_once_docked(self):
         # AFCLaneState.TOOLED means "mounted in the toolhead right now" --
         # Mainsail/grumpyscreen grey out Eject and swap Load->Unload based on
