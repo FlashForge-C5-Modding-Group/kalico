@@ -2043,28 +2043,6 @@ path:
 #   M20 and M23 commands. The default is False.
 ```
 
-### [usb_gcode]
-
-Offer a USB drive as the G-code folder when one is plugged in. The
-drive is mounted at `mount_point` and a prompt asks whether to use it.
-Using it bind-mounts the drive over the [virtual_sdcard] path, so
-Klipper and Moonraker both list the drive's files with no restart.
-Removing the drive, or `USB_GCODE_INTERNAL`, brings the internal
-files back. Nothing is mounted or switched while a print is running or
-paused; the prompt waits until it ends. Commands: `USB_GCODE_USE`,
-`USB_GCODE_INTERNAL`, `USB_GCODE_KEEP`.
-
-```
-[usb_gcode]
-#mount_point: /mnt
-#   Where the drive is mounted. The default is /mnt.
-#poll_interval: 2.0
-#   Seconds between checks for a drive. The default is 2.
-#mount_options: iocharset=utf8,noatime
-#   Options for the first (vfat) mount attempt. Other file systems are
-#   tried with default options.
-```
-
 ### [sdcard_loop]
 
 Some printers with stage-clearing features, such as a part ejector or
