@@ -2225,6 +2225,33 @@ class Creator5OffsetTests(unittest.TestCase):
                          ['attached=T1 dock=1011 grab=0100'])
         self.assertEqual(self.board.active, 1)
 
+    def _plate_step(self, homed, z):
+        toolhead = self.board.printer.lookup_object.return_value
+        toolhead.get_status.return_value = {'homed_axes': homed}
+        toolhead.get_position.return_value = [150., 150., z, 0.]
+        self.board.plate_removal_z = 60.
+        self.board.lower_bed_speed = 10.
+        self.board.gcode = mock.Mock()
+        self.board._move = mock.Mock()
+        self.board._offset_wizard_step(GCmd(), 'plate', 'ALL')
+        prompt = ' '.join(c.args[0] for c in self.board.gcode.respond_raw.call_args_list)
+        return self.board._move, prompt
+
+    def test_offset_wizard_lowers_bed_before_plate_removal(self):
+        move, prompt = self._plate_step('xyz', 10.)
+        move.assert_called_once_with(z=60., feed=600.)
+        self.assertIn('Remove the build plate', prompt)
+
+    def test_offset_wizard_leaves_a_low_bed_and_unhomed_z_alone(self):
+        move, prompt = self._plate_step('xyz', 120.)
+        move.assert_not_called()
+        self.assertIn('Remove the build plate', prompt)
+        self.board.printer.lookup_object.return_value.get_status.return_value = {
+            'homed_axes': 'xy'}
+        self.board._move = mock.Mock()
+        self.board._offset_wizard_step(GCmd(), 'plate', '2')
+        self.board._move.assert_not_called()
+
 
 if __name__ == '__main__':
     unittest.main()

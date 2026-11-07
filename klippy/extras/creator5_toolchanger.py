@@ -190,6 +190,10 @@ class Creator5Toolchanger:
         # Where C5_LOWER_BED stops: 5 mm above the bottom of Z travel (256).
         self.lower_bed_z = config.getfloat('lower_bed_z', 254., above=0.,
                                            maxval=256.)
+        # Where the offset wizard lowers the bed before asking for the build
+        # plate to be removed, so it slides out under the nozzle.
+        self.plate_removal_z = config.getfloat('plate_removal_z', 60., above=0.,
+                                               maxval=256.)
         self.dock_approach_speed = config.getfloat(
             'dock_approach_speed', 20., above=0.)
         self.dock_predock_offset = config.getfloat(
@@ -2347,6 +2351,13 @@ class Creator5Toolchanger:
             label = 'all tools' if tool == 'ALL' else 'T' + tool
             nxt = ('STEP=run TOOL=ALL LEVELBOARD=1' if tool == 'ALL'
                    else 'STEP=probe TOOL=%s' % tool)
+            # Room to take the plate out: homing leaves the nozzle just above it
+            toolhead = self.printer.lookup_object('toolhead')
+            if ('z' in homed
+                    and toolhead.get_position()[2] < self.plate_removal_z - .001):
+                self._move(z=self.plate_removal_z,
+                           feed=self.lower_bed_speed * 60.)
+                toolhead.wait_moves()
             self._prompt('Remove the build plate',
                          ['Calibrating %s. Remove the build plate now, then '
                           'confirm. The probe checks that it is really gone '
