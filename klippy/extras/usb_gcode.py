@@ -77,7 +77,7 @@ class UsbGcode:
             "poll_interval", 2.0, minval=0.5
         )
         self.mount_options = config.get(
-            "mount_options", "iocharset=utf8,noatime"
+            "mount_options", "iocharset=utf8,noatime,flush"
         )
         self.gcode_path = None
         self.print_stats = None
@@ -154,7 +154,7 @@ class UsbGcode:
         if self.mount_attempt == 0:
             cmd = ["mount", "-t", "vfat", "-o", self.mount_options]
         else:
-            cmd = ["mount", "-o", "noatime"]
+            cmd = ["mount", "-o", "noatime,sync"]
         cmd += [self.device, self.mount_point]
         self.mount_attempt += 1
         try:
@@ -195,6 +195,7 @@ class UsbGcode:
                 % (self.label,)
             )
         self.device = self.disk = None
+        self.label = ""
         self.mounted = self.active = self.asked = False
 
     def _prompt(self):
