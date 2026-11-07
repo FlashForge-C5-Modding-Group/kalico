@@ -22,6 +22,7 @@ class GCodeNumericPrefixTests(unittest.TestCase):
         dispatch = gcode.GCodeDispatch.__new__(gcode.GCodeDispatch)
         dispatch.printer = mock.Mock()
         dispatch.printer.config_error = ValueError
+        dispatch.printer.run_result = None
         dispatch.printer.get_reactor.return_value.monotonic.return_value = 0.
         dispatch.ready_gcode_handlers = {}
         dispatch.base_gcode_handlers = {}

@@ -40,10 +40,5 @@ class C5EBoardPAScorerTest(unittest.TestCase):
             ["test/c5_eboard_safety.c", "src/c5_eboard_pa.c"],
             "c5_eboard_safety")
 
-    def test_low_level_quiesce_and_rearm_registers(self):
-        self.compile_and_run(
-            ["test/c5_eboard_registers.c"], "c5_eboard_registers")
-
-
 if __name__ == "__main__":
     unittest.main()

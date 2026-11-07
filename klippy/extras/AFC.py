@@ -50,13 +50,14 @@ try:
     )
 except: raise error(ERROR_STR.format(import_lib="AFC_functions", trace=traceback.format_exc()))
 
-try: from extras.AFC_utils import add_filament_switch, AFC_moonraker, AFC_PrintFileMetaData
+try: from extras.AFC_utils import (add_filament_switch, AFC_moonraker, AFC_PrintFileMetaData,
+                                  get_led_color)
 except: raise error(ERROR_STR.format(import_lib="AFC_utils", trace=traceback.format_exc()))
 
 try: from extras.AFC_stats import AFCStats
 except: raise error(ERROR_STR.format(import_lib="AFC_stats", trace=traceback.format_exc()))
 
-AFC_VERSION="1.2.8"
+AFC_VERSION="1.2.10"
 
 # Class for holding different states so its clear what all valid states are
 class State(str, Enum):
@@ -222,20 +223,20 @@ class afc:
         # led_name is not used, either use or needs to be removed, removing this would break everyone's config as well
         self.led_name               = config.get('led_name',None)
         self.led_off                = "0,0,0,0"
-        self.led_fault              = config.get('led_fault','1,0,0,0')                # LED color to set when faults occur in lane
-        self.led_ready              = config.get('led_ready','0,0.8,0,0')                # LED color to set when lane is ready
-        self.led_not_ready          = config.get('led_not_ready','1,0,0,0')            # LED color to set when lane not ready
-        self.led_loading            = config.get('led_loading','1,1,1,0')              # LED color to set when lane is loading
-        self.led_prep_loaded        = config.get('led_loading','1,1,1,0')              # LED color to set when lane is loaded
-        self.led_unloading          = config.get('led_unloading','1,1,.5,0')           # LED color to set when lane is unloading
-        self.led_tool_loaded        = config.get('led_tool_loaded','0,0,1,0')          # LED color to set when lane is loaded into tool
-        self.led_tool_loaded_idle   = config.get('led_tool_loaded_idle','0.4,0.4,0,0') # LED color to set when lane is loaded into tool and idle
-        self.led_tool_unloaded      = config.get('led_tool_unloaded', '1,0,0,0')       # LED color to set when lanes extruder is unloaded
-        self.led_buffer_advancing   = config.get('led_buffer_advancing','0,0,1,0')     # LED color to set when buffer is advancing
-        self.led_buffer_trailing    = config.get('led_buffer_trailing','0,1,0,0')      # LED color to set when buffer is trailing
-        self.led_buffer_neutral     = config.get('led_buffer_neutral', "1,1,1,1")
-        self.led_buffer_disabled    = config.get('led_buffer_disable', '0,0,0,0.25')   # LED color to set when buffer is disabled
-        self.led_spool_illum        = config.get('led_spool_illuminate', "1,1,1,1")    # LED color to illuminate under spool
+        self.led_fault              = get_led_color(config, 'led_fault','1,0,0,0')                # LED color to set when faults occur in lane
+        self.led_ready              = get_led_color(config, 'led_ready','0,0.8,0,0')              # LED color to set when lane is ready
+        self.led_not_ready          = get_led_color(config, 'led_not_ready','1,0,0,0')            # LED color to set when lane not ready
+        self.led_loading            = get_led_color(config, 'led_loading','1,1,1,0')              # LED color to set when lane is loading
+        self.led_prep_loaded        = get_led_color(config, 'led_loading','1,1,1,0')              # LED color to set when lane is loaded
+        self.led_unloading          = get_led_color(config, 'led_unloading','1,1,.5,0')           # LED color to set when lane is unloading
+        self.led_tool_loaded        = get_led_color(config, 'led_tool_loaded','0,0,1,0')          # LED color to set when lane is loaded into tool
+        self.led_tool_loaded_idle   = get_led_color(config, 'led_tool_loaded_idle','0.4,0.4,0,0') # LED color to set when lane is loaded into tool and idle
+        self.led_tool_unloaded      = get_led_color(config, 'led_tool_unloaded', '1,0,0,0')       # LED color to set when lanes extruder is unloaded
+        self.led_buffer_advancing   = get_led_color(config, 'led_buffer_advancing','0,0,1,0')     # LED color to set when buffer is advancing
+        self.led_buffer_trailing    = get_led_color(config, 'led_buffer_trailing','0,1,0,0')      # LED color to set when buffer is trailing
+        self.led_buffer_neutral     = get_led_color(config, 'led_buffer_neutral', "1,1,1,1")      # LED color to set when the buffer is neutral
+        self.led_buffer_disabled    = get_led_color(config, 'led_buffer_disable', '0,0,0,0.25')   # LED color to set when buffer is disabled
+        self.led_spool_illum        = get_led_color(config, 'led_spool_illuminate', "1,1,1,1")    # LED color to illuminate under spool
 
         # TOOL Cutting Settings
         self.tool                   = ''
@@ -843,7 +844,13 @@ class afc:
                 idx = int(str(cur_lane.current_map).lstrip("T"))
                 if idx < 0: raise ValueError("Negative tool index")
                 target_temp = self.print_tool_temperatures[idx]
-            except (ValueError, IndexError, TypeError, AttributeError) as e:
+            except IndexError as e:
+                self.logger.info(
+                    f"Could not resolve print_tool_temperatures index for lane {cur_lane.name}: "
+                    f"{e}. Falling back to AFC lane temperature"
+                )
+                target_temp, using_min_value = self._get_default_material_temps(cur_lane)
+            except (ValueError, TypeError, AttributeError) as e:
                 # Logging lane.name/e rather than cur_lane.current_map here: if the error came from
                 # resolving cur_lane.current_map itself, referencing it again would raise the same error.
                 self.logger.info(
@@ -1991,8 +1998,7 @@ class afc:
             tool_attempts = 0
             # A virtual tool_start sensor has no hardware to confirm against,
             # the distance move above is the whole load
-            if (cur_extruder.tool_start
-                and cur_extruder.tool_start != "virtual"):
+            if cur_extruder.has_toolhead_sensor:
                 while (not cur_lane.get_toolhead_pre_sensor_state()
                        or warn == AFCMoveWarning.WARN):
                     tool_attempts += 1

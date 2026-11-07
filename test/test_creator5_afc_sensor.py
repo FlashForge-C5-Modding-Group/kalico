@@ -238,7 +238,7 @@ class Creator5AfcSensorTest(unittest.TestCase):
         afc = mock.Mock()
         extruder = mock.Mock(
             creator5_tool_index=1, creator5_mount_error=None,
-            creator5_filament_sync=None, lanes={}, status='Idle', afc=afc)
+            lanes={}, status='Idle', afc=afc)
         extruder.on_shuttle.return_value = False
         self.assertEqual(status(extruder)['status'], 'Parked')
         afc.function.is_printing.assert_not_called()

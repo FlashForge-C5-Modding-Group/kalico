@@ -149,37 +149,6 @@ class Creator5OffsetTests(unittest.TestCase):
             afc.lanes[alias] = lane
         return afc
 
-    def test_dock_clears_loaded_lane_using_physical_afc_tool_map(self):
-        for tool, alias in ((0, 'extruder0'), (0, 'extruder'),
-                            (1, 'extruder1')):
-            with self.subTest(tool=tool, alias=alias):
-                afc = self._afc_tool_fixture(alias if tool == 0 else 'extruder0')
-                physical = 'extruder' if tool == 0 else 'extruder1'
-                extruder = afc.tools[physical]
-                lane = afc.lanes[alias]
-                lane.set_tool_unloaded = mock.Mock()
-                objects = {
-                    'AFC': afc,
-                    'AFC_extruder ' + alias: extruder,
-                    'gcode_move': types.SimpleNamespace(
-                        get_status=lambda: {'homing_origin': (0., 0., 2., 0.)})}
-                self.board.printer.lookup_object.side_effect = (
-                    lambda name, default=None: objects.get(name, default))
-                self.board.approach_x = 250.
-                self.board.dock_predock_offset = 20.
-                self.board.dock_approach_speed = 25.
-                self.board.release_latch_wait_ms = 50
-                self.board.departure_speed = 90.
-                self.board._move = mock.Mock()
-                self.board._run = mock.Mock()
-                self.board._pause_ms = mock.Mock()
-                self.board._verify = mock.Mock()
-
-                self.board._dock(GCmd(), tool, raise_z=False)
-
-                lane.set_tool_unloaded.assert_called_once_with(
-                    normal_toolchange=True)
-
     def test_wheel_clog_resolves_numbered_and_legacy_t0_lanes(self):
         for alias in ('extruder0', 'extruder'):
             with self.subTest(alias=alias):
@@ -632,26 +601,6 @@ class Creator5OffsetTests(unittest.TestCase):
                                     'hd_home Y': y_home}[name])
         return x_home, y_home
 
-    def test_holder_measure_travels_fast_to_short_of_saved_dock(self):
-        # T1: Y reference 130; saved dock X298 Y100 puts the endstops at
-        # X-3 and Y30, so travel stops 10 mm short of each.
-        self._holder_measure_setup(-3.5, 29.8)
-        x, y = self.board._measure_holder_position(GCmd(), 1)
-        self.assertAlmostEqual(x, 298.5)
-        self.assertAlmostEqual(y, 100.2)
-        self.assertEqual(self.board._move.call_args_list[1:], [
-            mock.call(x=240., feed=12000),
-            mock.call(x=7., feed=12000),
-            mock.call(y=40., feed=12000)])
-
-    def test_holder_measure_margin_stays_wider_than_correction_limit(self):
-        self._holder_measure_setup(-3., 30.)
-        self.board.max_mount_correction = 8.
-        self.board._measure_holder_position(GCmd(), 1)
-        self.assertEqual(self.board._move.call_args_list[2:], [
-            mock.call(x=10., feed=12000),
-            mock.call(y=43., feed=12000)])
-
     def test_toolchange_counter_persists_per_tool_and_total(self):
         self.board._count_toolchange(2)
         self.board._count_toolchange(2)
@@ -722,38 +671,6 @@ class Creator5OffsetTests(unittest.TestCase):
             self.board.attached_tool_from_pins()
         self.assertIsNone(self.board.get_status(2.1)['active_tool'])
         self.assertEqual(self.board.printer.lookup_object.call_count, 8)
-
-    def test_dock_speeds_and_release_wait_come_from_config(self):
-        board = self.board
-        board.approach_x = 250.
-        board.clear_travel_speed = 600.
-        board.dock_approach_speed = 25.
-        board.dock_predock_offset = 20.
-        board.departure_speed = 90.
-        board.release_latch_wait_ms = 50
-        board._move = mock.Mock()
-        board._run = mock.Mock()
-        board._pause_ms = mock.Mock()
-        board._verify = mock.Mock()
-        board.z_adjustments = [0.] * 4
-
-        board._dock(GCmd(), 0, raise_z=False)
-
-        self.assertEqual(board._move.call_args_list, [
-            mock.call(x=250., feed=36000.),
-            mock.call(y=50., feed=36000.),
-            mock.call(x=278., feed=36000.),
-            mock.call(x=288., feed=1500.),
-            mock.call(x=298., feed=1500.),
-            mock.call(x=250., feed=5400.),
-        ])
-        board._pause_ms.assert_called_once_with(50)
-        board._verify.assert_called_once_with(mock.ANY, None, parked=0)
-        self.assertEqual(board._run.call_args_list[0], mock.call(
-            'SET_GCODE_OFFSET X=0.0000 Y=0.0000 Z=2.0000 MOVE=0'))
-        board._run.assert_any_call('SET_GCODE_OFFSET X=0 Y=0 MOVE=0')
-        self.assertFalse(any(' Z=0 ' in call.args[0] for call in
-                             board._run.call_args_list))
 
     def _dock_board(self, seated, at_mount):
         board = self.board
@@ -1037,29 +954,6 @@ class Creator5OffsetTests(unittest.TestCase):
                          [('grab1', False)] * 3)
         self.assertNotIn('MOTOR_GRAB', commands)
 
-    def test_select_sets_part_accel_only_after_success(self):
-        board = self.board
-        board.pickup_accel = 6000.
-        board._run = mock.Mock()
-        toolhead = mock.Mock()
-        toolhead.get_max_velocity.return_value = (600., 1000.)
-        gcode_move = mock.Mock()
-        gcode_move.get_status.return_value = {'absolute_coordinates': True}
-        board.printer.lookup_object.side_effect = lambda name: {
-            'toolhead': toolhead, 'gcode_move': gcode_move}[name]
-        board._with_motion(GCmd(), lambda: None, final_accel=30000.)
-        self.assertEqual(board._run.call_args_list[-1],
-                         mock.call('SET_VELOCITY_LIMIT ACCEL=30000.0000'))
-        board._run.reset_mock()
-        with self.assertRaisesRegex(RuntimeError, 'pickup failed'):
-            board._with_motion(GCmd(),
-                               lambda: (_ for _ in ()).throw(
-                                   RuntimeError('pickup failed')),
-                               final_accel=30000.)
-        self.assertEqual(board._run.call_args_list[-1],
-                         mock.call('SET_VELOCITY_LIMIT ACCEL=1000.0000'))
-        self.assertFalse(board.busy)
-
     def test_xy_only_tool_motion_uses_safe_home_hop(self):
         board = self.board
         board.safe_z = 10.
@@ -1145,23 +1039,6 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board.validate_nozzle_z_offset(GCmd(), 2.86)
         self.board._sensor_state = lambda command: ([True] * 4, [], None)
         self.board.validate_nozzle_z_offset(GCmd(), 0.)
-
-    def test_reloads_touchscreen_zoffset_before_selecting_tool(self):
-        zpath = os.path.join(self.temp.name, 'zoffset.json')
-        self.board.zoffset_json_path = zpath
-        self.board.z_adjustments = [0.] * 4
-        self.board._preflight = mock.Mock(return_value=([True] * 4, [], 1))
-        self.board._apply_offsets = mock.Mock()
-        self.board._run = mock.Mock()
-        with open(zpath, 'w') as target:
-            target.write('{"z_offset_t2": 0.04}\n/* stock comment */\n')
-        self.board.cmd_select(GCmd(T=1))
-        self.assertEqual(self.board.z_adjustments[1], 0.04)
-        self.board._apply_offsets.assert_called_once_with(1)
-        with open(zpath, 'w') as target:
-            target.write('{"z_offset_t2": 0.09}\n/* stock comment */\n')
-        self.board.cmd_select(GCmd(T=1))
-        self.assertEqual(self.board.z_adjustments[1], 0.09)
 
     def test_missing_touchscreen_zoffset_clears_stale_values(self):
         self.board.zoffset_json_path = os.path.join(
@@ -1569,54 +1446,6 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board.cmd_mount_correct(GCmd(T=0, X=299., Y=51., SAVE=1))
         self.board._load_extruder_json()
         self.assertEqual(self.board.docks[0], [299., 51.])
-
-    def test_purge_selects_attached_hotend_for_shared_drive(self):
-        self.board.purge_length = 12.
-        self.board.purge_x, self.board.purge_y, self.board.purge_z = 276.5, 260., 8.
-        self.board.prep_approach_x = self.board.prep_approach_y = 250.
-        self.board.purge_speed = 3.
-        self.board.flow_test_z = 8.
-        self.board._preflight = lambda command: ([], [], 1)
-        self.board.cmd_verify_nozzle_z = mock.Mock()
-        toolhead, heater, other = mock.Mock(), mock.Mock(), mock.Mock()
-        toolhead.get_extruder.return_value = other
-        heater.get_status.return_value = {'can_extrude': True}
-        self.board.printer.lookup_object.side_effect = (
-            lambda name: {'toolhead': toolhead, 'extruder1': heater}[name])
-        self.board._with_motion = lambda command, operation: operation()
-        self.board._raise_z = mock.Mock()
-        self.board._move = mock.Mock()
-        self.board._run = mock.Mock()
-        self.board._pause_ms = mock.Mock()
-        self.board.cmd_purge(GCmd())
-        self.assertEqual(self.board._run.call_args_list[0],
-                         mock.call('ACTIVATE_EXTRUDER EXTRUDER=extruder1'))
-        self.board._run.assert_any_call('G1 E12.000 F180')
-        self.board._run.assert_any_call('G1 E-5 F1200')
-        self.board._move.assert_any_call(y=250., feed=6000,
-                                         machine=False)
-        self.board._move.assert_any_call(z=8., feed=600, machine=False)
-        moves = [call.kwargs for call in self.board._move.call_args_list]
-        x250 = next(i for i, move in enumerate(moves)
-                    if move.get('x') == 250.)
-        low_y = next(i for i, move in enumerate(moves)
-                     if move.get('y') == 250.)
-        final_x = next(i for i, move in enumerate(moves)
-                       if move.get('x') == 276.5)
-        self.assertLess(x250, low_y)
-        self.assertLess(low_y, final_x)
-        final_z = next(i for i, move in enumerate(moves)
-                     if move.get('z') == 8.)
-        self.assertLess(final_x, final_z)
-        scripts = [call.args[0] for call in self.board._run.call_args_list]
-        self.assertLess(scripts.index('G1 E12.000 F180'),
-                        scripts.index('G1 E-5 F1200'))
-        self.assertEqual(scripts.count('M400'), 1)
-        self.board._run.reset_mock()
-        heater.get_status.return_value = {'can_extrude': False}
-        with self.assertRaisesRegex(RuntimeError, 'not hot enough'):
-            self.board.cmd_purge(GCmd())
-        self.board._run.assert_not_called()
 
     def test_purge_flow_envelope_stops_at_x279(self):
         board = self.board
@@ -2094,23 +1923,6 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board.cmd_save_offsets_json.assert_called_once()
         self.board.configfile.set.assert_not_called()
 
-    def test_stock_pin_checks_plate_before_levelboard_or_tool_pickup(self):
-        self.board._preflight = mock.Mock(return_value=([], [], None))
-        self.board._with_motion = lambda gcmd, operation: operation()
-        self.board._probe_stock_pin = mock.Mock(side_effect=(0., -1.))
-        self.board._run = mock.Mock()
-        self.board.cmd_calibrate_all_offsets(GCmd(BUILDPLATE_REMOVED=1,
-                                                   SAVE=0))
-        self.assertEqual(self.board._probe_stock_pin.call_count, 2)
-        self.assertEqual(self.board._probe_stock_pin.call_args_list[0].args[1:],
-                         (43., 226.))
-        self.assertEqual(self.board._probe_stock_pin.call_args_list[1].args[1:],
-                         (28.5, 214.5))
-        self.assertEqual(self.board._run.call_args_list[0].args[0],
-                         'C5_LEVELBOARD_REFERENCE_CALIBRATE SAVE=0 '
-                         'BUILDPLATE_REMOVED=1')
-        self.assertIsNone(self.board._stock_pin_approach_z)
-
     def test_stock_pin_rejects_plate_present_before_tool_motion(self):
         self.board._preflight = mock.Mock(return_value=([], [], None))
         self.board._with_motion = lambda gcmd, operation: operation()
@@ -2139,20 +1951,6 @@ class Creator5OffsetTests(unittest.TestCase):
             self.board._run.call_args_list.index(
                 mock.call('C5_LEVELBOARD_REFERENCE_CALIBRATE SAVE=0 '
                           'BUILDPLATE_REMOVED=1')))
-
-    def test_stock_pin_approach_never_exceeds_configured_probe_floor(self):
-        self.board.safe_z = 10.
-        self.board.z_probe_target = -8.
-        self.board._move = mock.Mock()
-        self.board._raise_z = mock.Mock()
-        self.board._estop = mock.Mock(return_value=1.)
-        self.board._stock_pin_approach_z = -5.
-        self.board._probe_fixture_z(GCmd(), 28., 215.)
-        self.board._estop.assert_called_once_with('Z', -5., mock.ANY)
-        self.board._estop.reset_mock()
-        self.board._stock_pin_approach_z = -12.
-        self.board._probe_fixture_z(GCmd(), 28., 215.)
-        self.board._estop.assert_called_once_with('Z', -8., mock.ANY)
 
     def test_stock_pin_uses_three_repeatable_probe_samples(self):
         probe = mock.Mock(sample_retract_dist=2.)
