@@ -93,7 +93,7 @@ def test_insert_mounts_then_asks(monkeypatch):
 
     unit._poll(0.0)
     assert popen.call_args.args[0] == [
-        "mount", "-t", "vfat", "-o", "iocharset=utf8,noatime,flush",
+        "mount", "-t", "vfat", "-o", "iocharset=utf8,noatime",
         "/dev/sda1", "/mnt"]
     unit._poll(0.2)
     assert unit.mounted

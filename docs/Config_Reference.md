@@ -2060,10 +2060,9 @@ paused; the prompt waits until it ends. Commands: `USB_GCODE_USE`,
 #   Where the drive is mounted. The default is /mnt.
 #poll_interval: 2.0
 #   Seconds between checks for a drive. The default is 2.
-#mount_options: iocharset=utf8,noatime,flush
-#   Options for the first (vfat) mount attempt. flush writes each file
-#   out when it is closed, so a drive pulled soon after an upload keeps
-#   the file. Other file systems are mounted with "noatime,sync".
+#mount_options: iocharset=utf8,noatime
+#   Options for the first (vfat) mount attempt. Other file systems are
+#   tried with default options.
 ```
 
 ### [sdcard_loop]
