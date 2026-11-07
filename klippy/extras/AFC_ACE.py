@@ -273,6 +273,9 @@ class afcACE(afcUnit):
         # event reconcile won't restart these; any explicit start (the command
         # with ENABLE=1 or a load/toolchange path) clears the suppression.
         self._assist_suppressed: set[int] = set()
+        # Slots with an idle-assist stop queued (_stop_idle_assist), so a
+        # heartbeat doesn't queue another before the first one runs.
+        self._assist_stopping: set[int] = set()
         # One-shot latch so a sustained jam pauses once, not every heartbeat.
         self._stuck_tripped = False
         self._slot_inventory: List[Dict[str, Any]] = [{} for _ in range(self.SLOTS_PER_UNIT)]
@@ -3661,10 +3664,11 @@ class afcACE(afcUnit):
         if not self._assist_watchdog:
             return
         name = self._active_assist_lane()
-        if name is None:
+        lane = self.afc.lanes.get(name) if name is not None else None
+        if lane is None or not self._use_feed_assist(lane):
+            self._stop_idle_assist()
             return
         slot = self._slot_map.get(name)
-        lane = self.afc.lanes.get(name)
         if (slot is not None
             and slot in self._assist_suppressed):
             return  # manually stopped via AFC_ACE_FEED_ASSIST, leave it off
@@ -3674,6 +3678,33 @@ class afcACE(afcUnit):
             and self._feed_assist_active != {slot}):
             self.logger.info(f"ACE assist watchdog: enabling feed assist for {name} (slot {slot})")
             self.afc.reactor.register_callback(lambda et, n=name: self._reconcile_feed_assist(n))
+
+    def _stop_idle_assist(self) -> None:
+        """
+        Stop feed assist when none of this unit's lanes should have it, e.g. once a
+        toolchanger docks the head (its lane stays loaded but is off the shuttle).
+        Nothing else turns it off then, so the slot kept assisting and the unit's
+        lights kept showing it printing. Covers slots the unit reports assisting
+        that aren't tracked, as after a Klipper restart.
+        """
+        assisting = set(self._feed_assist_active)
+        slots = (self._cached_hw_status or {}).get("slots") or []
+        for i, info in enumerate(slots):
+            if isinstance(info, dict) and info.get("slot_status") == "assisting":
+                assisting.add(info.get("index", i))
+        for slot in assisting:
+            if slot in self._assist_stopping:
+                continue
+            self._assist_stopping.add(slot)
+            self._feed_assist_active.add(slot)  # so _stop_feed_assist acts on it
+            self.logger.info(f"ACE {self.name}: no lane needs feed assist, stopping it on slot {slot}")
+
+            def stop(eventtime, s=slot):
+                try:
+                    self._stop_feed_assist(s)
+                finally:
+                    self._assist_stopping.discard(s)
+            self.afc.reactor.register_callback(stop)
 
     def _check_stuck(self, result: Dict[str, Any]) -> None:
         """
