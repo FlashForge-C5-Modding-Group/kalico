@@ -764,6 +764,16 @@ def _ace2_scan_candidates() -> List[str]:
             out.append(os.path.realpath(p))
         except Exception:
             out.append(p)
+    if out:
+        return out
+    # No udev (no /dev/serial): find CH34x ttys (USB vendor 1a86) through sysfs
+    for tty in sorted(glob.glob("/sys/class/tty/ttyACM*") + glob.glob("/sys/class/tty/ttyUSB*")):
+        with contextlib.suppress(Exception):
+            iface = os.path.realpath(os.path.join(tty, "device"))
+            with open(os.path.join(iface, "..", "idVendor")) as f:
+                vendor = f.read().strip()
+            if vendor == "1a86":
+                out.append("/dev/" + os.path.basename(tty))
     return out
 
 def _ace2_topology_key(real_tty: str) -> str:
