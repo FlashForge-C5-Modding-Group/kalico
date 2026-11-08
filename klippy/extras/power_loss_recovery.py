@@ -19,6 +19,7 @@ import os
 import time
 
 from klippy.extras.latest_file_writer import LatestFileWriter
+from klippy.extras.bed_mesh import ZMesh
 
 class PowerLossRecovery:
     def __init__(self, config):
@@ -205,6 +206,14 @@ class PowerLossRecovery:
         toolchanger = self.printer.lookup_object(self.toolchanger_name, None)
         if toolchanger is not None:
             tool = toolchanger.get_status(eventtime).get('active_tool')
+        mesh = None
+        bed_mesh = self.printer.lookup_object('bed_mesh', None)
+        z_mesh = bed_mesh.get_mesh() if bed_mesh is not None else None
+        if z_mesh is not None:
+            mesh = {'name': z_mesh.get_profile_name(),
+                    'params': z_mesh.get_mesh_params(),
+                    'points': z_mesh.get_probed_matrix()}
+        info = print_stats_status.get('info') or {}
         state = {
             'in_progress': True,
             'filename': print_stats_status['filename'],
@@ -214,6 +223,14 @@ class PowerLossRecovery:
             # Toolhead coordinates (G-code offsets included), and the same
             # point in G-code coordinates (what the file's E values count in).
             'position': [pos.x, pos.y, pos.z, pos.e],
+            # Z the motors were at, after the bed mesh
+            'toolhead_z': self.printer.lookup_object('toolhead').get_position()[2],
+            'bed_mesh': mesh,
+            'print_duration': print_stats_status.get('print_duration', 0.),
+            'total_duration': print_stats_status.get('total_duration', 0.),
+            'filament_used': print_stats_status.get('filament_used', 0.),
+            'total_layer': info.get('total_layer'),
+            'current_layer': info.get('current_layer'),
             'gcode_position': list(gm_status['gcode_position'][:4]),
             'speed_factor': gm_status['speed_factor'],
             'extrude_factor': gm_status['extrude_factor'],
@@ -258,8 +275,10 @@ class PowerLossRecovery:
         # stopped, so take Z from the snapshot, back the bed off the part,
         # then home only X and Y.
         x, y, z, e = state['position']
+        self._restore_mesh(gcmd, state.get('bed_mesh'))
         self.gcode.run_script_from_command(
-            'SET_KINEMATIC_POSITION Z=%.3f SET_HOMED=z' % z)
+            'SET_KINEMATIC_POSITION Z=%.3f SET_HOMED=z'
+            % state.get('toolhead_z', z))
         self.gcode.run_script_from_command('G91')
         self.gcode.run_script_from_command(
             'G1 Z%.3f F600' % self.min_z_clearance)
@@ -321,13 +340,36 @@ class PowerLossRecovery:
         fan_speed = state.get('fan_speed', 0.)
         self.gcode.run_script_from_command('M106 S%d' % round(fan_speed * 255))
         self.gcode.run_script_from_command('M23 %s' % filename)
+        self._restore_print_stats(print_stats, state)
         self.gcode.run_script_from_command('M26 S%d' % file_position)
         self._arm_next_print = True
         self.gcode.run_script_from_command('M24')
         self._write_state({'in_progress': False})
         self.pending = None
 
-    cmd_CLEAR_POWER_LOSS_RECOVERY_help = 'Discard any pending power-loss-recovery state'
+    def _restore_mesh(self, gcmd, mesh):
+        bed_mesh = self.printer.lookup_object('bed_mesh', None)
+        if not mesh or bed_mesh is None:
+            return
+        try:
+            z_mesh = ZMesh(mesh['params'], mesh.get('name'))
+            z_mesh.build_mesh(mesh['points'])
+            bed_mesh.set_mesh(z_mesh)
+        except Exception as e:
+            gcmd.respond_info('Could not restore the bed mesh: %s' % e)
+
+    def _restore_print_stats(self, print_stats, state):
+        # M23 reset these; note_start keeps a start time already set
+        total = state.get('total_duration') or 0.
+        printed = state.get('print_duration') or 0.
+        print_stats.print_start_time = self.reactor.monotonic() - total
+        print_stats.prev_pause_duration = max(0., total - printed)
+        print_stats.init_duration = 0.
+        print_stats.filament_used = state.get('filament_used') or 0.
+        print_stats.info_total_layer = state.get('total_layer')
+        print_stats.info_current_layer = state.get('current_layer')
+
+    cmd_CLEAR_POWER_LOSS_RECOVERY_help ='Discard any pending power-loss-recovery state'
     def cmd_CLEAR_POWER_LOSS_RECOVERY(self, gcmd):
         holding = self._bed_target is not None
         self._write_state({'in_progress': False})
