@@ -1,5 +1,5 @@
 import numpy as np
-import logging, time
+import logging, math, time
 #from scipy.signal import butter, filtfilt
 #from scipy.fftpack import fft,ifft
 
@@ -240,12 +240,162 @@ def golden_section_search(f, a, b, tol=0.05, max_iter=20):
 
     return x_opt, f_opt, history
 
+# The steady-speed part of a test move, from its known start and end times:
+# skips the acceleration at each end and the ringing just after it. None when
+# that leaves too little to analyse.
+CRUISE_SETTLE = 0.1   # s after reaching speed, and before slowing down
+CRUISE_MIN_TIME = 0.25  # s
+# A fast move has less steady time: enough cycles of its lowest ripple will
+# do there, rather than the fixed minimum
+CRUISE_MIN_CYCLES = 40
+CRUISE_FLOOR_TIME = 0.06  # s
+
+# The accelerometer (LIS2DW, 1600 samples/s, filtered at half that) can't see
+# vibration above about this; readings for ripples above it are left out
+MAX_MEASURABLE_HZ = 700.
+
+def cruise_window(t_start, t_end, vel, accel, settle=CRUISE_SETTLE,
+                  min_time=CRUISE_MIN_TIME, freq=None):
+    if freq:
+        min_time = min(min_time, max(CRUISE_MIN_CYCLES / freq, CRUISE_FLOOR_TIME))
+    ramp = vel / accel if accel > 0. else 0.
+    t0 = t_start + ramp + settle
+    t1 = t_end - ramp - settle
+    if t1 - t0 < min_time:
+        return None
+    return t0, t1
+
+# One amplitude serves both directions (the MCU keeps a phase per direction but
+# a single amplitude). Each direction's residual² is a parabola in amplitude,
+# c0 + c1·A + c2·A²; the amplitude that minimises their sum keeps total
+# vibration lowest. Without two usable parabolas, the mean of the two optima.
+def combine_direction_amps(amps, fits):
+    lo, hi = min(amps), max(amps)
+    if len(fits) == len(amps) and all(f is not None and f[2] > 0. for f in fits):
+        c1 = sum(f[1] for f in fits)
+        c2 = sum(f[2] for f in fits)
+        return float(np.clip(-c1 / (2.0 * c2), lo, hi))
+    return float(sum(amps) / len(amps))
+
+# Whether compensation is worth keeping: the summed vibration energy over the
+# measured directions must drop by at least min_gain (5% by default).
+def damping_helps(bare, final, min_gain=0.05):
+    bare_e = sum(r * r for r in bare)
+    final_e = sum(r * r for r in final)
+    return bare_e > 0. and final_e <= bare_e * (1.0 - min_gain) ** 2
+
+# The ripple frequency of harmonic tdx at a toolhead speed (the motor has 50
+# electrical cycles per turn)
+# The speeds a resonance sweep tests: each spacing (8% by default) faster than
+# the last, so a narrow peak at low speed gets as many points as a wide one at
+# high speed (a resonance's width grows with its frequency). spacing=0 gives
+# fixed steps of step instead.
+SWEEP_SPACING = 0.08
+
+def sweep_speeds(vmin, vmax, spacing=SWEEP_SPACING, step=10.):
+    if spacing > 0.:
+        n = int(math.ceil(math.log(vmax / vmin) / math.log(1. + spacing))) + 1
+        return [round(float(v), 2) for v in np.geomspace(vmin, vmax, n)]
+    return [round(float(v), 2) for v in np.arange(vmin, vmax + step / 2., step)]
+
+# The coarse-sweep points worth refining: the strongest local high points
+# (an end counts when it's higher than its one neighbour), at most `count`
+RESONANCE_CANDIDATES = 3
+
+def resonance_candidates(amps, count=RESONANCE_CANDIDATES):
+    n = len(amps)
+    if n < 2:
+        return []
+    peaks = [i for i in range(n)
+             if (i == 0 or amps[i] >= amps[i - 1])
+             and (i == n - 1 or amps[i] >= amps[i + 1])]
+    return sorted(peaks, key=lambda i: -amps[i])[:count]
+
+# The strong resonances in a sweep: in each region that was fine-swept, its
+# highest point, refined between its neighbours. Kept only when it's inside
+# the sweep (not at either end), clearly above the rest (RESONANCE_PROMINENCE
+# times the median), and at least `fraction` of the strongest kept. Strongest
+# first, at most `count`. Returns [(vel, amp)].
+STRONG_FRACTION = 0.5
+TUNE_CANDIDATES = 2
+
+def strong_resonances(vels, amps, regions, fraction=STRONG_FRACTION,
+                      count=TUNE_CANDIDATES):
+    vels = np.asarray(vels, dtype=float)
+    amps = np.asarray(amps, dtype=float)
+    if len(vels) < 3:
+        return []
+    floor = RESONANCE_PROMINENCE * float(np.median(amps))
+    found = []
+    for lo, hi in regions:
+        idx = [i for i in range(len(vels)) if lo - 1e-6 <= vels[i] <= hi + 1e-6]
+        if not idx:
+            continue
+        i = max(idx, key=lambda j: amps[j])
+        if i == 0 or i == len(vels) - 1:
+            continue
+        peak_vel, peak_amp = vels[i], amps[i]
+        coeff = np.polyfit(vels[i - 1:i + 2], amps[i - 1:i + 2], 2)
+        if coeff[0] < 0:
+            v = -coeff[1] / (2.0 * coeff[0])
+            if vels[i - 1] <= v <= vels[i + 1]:
+                peak_vel, peak_amp = v, float(np.polyval(coeff, v))
+        if peak_amp < floor:
+            continue
+        # Overlapping regions can find the same peak twice
+        if any(abs(peak_vel - v) < 0.05 * v for v, _ in found):
+            continue
+        found.append((float(peak_vel), float(peak_amp)))
+    if not found:
+        return []
+    top = max(a for _, a in found)
+    found = [f for f in found if f[1] >= fraction * top]
+    return sorted(found, key=lambda f: -f[1])[:count]
+
+# How much vibration a check sweep leaves: the sum of every ripple's
+# vibration squared, over all the speeds (unmeasurable readings left out)
+def sweep_score(rows):
+    return float(sum(a * a for amps in rows.values() for a in amps
+                     if not np.isnan(a)))
+
+def vel_to_freq(vel, rotation_distance, vel_ratio, tdx):
+    return vel / rotation_distance * vel_ratio * 50 * tdx
+
+# The resonance from a speed sweep: the speed of the strongest vibration,
+# refined between its neighbours. Trusted only when the peak is inside the
+# sweep (not at either end) and clearly above the rest (1.5x the median).
+# Returns (peak_vel, peak_amp, trusted, reason).
+RESONANCE_PROMINENCE = 1.5
+
+def pick_resonance(vels, amps):
+    vels = np.asarray(vels, dtype=float)
+    amps = np.asarray(amps, dtype=float)
+    i = int(np.argmax(amps))
+    peak_vel, peak_amp = vels[i], amps[i]
+    if i == 0 or i == len(vels) - 1:
+        return peak_vel, peak_amp, False, "strongest at the edge of the sweep"
+    coeff = np.polyfit(vels[i - 1:i + 2], amps[i - 1:i + 2], 2)
+    if coeff[0] < 0:
+        v = -coeff[1] / (2.0 * coeff[0])
+        if vels[i - 1] <= v <= vels[i + 1]:
+            peak_vel, peak_amp = v, float(np.polyval(coeff, v))
+    if peak_amp < RESONANCE_PROMINENCE * float(np.median(amps)):
+        return peak_vel, peak_amp, False, "no peak stands out"
+    return float(peak_vel), float(peak_amp), True, ""
+
 class StepperResonanceTester:
     def __init__(self, config):
         self.printer = config.get_printer()
         # Get the range of velocity, amp and phase for curve and mesh test
         self.move_accel = config.getfloat('move_accel', 5000.0, minval=2000.0, maxval=10000.0)
+        # Test moves faster than fast_move_speed accelerate harder, so a 100 mm
+        # move still has some steady speed to measure
+        self.fast_move_speed = config.getfloat('fast_move_speed', 150.0, above=0.)
+        self.fast_move_accel = config.getfloat('fast_move_accel', 10000.0,
+                                               minval=2000.0, maxval=20000.0)
         self.vel_min, self.vel_max, self.vel_step = config.getfloatlist('vel_range', count=3)
+        self.sweep_spacing = config.getfloat('sweep_spacing', SWEEP_SPACING,
+                                             minval=0., maxval=0.5)
         self.amp_min, self.amp_max, self.amp_step = config.getfloatlist('amp_range', count=3)
         self.phs_min, self.phs_max, self.phs_step = config.getfloatlist('phase_range', count=3)
         self.x_min, self.x_max = config.getfloatlist('x_range', count=2)
@@ -347,6 +497,9 @@ class StepperResonanceTester:
         self.gcode.register_command("STEPPER_RESONANCE_PHASE_CALIBRATE",
                                     self.cmd_STEPPER_RESONANCE_PHASE_CALIBRATE,
                                     desc=self.cmd_STEPPER_RESONANCE_PHASE_CALIBRATE_help)
+        self.gcode.register_command("STEPPER_RESONANCE_AUTO_CALIBRATE",
+                                    self.cmd_STEPPER_RESONANCE_AUTO_CALIBRATE,
+                                    desc=self.cmd_STEPPER_RESONANCE_AUTO_CALIBRATE_help)
         self.gcode.register_command("STEPPER_RESONANCE_SEARCH_CALIBRATE",
                                     self.cmd_STEPPER_RESONANCE_SEARCH_CALIBRATE,
                                     desc=self.cmd_STEPPER_RESONANCE_SEARCH_CALIBRATE_help)
@@ -405,7 +558,12 @@ class StepperResonanceTester:
             input_shaper.disable_shaping()
 
         # Override maximum acceleration and acceleration to
-        # deceleration based on the maximum test frequency
+        # deceleration based on the maximum test frequency; end_test puts
+        # the printer's own back
+        toolhead = self.printer.lookup_object('toolhead')
+        status = toolhead.get_status(self.printer.get_reactor().monotonic())
+        self.saved_limits = (status['max_accel'],
+                             status.get('minimum_cruise_ratio'))
         self.gcode.run_script_from_command(
                 "SET_VELOCITY_LIMIT ACCEL=%.3f MINIMUM_CRUISE_RATIO=%.3f" % (self.move_accel, 0.0))
 
@@ -471,6 +629,13 @@ class StepperResonanceTester:
 
     # perform operations after the end of test
     def end_test(self, gcmd):
+        limits = getattr(self, 'saved_limits', None)
+        if limits is not None:
+            self.saved_limits = None
+            cmd = "SET_VELOCITY_LIMIT ACCEL=%.3f" % (limits[0],)
+            if limits[1] is not None:
+                cmd += " MINIMUM_CRUISE_RATIO=%.3f" % (limits[1],)
+            self.gcode.run_script_from_command(cmd)
         # Restore input shaper if it was disabled for resonance testing
         input_shaper = self.printer.lookup_object('input_shaper', None)
         if input_shaper is not None:
@@ -605,7 +770,8 @@ class StepperResonanceTester:
 
         return resonance_vel, resonance_freq
 
-    def calculate_resonance_amps(self, samples, freqs, move_angle, axis='X', avg_num=1024):
+    def calculate_resonance_amps(self, samples, freqs, move_angle, axis='X', avg_num=1024,
+                                 window=None):
         if samples is None:
             return None
         if isinstance(samples, np.ndarray):
@@ -623,17 +789,26 @@ class StepperResonanceTester:
         accel_d = accel_x * np.cos(angle_rad) + accel_y * np.sin(angle_rad)
         accel_q = -accel_x * np.sin(angle_rad) + accel_y * np.cos(angle_rad)
 
-        # 使用 accel_d 找到移动起始时间和终止时间 (aligned with move direction)
-        index = np.where(np.abs(accel_d) > 0.5 * np.max(np.abs(accel_d)))[0]
-        if len(index) == 0:
-            return None
-        start_idx = index[0]
-        end_idx = index[-1] + 1
-        mid_idx = (start_idx + end_idx)//2
+        id0 = id1 = 0
+        if window is not None:
+            # The whole steady-speed part of the move, from its known timing:
+            # more cycles than a fixed slice, so less noise in each result
+            id0 = int(np.searchsorted(t, window[0]))
+            id1 = int(np.searchsorted(t, window[1]))
+        if id1 - id0 < 256:
+            # 使用 accel_d 找到移动起始时间和终止时间 (aligned with move direction)
+            index = np.where(np.abs(accel_d) > 0.5 * np.max(np.abs(accel_d)))[0]
+            if len(index) == 0:
+                return None
+            start_idx = index[0]
+            end_idx = index[-1] + 1
+            mid_idx = (start_idx + end_idx)//2
 
-        # 截取匀速段进行分析，避免加减速段对频谱的影响
-        id0 = max(start_idx, mid_idx - avg_num//2)
-        id1 = min(end_idx, mid_idx + avg_num//2)
+            # 截取匀速段进行分析，避免加减速段对频谱的影响
+            id0 = max(start_idx, mid_idx - avg_num//2)
+            id1 = min(end_idx, mid_idx + avg_num//2)
+        if id1 - id0 < 16:
+            return None
 
         # 分别提取XYDQ方向振动幅度，再计算振动矢量幅度
         N = len(t)
@@ -765,74 +940,195 @@ class StepperResonanceTester:
         self.save_to_csv(filename, result, header=csv_header, format_spec='%.6f')
         gcmd.respond_info("Writing stepper resonance test result to %s file" % (filename,))
 
-    # Test the relationship of resonance_amp and vel
-    cmd_STEPPER_RESONANCE_CURVE_TEST_help = ("Test the resonance amp vs velocity for a stepper")
-    def cmd_STEPPER_RESONANCE_CURVE_TEST(self, gcmd):
-        # prepare test parameters
-        self.prepare_test(gcmd)
+    def _measure_sweep(self, gcmd, speeds, rows, quiet=False):
+        """Test moves at each speed along the current path, into rows
+        ({speed: [vibration per harmonic]}); speeds already in rows are
+        skipped."""
+        for vel in speeds:
+            key = round(float(vel), 2)
+            if key in rows:
+                continue
+            rows[key] = self._measure_amps(gcmd, key, self.tdx)
+            if not quiet:
+                gcmd.respond_info(
+                    "  %.1f mm/s: %s" % (key, ", ".join(
+                        "td%d=%s" % (t, "--" if np.isnan(a) else "%.0f" % a)
+                        for t, a in zip(self.tdx, rows[key]))))
 
-        # if apply new resonance freq immeditely
-        apply = gcmd.get_int('APPLY', 0)
-
-        # update move path based on move parameters or stepper/direction
-        self.update_move(self.stepper, self.dir)
-
-        result = []
-        for vel in np.arange(self.vel_min, self.vel_max, self.vel_step):
-            # Perform move and accel measurement at positive direction
-            gcmd.respond_info("Testing resonance at velocity %.3f mm/s and angle %.3f degrees" % (vel, self.move_angle))
-            # samples, _, _ = self.do_move_and_accel_measure(vel)
-
-            # # calculate the resonance amplitude at res_point freq
-            # freqs = [vel/self.rotation_dis*self.vel_ratio*50*v for v in self.tdx]
-            # resonance_amps = self.calculate_resonance_amps(samples, freqs, self.move_angle, self.axis)
-            retry_count = 0
-            while retry_count < 5:
-                samples, _, _ = self.do_move_and_accel_measure(vel)
-
-                # calculate the resonance amplitude
-                freqs = [vel/self.rotation_dis*self.vel_ratio*50*v for v in self.tdx]
-                resonance_amps = self.calculate_resonance_amps(samples, freqs, self.move_angle, self.axis)
-                if resonance_amps is not None:
-                    break
-                retry_count += 1
-
-            # Output result
-            str = "Result:"
-            for i in range(len(freqs)):
-                str += " td%d_%s_amp=%.3f" % (self.tdx[i], self.axis, resonance_amps[i])
-            gcmd.respond_info(str)
-
-            output = [vel] + resonance_amps
-            result.append(output)
-
-        # call after the end of test
-        self.end_test(gcmd)
-
-        # Save the result to csv file
-        filename = CSV_DIR + "%s_resonance_curve-%s.csv" % (self.stepper, time.strftime("%Y%m%d_%H%M%S"))
-        csv_header = ["vel"] + ["td%d_%s_amp" % (v, self.axis) for v in self.tdx]
-        self.save_to_csv(filename, result, header=csv_header)
-        gcmd.respond_info("Writing stepper resonance test result to %s file" % (filename,))
-
-        # Find the resonance frequency at maximum resonance amp
-        data = np.array(result)
-        if self.main_tdx in self.tdx:
-            peak_vel, peak_amp = find_peak_with_interpolation(data[:,[0,int(self.main_tdx//2)+1]])
-            res_freq = peak_vel/self.rotation_dis*self.main_tdx*self.vel_ratio*50 # resonance frequency
-            gcmd.respond_info("Maximum resonance velocity %.1fmm/s, freq %.1f and amp %.1f" % (peak_vel, res_freq, peak_amp))
-
-        	# Determine if apply resonance frequency immeditely
-            if apply == 1:
-                self.td_config[self.stepper]['freq'] = res_freq
-
-        # save the config
-        configfile = self.printer.lookup_object('configfile')
-        configfile.set('stepper_resonance_tester', '%s_freq'% self.stepper, "%.1f" % (res_freq, ))
-
+    def _resonance_sweep(self, gcmd, name, checking=False):
+        """Sweep the speeds, refine around the candidate peaks, and save the
+        result as vfa_<stepper>_curve_<name>. Returns (rows, main harmonic,
+        strong resonances as [(speed, vibration)])."""
+        main = self.main_tdx if self.main_tdx in self.tdx else self.tdx[0]
+        mi = self.tdx.index(main)
+        rows = {}
+        coarse = sweep_speeds(self.vel_min, self.vel_max,
+                              self.sweep_spacing, self.vel_step)
         gcmd.respond_info(
-            "The SAVE_CONFIG command will update the printer config\n"
-            "file and restart the printer.")
+            ("Checking %s across speeds: %.0f-%.0f mm/s" if checking
+             else "Finding the %s resonance: coarse sweep %.0f-%.0f mm/s")
+            % (self.stepper, self.vel_min, self.vel_max)
+            + " (%d speeds)" % len(coarse))
+        self._measure_sweep(gcmd, coarse, rows)
+        # Only where the main ripple is within what the accelerometer sees
+        seen = [v for v in coarse if not np.isnan(rows[v][mi])]
+        # Refine around every candidate, not just the strongest: a narrow
+        # peak sampled off its top still shows as a local high point
+        regions = []
+        for i in resonance_candidates([rows[v][mi] for v in seen]):
+            lo = seen[max(i - 1, 0)]
+            hi = seen[min(i + 1, len(seen) - 1)]
+            regions.append((lo, hi))
+            gcmd.respond_info("Fine sweep around %.1f mm/s" % seen[i])
+            self._measure_sweep(gcmd, np.linspace(lo, hi, 9), rows)
+
+        vels = sorted(rows)
+        seen = [v for v in vels if not np.isnan(rows[v][mi])]
+        strong = strong_resonances(seen, [rows[v][mi] for v in seen], regions)
+        res_freq = (vel_to_freq(strong[0][0], self.rotation_dis, self.vel_ratio, main)
+                    if strong else self.res_freq)
+
+        header = ["vel"] + ["td%d_amp" % t for t in self.tdx]
+        result = [[v] + rows[v] for v in vels]
+        for filename in (CSV_DIR + "%s_resonance_curve-%s.csv"
+                         % (self.stepper, time.strftime("%Y%m%d_%H%M%S")),
+                         CSV_DIR + "vfa_%s_curve_%s.csv" % (self.stepper, name)):
+            self.save_to_csv(filename, result, header=header)
+        with open(CSV_DIR + "vfa_%s_curve_%s.info" % (self.stepper, name), 'w') as f:
+            f.write("res_freq=%.1f\ntrusted=%d\nmain_tdx=%d\nconfigured_freq=%.1f\n"
+                    "rotation_distance=%.4f\nvel_ratio=%.6f\n"
+                    % (res_freq, bool(strong), main, self.res_freq,
+                       self.rotation_dis, self.vel_ratio))
+        gcmd.respond_info("Resonance sweep (%d speeds) saved to %s"
+                          % (len(vels), filename))
+        return rows, main, strong
+
+    def _use_freq(self, freq, stage):
+        """Aim calibration at freq; stage it for SAVE_CONFIG when stage."""
+        self.res_freq = freq
+        self.td_config[self.stepper]['freq'] = freq
+        if stage:
+            configfile = self.printer.lookup_object('configfile')
+            configfile.set('stepper_resonance_tester',
+                           '%s_freq' % self.stepper, "%.1f" % (freq,))
+
+    def _zero_damping(self):
+        for tdx in self.tdx:
+            self._set_damping(tdx, 0.0, 0.0, 0.0)
+
+    # Find the motor's resonance: the speed where its main ripple harmonic
+    # shakes the toolhead hardest, as a frequency
+    cmd_STEPPER_RESONANCE_CURVE_TEST_help = (
+        "Sweep speeds to find a stepper's resonance frequency (APPLY=1 uses "
+        "and stages it; NAME tags the CSV for graphing)")
+    def cmd_STEPPER_RESONANCE_CURVE_TEST(self, gcmd):
+        self.prepare_test(gcmd)
+        apply = gcmd.get_int('APPLY', 0)
+        name = gcmd.get('NAME', 'latest')
+        try:
+            self.update_move(self.stepper, self.dir)
+            rows, main, strong = self._resonance_sweep(gcmd, name,
+                                                       checking=not apply)
+        finally:
+            self.end_test(gcmd)
+
+        if not apply:
+            # A check sweep (e.g. after calibrating, for the graph): report the
+            # worst that's left, without calling it a resonance or using it
+            mi = self.tdx.index(main)
+            seen = [(rows[v][mi], v) for v in rows if not np.isnan(rows[v][mi])]
+            peak_amp, peak_vel = max(seen) if seen else (0., 0.)
+            gcmd.respond_info(
+                "%s: strongest remaining vibration %.0f at %.1f mm/s "
+                "(nothing applied)" % (self.stepper, peak_amp, peak_vel))
+            return
+        if not strong:
+            gcmd.respond_info(
+                "No clear resonance for %s: keeping %.1f Hz"
+                % (self.stepper, self.res_freq))
+            return
+        peak_vel, peak_amp = strong[0]
+        res_freq = vel_to_freq(peak_vel, self.rotation_dis, self.vel_ratio, main)
+        gcmd.respond_info(
+            "%s resonance: %.1f Hz (strongest at %.1f mm/s, %.0f)"
+            % (self.stepper, res_freq, peak_vel, peak_amp))
+        self._use_freq(res_freq, stage=True)
+        gcmd.respond_info(
+            "Calibration will use %.1f Hz for %s. The SAVE_CONFIG command "
+            "will keep it." % (res_freq, self.stepper))
+
+    # Calibrate at the motor's resonance. With more than one strong resonance,
+    # calibrate at each, check every result across the speeds, and keep the one
+    # that leaves the least vibration: the best tuning depends on the speed it's
+    # tuned at, not just on how strong the resonance is.
+    cmd_STEPPER_RESONANCE_AUTO_CALIBRATE_help = (
+        "Find a stepper's resonances and calibrate VFA damping at the one that "
+        "leaves the least vibration across speeds")
+    def cmd_STEPPER_RESONANCE_AUTO_CALIBRATE(self, gcmd):
+        self.prepare_test(gcmd)
+        try:
+            self._auto_calibrate(gcmd)
+        except Exception:
+            self.gcode.run_script_from_command(
+                "MCLIB_APPLY_CALIBRATION STEPPER=%s" % (self.stepper,))
+            raise
+        finally:
+            self.end_test(gcmd)
+
+    def _auto_calibrate(self, gcmd):
+        self._zero_damping()
+        self.dir = 1
+        self.update_move(self.stepper, self.dir)
+        rows, main, strong = self._resonance_sweep(gcmd, 'before')
+        freqs = [vel_to_freq(v, self.rotation_dis, self.vel_ratio, main)
+                 for v, _ in strong]
+        if not freqs:
+            gcmd.respond_info("No clear resonance for %s: calibrating at %.1f Hz"
+                              % (self.stepper, self.res_freq))
+            self._search_calibrate(gcmd)
+            return
+        gcmd.respond_info("%s resonances: %s" % (self.stepper, ", ".join(
+            "%.1f Hz (%.1f mm/s, %.0f)" % (f, v, a)
+            for f, (v, a) in zip(freqs, strong))))
+        if len(freqs) == 1:
+            self._use_freq(freqs[0], stage=True)
+            self._search_calibrate(gcmd)
+            return
+
+        speeds = sweep_speeds(self.vel_min, self.vel_max,
+                              self.sweep_spacing, self.vel_step)
+        tried = []
+        for freq in freqs:
+            gcmd.respond_info("===== %s: trying the %.1f Hz resonance ====="
+                              % (self.stepper, freq))
+            self._zero_damping()
+            self._use_freq(freq, stage=False)
+            summary = self._search_calibrate(gcmd)
+            values = dict(self.last_results)
+            self.dir = 1
+            self.update_move(self.stepper, self.dir)
+            gcmd.respond_info("Checking the %.1f Hz calibration across speeds"
+                              % freq)
+            check = {}
+            self._measure_sweep(gcmd, speeds, check, quiet=True)
+            score = sweep_score(check)
+            gcmd.respond_info("  %.1f Hz calibration leaves %.0f (lower is better)"
+                              % (freq, score))
+            tried.append((score, freq, values, summary))
+
+        score, freq, values, summary = min(tried, key=lambda t: t[0])
+        for tdx, (amp, phase1, phase2) in sorted(values.items()):
+            self._set_damping(tdx, amp, phase1, phase2)
+            self._keep_result(tdx, amp, phase1, phase2)
+        self._use_freq(freq, stage=True)
+        self.save_to_csv(CSV_DIR + "vfa_%s_summary.csv" % self.stepper, summary,
+                         header=["tdx", "dir", "vel", "freq", "before", "after",
+                                 "kept", "amp", "phase"], format_spec='%.4f')
+        others = ", ".join("%.1f Hz: %.0f" % (f, s) for s, f, _, _ in tried
+                           if f != freq)
+        gcmd.respond_info(
+            "%s: kept the %.1f Hz calibration (%.0f, vs %s). The SAVE_CONFIG "
+            "command will keep it." % (self.stepper, freq, score, others))
 
     # Test the mesh data of resonance_amp and (td2_amp, td2_phase)
     cmd_STEPPER_RESONANCE_MESH_TEST_help = ("Test the resonance amp and frequency at specified velocity for a stepper")
@@ -1108,18 +1404,45 @@ class StepperResonanceTester:
         # # calculate the resonance amplitude
         # freqs = [vel/self.rotation_dis*self.vel_ratio*50*tdx]
         # resonance_amps = self.calculate_resonance_amps(samples, freqs, self.move_angle, self.axis)
-        retry_count = 0
-        while retry_count < 5:
-            samples, t_move_start, t_move_end = self.do_move_and_accel_measure(vel)
+        return self._measure_amps(gcmd, vel, [tdx])[0]
 
-            # calculate the resonance amplitude
-            freqs = [vel/self.rotation_dis*self.vel_ratio*50*tdx]
-            resonance_amps = self.calculate_resonance_amps(samples, freqs, self.move_angle, self.axis)
-            if resonance_amps is not None:
-                break
-            retry_count += 1
-
-        return resonance_amps[0]
+    def _measure_amps(self, gcmd, vel, tdxs):
+        """One test move at vel along the current path: the vibration at each
+        harmonic in tdxs, from the steady-speed part of the move."""
+        freqs = [vel/self.rotation_dis*self.vel_ratio*50*tdx for tdx in tdxs]
+        # Ripples above what the accelerometer can see are reported as NaN
+        usable = [i for i, f in enumerate(freqs) if f <= MAX_MEASURABLE_HZ]
+        result = [float('nan')] * len(freqs)
+        if not usable:
+            return result
+        accel = self.move_accel
+        if vel > self.fast_move_speed:
+            limits = getattr(self, 'saved_limits', None)
+            accel = self.fast_move_accel
+            if limits is not None:
+                accel = min(accel, max(limits[0], self.move_accel))
+            self.gcode.run_script_from_command(
+                "SET_VELOCITY_LIMIT ACCEL=%.3f" % (accel,))
+        try:
+            for retry_count in range(5):
+                samples, t_move_start, t_move_end =                     self.do_move_and_accel_measure(vel)
+                window = cruise_window(t_move_start, t_move_end, vel, accel,
+                                       freq=min(freqs[i] for i in usable))
+                resonance_amps = self.calculate_resonance_amps(
+                    samples, [freqs[i] for i in usable], self.move_angle,
+                    self.axis, window=window)
+                if resonance_amps is not None:
+                    for i, a in zip(usable, resonance_amps):
+                        result[i] = float(a)
+                    return result
+        finally:
+            if accel != self.move_accel:
+                self.gcode.run_script_from_command(
+                    "SET_VELOCITY_LIMIT ACCEL=%.3f" % (self.move_accel,))
+        raise gcmd.error(
+            "No usable accelerometer data for %s at %.1f mm/s after 5 tries: "
+            "check the accelerometer (%s)"
+            % (self.stepper, vel, self.td_config[self.stepper]['accel_chip']))
 
     def search_calibrate_one_direction(self, gcmd, tdx, direction,
                                        n_phase=12, n_amp=5):
@@ -1141,8 +1464,9 @@ class StepperResonanceTester:
         总测量次数: 1 + 4 + 5 + n_amp + 3 + 1（默认 19 次移动）
         其中仅 1~2 次处于"坏相位"（Round 1），且使用小幅值
 
-        返回: (optimal_amp, optimal_phase, history)
+        返回: (optimal_amp, optimal_phase, history, amp_fit)
           history: list of [round, amp, phase, residual] 每次测量记录
+          amp_fit: (c0, c1, c2) of residual² against amplitude, or None
         """
         # 设置移动参数
         self.update_move(self.stepper, direction)
@@ -1170,7 +1494,7 @@ class StepperResonanceTester:
         if A_bare < self.min_distortion_threshold:
             gcmd.respond_info(
                 "  Distortion too small (%.1f < %.1f), skipping" % (A_bare, self.min_distortion_threshold))
-            return 0.0, 0.0, history
+            return 0.0, 0.0, history, None
 
         # 试探幅值用小固定值，即使相位反了也只增加 ~10-15% 振动
         # 注意: A_bare 是加速度计单位(~数千)，trial_amp 是补偿电流单位(~0.005-0.050)
@@ -1440,7 +1764,7 @@ class StepperResonanceTester:
                A_final, A_bare,
                (1.0 - A_final / A_bare) * 100.0 if A_bare > 1e-6 else 0.0))
 
-        return best_amp, best_phase, history
+        return best_amp, best_phase, history, (c0, c1, c2)
 
     cmd_STEPPER_RESONANCE_SEARCH_CALIBRATE_help = (
         "Search-based calibration: sweep phase then amplitude "
@@ -1461,7 +1785,36 @@ class StepperResonanceTester:
           N_AMP: 幅值扫描点数（默认5）
         """
         self.prepare_test(gcmd)
+        try:
+            self._search_calibrate(gcmd)
+        except Exception:
+            # Leave the motors on their saved damping, not half-calibrated
+            self.gcode.run_script_from_command(
+                "MCLIB_APPLY_CALIBRATION STEPPER=%s" % (self.stepper,))
+            raise
+        finally:
+            self.end_test(gcmd)
 
+    def _set_damping(self, tdx, amp, phase1, phase2):
+        self.gcode.run_script_from_command(
+            "MCLIB_SET_RESONANCE_DAMP STEPPER=%s TDX=%d "
+            "AMP=%.3f PHASE1=%.3f PHASE2=%.3f"
+            % (self.stepper, tdx, amp, phase1, phase2))
+
+    def _keep_result(self, tdx, amp, phase1, phase2):
+        """Stage a harmonic's result for SAVE_CONFIG, and make it the one
+        MCLIB_APPLY_CALIBRATION restores until then (print start uses it)."""
+        configfile = self.printer.lookup_object('configfile')
+        section = 'mclib %s' % self.stepper
+        configfile.set(section, 'td%d_amp' % tdx, "%.4f" % amp)
+        configfile.set(section, 'td%d_phase1' % tdx, "%.3f" % phase1)
+        configfile.set(section, 'td%d_phase2' % tdx, "%.3f" % phase2)
+        mclib = self.printer.lookup_object(section, None)
+        if mclib is not None and hasattr(mclib, 'calibrated_damping'):
+            mclib.calibrated_damping[tdx] = (
+                int(amp * 1000), int(phase1 * 1000), int(phase2 * 1000))
+
+    def _search_calibrate(self, gcmd):
         cal_dir = gcmd.get('DIR', None)
         if cal_dir is not None:
             directions = [int(cal_dir)]
@@ -1480,9 +1833,9 @@ class StepperResonanceTester:
             "~%d total per harmonic)"
             % (n_phase, n_amp, 1 + n_phase + n_amp + 5 + 1, total_moves))
 
-        configfile = self.printer.lookup_object('configfile')
         results = []
-
+        summary = []
+        self.last_results = {}
         for tdx in self.tdx:
             gcmd.respond_info(
                 "===== Search calibrating td%d for %s ====="
@@ -1490,74 +1843,112 @@ class StepperResonanceTester:
 
             amp_by_dir = {}
             phase_by_dir = {}
+            fit_by_dir = {}
+            bare_by_dir = {}
             for direction in directions:
                 dir_name = "Forward" if direction == 1 else "Backward"
                 gcmd.respond_info(
                     "--- Direction: %s (dir=%d) ---"
                     % (dir_name, direction))
 
-                opt_amp, opt_phase, meas_history = \
+                opt_amp, opt_phase, meas_history, amp_fit = \
                     self.search_calibrate_one_direction(
                         gcmd, tdx, direction,
                         n_phase=n_phase, n_amp=n_amp)
                 amp_by_dir[direction] = opt_amp
                 phase_by_dir[direction] = opt_phase
+                fit_by_dir[direction] = amp_fit
+                bare_by_dir[direction] = meas_history[0][3]
 
                 for h in meas_history:
                     results.append([tdx, direction] + h)
 
-            # 保存结果到配置
-            if len(directions) == 2:
-                final_amp = max(amp_by_dir.get(1, 0.0),
-                                amp_by_dir.get(0, 0.0))
-                phase1_idx = int(not (1 ^ self.dir_inverted)) + 1
-                phase2_idx = int(not (0 ^ self.dir_inverted)) + 1
-                final_phase1 = phase_by_dir.get(1, 0.0)
-                final_phase2 = phase_by_dir.get(0, 0.0)
-                if phase1_idx == 2:
-                    final_phase1, final_phase2 = final_phase2, final_phase1
-
-                configfile.set('mclib %s' % self.stepper,
-                               'td%d_amp' % tdx,
-                               "%.4f" % final_amp)
-                configfile.set('mclib %s' % self.stepper,
-                               'td%d_phase1' % tdx,
-                               "%.3f" % final_phase1)
-                configfile.set('mclib %s' % self.stepper,
-                               'td%d_phase2' % tdx,
-                               "%.3f" % final_phase2)
-
-                cmd_str = ("MCLIB_SET_RESONANCE_DAMP STEPPER=%s TDX=%d "
-                           "AMP=%.3f PHASE1=%.3f PHASE2=%.3f"
-                           % (self.stepper, tdx, final_amp,
-                              final_phase1, final_phase2))
-                self.gcode.run_script_from_command(cmd_str)
-
-                gcmd.respond_info(
-                    "td%d result: amp=%.4f, phase1=%.3f, phase2=%.3f"
-                    % (tdx, final_amp, final_phase1, final_phase2))
+            # Phases per motor direction: phase1 is the motor's forward
+            phase1 = phase2 = 0.0
+            for direction in directions:
+                if int(not (direction ^ self.dir_inverted)) + 1 == 1:
+                    phase1 = phase_by_dir[direction]
+                else:
+                    phase2 = phase_by_dir[direction]
+            used = [d for d in directions if amp_by_dir[d] > 0.]
+            if not used:
+                final_amp = 0.0
+            elif len(used) == 1:
+                final_amp = amp_by_dir[used[0]]
             else:
-                direction = directions[0]
-                phase_idx = int(not (direction ^ self.dir_inverted)) + 1
-                configfile.set('mclib %s' % self.stepper,
-                               'td%d_amp' % tdx,
-                               "%.4f" % amp_by_dir[direction])
-                configfile.set('mclib %s' % self.stepper,
-                               'td%d_phase%d' % (tdx, phase_idx),
-                               "%.3f" % phase_by_dir[direction])
-
+                final_amp = combine_direction_amps(
+                    [amp_by_dir[d] for d in used],
+                    [fit_by_dir[d] for d in used])
                 gcmd.respond_info(
-                    "td%d result: amp=%.4f, phase%d=%.3f"
-                    % (tdx, amp_by_dir[direction],
-                       phase_idx, phase_by_dir[direction]))
+                    "td%d amplitude for both directions: %.4f "
+                    "(forward %.4f, backward %.4f)"
+                    % (tdx, final_amp, amp_by_dir.get(1, 0.0),
+                       amp_by_dir.get(0, 0.0)))
 
-        self.end_test(gcmd)
+            # Check the result as it will run, in each direction, against no
+            # compensation; keep it only if it lowers the vibration
+            final_by_dir = {}
+            if final_amp > 0.:
+                self._set_damping(tdx, final_amp, phase1, phase2)
+                final_res = []
+                for direction in used:
+                    self.update_move(self.stepper, direction)
+                    vel = (self.vel if self.vel is not None else
+                           self.res_freq/50/tdx*self.rotation_dis/self.vel_ratio)
+                    phase = phase_by_dir[direction]
+                    res = self._apply_comp_and_measure(
+                        gcmd, vel, tdx, direction, final_amp, phase)
+                    results.append([tdx, direction, 6, final_amp, phase, res])
+                    final_res.append(res)
+                    final_by_dir[direction] = res
+                bare = [bare_by_dir[d] for d in used]
+                if not damping_helps(bare, final_res):
+                    gcmd.respond_info(
+                        "td%d: compensation did not lower the vibration "
+                        "(%s -> %s), leaving td%d off"
+                        % (tdx, ", ".join("%.0f" % r for r in bare),
+                           ", ".join("%.0f" % r for r in final_res), tdx))
+                    final_amp = phase1 = phase2 = 0.0
+                else:
+                    gcmd.respond_info(
+                        "td%d: vibration %s -> %s"
+                        % (tdx, ", ".join("%.0f" % r for r in bare),
+                           ", ".join("%.0f" % r for r in final_res)))
+
+            vel_tdx = (self.vel if self.vel is not None else
+                       self.res_freq/50/tdx*self.rotation_dis/self.vel_ratio)
+            for direction in directions:
+                kept = final_amp > 0. and direction in final_by_dir
+                summary.append([
+                    tdx, direction, vel_tdx,
+                    vel_to_freq(vel_tdx, self.rotation_dis, self.vel_ratio, tdx),
+                    bare_by_dir[direction],
+                    final_by_dir[direction] if kept else bare_by_dir[direction],
+                    int(kept), final_amp, phase_by_dir[direction] if kept else 0.])
+
+            if len(directions) == 1 and final_amp > 0.:
+                # Only one direction measured: keep the other's saved phase
+                other = 1 - int(not (directions[0] ^ self.dir_inverted))
+                saved = self.td_config[self.stepper]['td_phase'][tdx // 2]
+                if other == 0:
+                    phase1 = saved[0]
+                else:
+                    phase2 = saved[1]
+            self._set_damping(tdx, final_amp, phase1, phase2)
+            self._keep_result(tdx, final_amp, phase1, phase2)
+            self.last_results[tdx] = (final_amp, phase1, phase2)
+            gcmd.respond_info(
+                "td%d result: amp=%.4f, phase1=%.3f, phase2=%.3f"
+                % (tdx, final_amp, phase1, phase2))
 
         filename = (CSV_DIR + "%s_search_calibrate-%s.csv"
                     % (self.stepper, time.strftime("%Y%m%d_%H%M%S")))
         csv_header = ["tdx", "dir", "round", "amp", "phase", "residual"]
         self.save_to_csv(filename, results, header=csv_header,
                          format_spec='%.4f')
+        self.save_to_csv(CSV_DIR + "vfa_%s_summary.csv" % self.stepper, summary,
+                         header=["tdx", "dir", "vel", "freq", "before", "after",
+                                 "kept", "amp", "phase"], format_spec='%.4f')
         gcmd.respond_info(
             "Search calibration history (%d measurements) saved to %s"
             % (len(results), filename))
@@ -1565,6 +1956,7 @@ class StepperResonanceTester:
         gcmd.respond_info(
             "The SAVE_CONFIG command will update the printer config\n"
             "file and restart the printer.")
+        return summary
 
     def refine_calibrate_one_direction(self, gcmd, tdx, direction,
                                        init_amp, init_phase,
