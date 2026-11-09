@@ -391,6 +391,47 @@ class AutoCalibrateTest(unittest.TestCase):
         self.assertAlmostEqual(t.td_config['stepper_x']['freq'], 245., delta=8.)
 
 
+class PhaseProbeRetryTest(unittest.TestCase):
+    # A ripple of size D, cancelled by a test strength of D/K at phase pi
+    def run_search(self, bare, k=48485.):
+        from unittest import mock
+        t = srt.StepperResonanceTester.__new__(srt.StepperResonanceTester)
+        t.stepper, t.vel = 'stepper_y', None
+        t.res_freq, t.rotation_dis, t.vel_ratio = 244., 40.4, np.sqrt(2.)
+        t.dir_inverted = False
+        t.td_amp_initial = [0.01, 0.02, 0.01]
+        t.initial_trial_amp = 0.05
+        t.min_distortion_threshold = 10.
+        t.update_move = mock.Mock()
+        t.move_angle = 45.
+        amps = []
+
+        def measure(gcmd, vel, tdx, direction, amp, phase):
+            amps.append(round(amp, 4))
+            return abs(bare + k * amp * np.exp(1j * phase))
+        t._apply_comp_and_measure = measure
+        gcmd = mock.Mock()
+        amp, phase, history, fit = t.search_calibrate_one_direction(gcmd, 1, 1)
+        probes = [round(h[1], 4) for h in history if h[0] == 1]
+        return amp, phase, probes, gcmd
+
+    def test_small_ripple_gets_a_smaller_probe(self):
+        # bare 160: a 0.01 probe overshoots at every phase, 0.002 doesn't
+        amp, phase, probes, _ = self.run_search(160.)
+        self.assertEqual(probes, [0.01] * 4 + [0.002] * 4)
+        self.assertAlmostEqual(amp, 160. / 48485., delta=0.0006)
+        self.assertAlmostEqual(phase, np.pi, delta=0.15)
+
+    def test_no_repeat_at_the_same_strength(self):
+        # bare 50: even the smallest probe overshoots. It says so and carries
+        # on, instead of probing again at the same strength
+        amp, phase, probes, gcmd = self.run_search(50.)
+        self.assertEqual(probes, [0.01] * 4 + [0.002] * 4)
+        said = " ".join(str(c[0][0]) for c in gcmd.respond_info.call_args_list)
+        self.assertIn("already the smallest", said)
+        self.assertNotIn("Reducing 0.0020 -> 0.0020", said)
+
+
 class ResonanceAmpWindowTest(unittest.TestCase):
     def setUp(self):
         self.tester = srt.StepperResonanceTester.__new__(

@@ -243,6 +243,10 @@ def golden_section_search(f, a, b, tol=0.05, max_iter=20):
 # The steady-speed part of a test move, from its known start and end times:
 # skips the acceleration at each end and the ringing just after it. None when
 # that leaves too little to analyse.
+# The weakest test strength the phase probe shrinks to (A; the MCU's step is
+# 0.001). A small ripple needs a small probe, or every phase overshoots it.
+TRIAL_AMP_MIN = 0.002
+
 CRUISE_SETTLE = 0.1   # s after reaching speed, and before slowing down
 CRUISE_MIN_TIME = 0.25  # s
 # A fast move has less steady time: enough cycles of its lowest ripple will
@@ -1097,10 +1101,14 @@ class StepperResonanceTester:
 
         speeds = sweep_speeds(self.vel_min, self.vel_max,
                               self.sweep_spacing, self.vel_step)
+        gcmd.respond_info(
+            "%s has %d strong resonances: calibrating at each and keeping the "
+            "one that leaves less vibration (this takes about %d times as long)"
+            % (self.stepper, len(freqs), len(freqs)))
         tried = []
-        for freq in freqs:
-            gcmd.respond_info("===== %s: trying the %.1f Hz resonance ====="
-                              % (self.stepper, freq))
+        for n, freq in enumerate(freqs, 1):
+            gcmd.respond_info("===== %s: calibration %d of %d, at %.1f Hz ====="
+                              % (self.stepper, n, len(freqs), freq))
             self._zero_damping()
             self._use_freq(freq, stage=False)
             summary = self._search_calibrate(gcmd)
@@ -1425,7 +1433,8 @@ class StepperResonanceTester:
                 "SET_VELOCITY_LIMIT ACCEL=%.3f" % (accel,))
         try:
             for retry_count in range(5):
-                samples, t_move_start, t_move_end =                     self.do_move_and_accel_measure(vel)
+                samples, t_move_start, t_move_end = (
+                    self.do_move_and_accel_measure(vel))
                 window = cruise_window(t_move_start, t_move_end, vel, accel,
                                        freq=min(freqs[i] for i in usable))
                 resonance_amps = self.calculate_resonance_amps(
@@ -1435,6 +1444,13 @@ class StepperResonanceTester:
                     for i, a in zip(usable, resonance_amps):
                         result[i] = float(a)
                     return result
+                gcmd.respond_info(
+                    "  No usable accelerometer data at %.1f mm/s (%d samples); "
+                    "repeating the move (%d of 5)"
+                    % (vel, len(samples), retry_count + 2)
+                    if retry_count < 4 else
+                    "  No usable accelerometer data at %.1f mm/s (%d samples)"
+                    % (vel, len(samples)))
         finally:
             if accel != self.move_accel:
                 self.gcode.run_script_from_command(
@@ -1530,24 +1546,37 @@ class StepperResonanceTester:
                     % (quad_labels[i], R_quad[i]))
 
             # 检查是否过补偿：所有残余都大于裸扰动
-            if np.min(R_quad) > A_bare * 0.8:
-                # 用最大残余与 A_bare 的比值估算缩放因子
-                # R_max ≈ |D| + |GA_t|, A_bare ≈ |D|
-                # 目标: |GA_t_new| ≈ |D|/5 → trial_amp_new ≈ trial_amp * A_bare / (5*(R_max - A_bare))
-                R_max = np.max(R_quad)
-                scale = A_bare / (5.0 * max(R_max - A_bare, A_bare * 0.1))
-                scale = min(scale, 0.5)  # 确保缩小，不能放大
-                trial_amp_new = trial_amp * scale
-                trial_amp_new = max(trial_amp_new, 0.005) # 不要过度缩小，保持足够信噪比
-                gcmd.respond_info(
-                    "  WARNING: All residuals > A_bare (min=%.1f > "
-                    "%.1f), trial_amp too large. "
-                    "Reducing %.4f -> %.4f"
-                    % (np.min(R_quad), A_bare,
-                       trial_amp, trial_amp_new))
-                trial_amp = trial_amp_new
-            else:
+            if np.min(R_quad) <= A_bare * 0.8:
                 break
+            # Every phase made it worse: the test strength is too big for this
+            # ripple. Probe again weaker, unless this was the last try or it
+            # can't get any weaker; then carry on with these readings (the
+            # later rounds still find the best amplitude)
+            if retry == max_retries - 1:
+                gcmd.respond_info(
+                    "  Every phase still above the bare vibration (min=%.1f, "
+                    "bare=%.1f) after %d probes; continuing with these readings"
+                    % (np.min(R_quad), A_bare, max_retries))
+                break
+            # 用最大残余与 A_bare 的比值估算缩放因子
+            # R_max ≈ |D| + |GA_t|, A_bare ≈ |D|
+            # 目标: |GA_t_new| ≈ |D|/5 → trial_amp_new ≈ trial_amp * A_bare / (5*(R_max - A_bare))
+            R_max = np.max(R_quad)
+            scale = A_bare / (5.0 * max(R_max - A_bare, A_bare * 0.1))
+            scale = min(scale, 0.5)  # 确保缩小，不能放大
+            trial_amp_new = max(trial_amp * scale, TRIAL_AMP_MIN)
+            if trial_amp_new > trial_amp * 0.95:
+                gcmd.respond_info(
+                    "  Every phase above the bare vibration (min=%.1f, bare=%.1f), "
+                    "but the test strength is already the smallest (%.4f); "
+                    "continuing with these readings"
+                    % (np.min(R_quad), A_bare, trial_amp))
+                break
+            gcmd.respond_info(
+                "  Every phase above the bare vibration (min=%.1f > %.1f): test "
+                "strength too big, probing again at %.4f (was %.4f)"
+                % (np.min(R_quad), A_bare, trial_amp_new, trial_amp))
+            trial_amp = trial_amp_new
 
         best_phase_r1, amp_est, R0_sq, R1, phase_check_err = \
             self._quadrature_estimate(quad_phases, R_quad, trial_amp)
