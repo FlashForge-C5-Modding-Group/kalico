@@ -1952,12 +1952,10 @@ class Creator5Toolchanger:
         with self._calibration_transaction():
             self._with_motion(gcmd, calibrate)
         if gcmd.get_int('SAVE', 0, minval=0, maxval=1):
-            self.configfile.set(self.section, 'station_x',
-                                '%.4f' % self.station_x)
-            self.configfile.set(self.section, 'station_y',
-                                '%.4f' % self.station_y)
-            self.configfile.set(self.section, 'station_z',
-                                '%.4f' % self.station_z)
+            # extruder.json is what's loaded at startup. Staging these for
+            # SAVE_CONFIG too would clash with printer.creator5.cfg, which
+            # sets them, and make every SAVE_CONFIG fail
+            self.cmd_save_offsets_json(gcmd)
 
     def _dock_for_offset_reference(self, gcmd, attached):
         if attached is None:
@@ -2081,11 +2079,11 @@ class Creator5Toolchanger:
             finally:
                 if single:
                     self._stock_pin_approach_z = None
-        if gcmd.get_int('SAVE', 0, minval=0, maxval=1):
-            axes = 'xyz' if include_z else 'xy'
-            for axis, value in zip(axes, self.measurements[tool]):
-                self.configfile.set(self.section, 't%d_measure_%s' % (tool, axis),
-                                    '%.4f' % value)
+        if gcmd.get_int('SAVE', 0, minval=0, maxval=1) and single:
+            # As for all four tools: extruder.json is the saved set, loaded at
+            # startup. Staging t%d_measure_* for SAVE_CONFIG would clash with
+            # printer.creator5.cfg, which sets them, and fail every SAVE_CONFIG
+            self.cmd_save_offsets_json(gcmd)
         if single:
             self._dock(gcmd, tool)
 
@@ -2379,10 +2377,10 @@ class Creator5Toolchanger:
             if tool == 'ALL':
                 self._run('C5_CALIBRATE_ALL_OFFSETS SAVE=1 BUILDPLATE_REMOVED=1')
             else:
+                # SAVE=1 writes extruder.json itself
                 self._run('C5_TOOL_OFFSET_CALIBRATE T=%s Z=1 SAVE=1 '
                           'LEVELBOARD=%d BUILDPLATE_REMOVED=1'
                           % (tool, levelboard))
-                self._run('C5_SAVE_OFFSETS_JSON')
             return
         raise gcmd.error('Unknown STEP %s' % step)
 

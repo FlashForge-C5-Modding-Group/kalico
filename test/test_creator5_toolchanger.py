@@ -1294,6 +1294,54 @@ class Creator5OffsetTests(unittest.TestCase):
         self.assertEqual(steps[4:6], [('z', 1), ('xy', 1, 1.9)])
         self.assertIsNone(self.board._stock_pin_approach_z)
 
+    def single_offset_setup(self):
+        self.board.scan_height = None
+        self.board._preflight = mock.Mock(side_effect=[
+            ([], [], 1), ([], [], 1)])
+        self.board._dock_for_offset_reference = lambda gcmd, attached: None
+        self.board._dock = lambda gcmd, tool: None
+        self.board._calibrate_offset_reference = (
+            lambda gcmd, levelboard=True: None)
+        self.board._run = mock.Mock()
+        self.board._with_motion = lambda gcmd, operation: operation()
+        self.board._calibrate_tool_z = lambda gcmd, tool: 1.3
+        self.board._calibrate_tool_xy = lambda gcmd, tool, height: None
+        self.board._apply_offsets = lambda tool: None
+        self.board._lift_after_offset_calibration = lambda gcmd: None
+        self.board.printer.lookup_object.side_effect = None
+        self.board.printer.lookup_object.return_value = mock.Mock(
+            get_status=mock.Mock(return_value={
+                'homing_origin': (.1, .2, .3, 0.), 'state': 'standby'}))
+        self.board.configfile = mock.Mock()
+        self.board.cmd_save_offsets_json = mock.Mock()
+
+    def test_single_offset_save_writes_json_not_save_config(self):
+        # printer.creator5.cfg sets t0..t3_measure_*, so staging them for
+        # SAVE_CONFIG would make every SAVE_CONFIG fail
+        self.single_offset_setup()
+        self.board.cmd_offset_calibrate(GCmd(
+            BUILDPLATE_REMOVED=1, T=1, Z=1, SAVE=1))
+        self.board.cmd_save_offsets_json.assert_called_once()
+        self.board.configfile.set.assert_not_called()
+
+    def test_single_offset_without_save_writes_nothing(self):
+        self.single_offset_setup()
+        self.board.cmd_offset_calibrate(GCmd(
+            BUILDPLATE_REMOVED=1, T=1, Z=1, SAVE=0))
+        self.board.cmd_save_offsets_json.assert_not_called()
+        self.board.configfile.set.assert_not_called()
+
+    def test_reference_save_writes_json_not_save_config(self):
+        self.board.configfile = mock.Mock()
+        self.board.cmd_save_offsets_json = mock.Mock()
+        self.board._calibration_transaction = mock.MagicMock()
+        self.board._with_motion = mock.Mock()
+        self.board._preflight = mock.Mock(return_value=([], [], None))
+        self.board.reference_scan_height = None
+        self.board.cmd_reference_calibrate(GCmd(SAVE=1, BUILDPLATE_REMOVED=1))
+        self.board.cmd_save_offsets_json.assert_called_once()
+        self.board.configfile.set.assert_not_called()
+
     def test_single_offset_plate_check_failure_prevents_pickup_and_fixture(self):
         self.board.scan_height = None
         self.board._preflight = mock.Mock(return_value=([], [], None))
