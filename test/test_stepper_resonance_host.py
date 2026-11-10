@@ -371,6 +371,47 @@ class AutoCalibrateTest(unittest.TestCase):
         self.assertEqual(staged[:2], ('stepper_resonance_tester', 'stepper_x_freq'))
         self.assertAlmostEqual(float(staged[2]), 284.6, delta=10.)
 
+    def test_checks_both_directions(self):
+        from unittest import mock
+        t = self.make()
+        t._auto_calibrate(mock.Mock())
+        dirs = [c[0][1] for c in t.update_move.call_args_list]
+        self.assertIn(0, dirs)
+        self.assertEqual(dirs[-1], 1)
+
+    def test_graph_reuses_the_winners_check_as_after(self):
+        from unittest import mock
+        t = self.make()
+        moves = []
+        orig = t._measure_amps
+        t._measure_amps = lambda g, v, tdxs: (moves.append(v), orig(g, v, tdxs))[1]
+        t._auto_calibrate(mock.Mock(), graph=True)
+        after = pathlib.Path(srt.CSV_DIR, 'vfa_stepper_x_curve_after.csv')
+        self.assertTrue(after.exists())
+        # no separate after sweep: the last moves are the winner's check
+        speeds = srt.sweep_speeds(20., 300.)
+        self.assertEqual(moves[-len(speeds):], speeds)
+        rows = after.read_text().splitlines()
+        self.assertEqual(len(rows), len(speeds) + 1)
+
+    def test_one_resonance_graph_runs_an_after_sweep(self):
+        from unittest import mock
+        t = self.make()
+        orig = t._measure_amps
+
+        def one_peak(gcmd, vel, tdxs):
+            if t.tuned is not None:
+                return orig(gcmd, vel, tdxs)
+            out = []
+            for tdx in tdxs:
+                f = srt.vel_to_freq(vel, 40.4, np.sqrt(2.), tdx)
+                out.append(float('nan') if f > srt.MAX_MEASURABLE_HZ else
+                           100. + 1650. / (1. + ((f - 245.) / 20.) ** 2))
+            return out
+        t._measure_amps = one_peak
+        t._auto_calibrate(mock.Mock(), graph=True)
+        self.assertTrue(pathlib.Path(srt.CSV_DIR, 'vfa_stepper_x_curve_after.csv').exists())
+
     def test_one_strong_resonance_calibrates_once(self):
         from unittest import mock
         t = self.make()

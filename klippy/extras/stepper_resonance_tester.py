@@ -992,12 +992,7 @@ class StepperResonanceTester:
         res_freq = (vel_to_freq(strong[0][0], self.rotation_dis, self.vel_ratio, main)
                     if strong else self.res_freq)
 
-        header = ["vel"] + ["td%d_amp" % t for t in self.tdx]
-        result = [[v] + rows[v] for v in vels]
-        for filename in (CSV_DIR + "%s_resonance_curve-%s.csv"
-                         % (self.stepper, time.strftime("%Y%m%d_%H%M%S")),
-                         CSV_DIR + "vfa_%s_curve_%s.csv" % (self.stepper, name)):
-            self.save_to_csv(filename, result, header=header)
+        filename = self._save_curve(rows, name)
         with open(CSV_DIR + "vfa_%s_curve_%s.info" % (self.stepper, name), 'w') as f:
             f.write("res_freq=%.1f\ntrusted=%d\nmain_tdx=%d\nconfigured_freq=%.1f\n"
                     "rotation_distance=%.4f\nvel_ratio=%.6f\n"
@@ -1006,6 +1001,38 @@ class StepperResonanceTester:
         gcmd.respond_info("Resonance sweep (%d speeds) saved to %s"
                           % (len(vels), filename))
         return rows, main, strong
+
+    def _save_curve(self, rows, name):
+        """A sweep's rows as vfa_<stepper>_curve_<name>.csv (what the graph
+        reads), plus a timestamped copy. Returns the vfa_ file's path."""
+        header = ["vel"] + ["td%d_amp" % t for t in self.tdx]
+        result = [[v] + rows[v] for v in sorted(rows)]
+        stamped = (CSV_DIR + "%s_resonance_curve-%s.csv"
+                   % (self.stepper, time.strftime("%Y%m%d_%H%M%S")))
+        filename = CSV_DIR + "vfa_%s_curve_%s.csv" % (self.stepper, name)
+        for path in (stamped, filename):
+            self.save_to_csv(path, result, header=header)
+        return filename
+
+    def _check_sweep(self, gcmd, speeds):
+        """The current calibration across the speeds, in both directions.
+        Returns (forward rows, score): the score adds both directions."""
+        rows_by_dir = {}
+        for direction in (1, 0):
+            self.dir = direction
+            self.update_move(self.stepper, direction)
+            rows = {}
+            self._measure_sweep(gcmd, speeds, rows, quiet=True)
+            rows_by_dir[direction] = rows
+        self.dir = 1
+        self.update_move(self.stepper, 1)
+        return rows_by_dir[1], sum(sweep_score(r) for r in rows_by_dir.values())
+
+    def _after_sweep(self, gcmd):
+        """The speed sweep again with the calibration applied, for the graph."""
+        self.dir = 1
+        self.update_move(self.stepper, 1)
+        self._resonance_sweep(gcmd, 'after', checking=True)
 
     def _use_freq(self, freq, stage):
         """Aim calibration at freq; stage it for SAVE_CONFIG when stage."""
@@ -1070,8 +1097,9 @@ class StepperResonanceTester:
         "leaves the least vibration across speeds")
     def cmd_STEPPER_RESONANCE_AUTO_CALIBRATE(self, gcmd):
         self.prepare_test(gcmd)
+        graph = gcmd.get_int('GRAPH', 0)
         try:
-            self._auto_calibrate(gcmd)
+            self._auto_calibrate(gcmd, graph)
         except Exception:
             self.gcode.run_script_from_command(
                 "MCLIB_APPLY_CALIBRATION STEPPER=%s" % (self.stepper,))
@@ -1079,7 +1107,7 @@ class StepperResonanceTester:
         finally:
             self.end_test(gcmd)
 
-    def _auto_calibrate(self, gcmd):
+    def _auto_calibrate(self, gcmd, graph=False):
         self._zero_damping()
         self.dir = 1
         self.update_move(self.stepper, self.dir)
@@ -1090,6 +1118,8 @@ class StepperResonanceTester:
             gcmd.respond_info("No clear resonance for %s: calibrating at %.1f Hz"
                               % (self.stepper, self.res_freq))
             self._search_calibrate(gcmd)
+            if graph:
+                self._after_sweep(gcmd)
             return
         gcmd.respond_info("%s resonances: %s" % (self.stepper, ", ".join(
             "%.1f Hz (%.1f mm/s, %.0f)" % (f, v, a)
@@ -1097,6 +1127,8 @@ class StepperResonanceTester:
         if len(freqs) == 1:
             self._use_freq(freqs[0], stage=True)
             self._search_calibrate(gcmd)
+            if graph:
+                self._after_sweep(gcmd)
             return
 
         speeds = sweep_speeds(self.vel_min, self.vel_max,
@@ -1113,18 +1145,14 @@ class StepperResonanceTester:
             self._use_freq(freq, stage=False)
             summary = self._search_calibrate(gcmd)
             values = dict(self.last_results)
-            self.dir = 1
-            self.update_move(self.stepper, self.dir)
-            gcmd.respond_info("Checking the %.1f Hz calibration across speeds"
-                              % freq)
-            check = {}
-            self._measure_sweep(gcmd, speeds, check, quiet=True)
-            score = sweep_score(check)
+            gcmd.respond_info("Checking the %.1f Hz calibration across speeds, "
+                              "both directions" % freq)
+            check, score = self._check_sweep(gcmd, speeds)
             gcmd.respond_info("  %.1f Hz calibration leaves %.0f (lower is better)"
                               % (freq, score))
-            tried.append((score, freq, values, summary))
+            tried.append((score, freq, values, summary, check))
 
-        score, freq, values, summary = min(tried, key=lambda t: t[0])
+        score, freq, values, summary, check = min(tried, key=lambda t: t[0])
         for tdx, (amp, phase1, phase2) in sorted(values.items()):
             self._set_damping(tdx, amp, phase1, phase2)
             self._keep_result(tdx, amp, phase1, phase2)
@@ -1132,8 +1160,12 @@ class StepperResonanceTester:
         self.save_to_csv(CSV_DIR + "vfa_%s_summary.csv" % self.stepper, summary,
                          header=["tdx", "dir", "vel", "freq", "before", "after",
                                  "kept", "amp", "phase"], format_spec='%.4f')
-        others = ", ".join("%.1f Hz: %.0f" % (f, s) for s, f, _, _ in tried
-                           if f != freq)
+        if graph:
+            # The winner's check sweep is the graph's "after": no need to
+            # measure it again
+            self._save_curve(check, 'after')
+        others = ", ".join("%.1f Hz: %.0f" % (t[1], t[0]) for t in tried
+                           if t[1] != freq)
         gcmd.respond_info(
             "%s: kept the %.1f Hz calibration (%.0f, vs %s). The SAVE_CONFIG "
             "command will keep it." % (self.stepper, freq, score, others))
