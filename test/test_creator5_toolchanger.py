@@ -1131,6 +1131,89 @@ class Creator5OffsetTests(unittest.TestCase):
         data, _ = self.board._read_stock_json(zpath)
         self.assertAlmostEqual(data['z_offset_t2'], 0.03)
 
+    def test_babystep_saved_after_a_restart_with_the_tool_on(self):
+        # After a restart this module hasn't set the offset (_applied_z is
+        # None); the Z_ADJUST step is still added to zoffset.json
+        zpath = self._babystep_fixture(2.83)
+        self.board._applied_z = None
+        self.board.busy = False
+        self.board.attached_tool_from_pins = lambda: 1
+        self.board.prev_set_gcode_offset = mock.Mock()
+        self.board.cmd_set_gcode_offset(GCmd(Z_ADJUST=-0.02))
+        data, _ = self.board._read_stock_json(zpath)
+        self.assertAlmostEqual(data['z_offset_t2'], 0.03)
+
+    def test_babystep_is_not_counted_again_at_dock_or_save(self):
+        zpath = self._babystep_fixture(2.83)
+        self.board.busy = False
+        self.board.attached_tool_from_pins = lambda: 1
+        self.board.prev_set_gcode_offset = mock.Mock()
+        self.board.cmd_set_gcode_offset(GCmd(Z_ADJUST=-0.02))
+        self.board.cmd_save_babystep(GCmd())
+        data, _ = self.board._read_stock_json(zpath)
+        self.assertAlmostEqual(data['z_offset_t2'], 0.03)
+
+    def test_babystep_keeps_a_value_written_by_something_else(self):
+        zpath = self._babystep_fixture(2.83)
+        self.board.busy = False
+        self.board.attached_tool_from_pins = lambda: 1
+        self.board.prev_set_gcode_offset = mock.Mock()
+        # the touchscreen (or a hand edit) set T1 to 0.10 meanwhile
+        with open(zpath, 'w') as target:
+            target.write('{"z_offset_t2": 0.10}\n/* stock comment */\n')
+        self.board.cmd_set_gcode_offset(GCmd(Z_ADJUST=-0.02))
+        data, _ = self.board._read_stock_json(zpath)
+        self.assertAlmostEqual(data['z_offset_t2'], 0.08)
+
+    def test_pickup_applies_what_zoffset_json_says_now(self):
+        zpath = self._babystep_fixture(2.85)
+        self.board.measurements[1] = [0., 0., 1.3]
+        self.board.station_z = -1.5
+        with open(zpath, 'w') as target:
+            target.write('{"z_offset_t2": 0.20}\n')
+        self.board._run.reset_mock()
+        self.board._apply_offsets(1)
+        cmd = self.board._run.call_args[0][0]
+        self.assertTrue(cmd.endswith('Z=3.0000 MOVE=0'), cmd)
+
+    def test_unreadable_zoffset_json_keeps_the_last_values(self):
+        zpath = self._babystep_fixture(2.85)
+        self.board.z_adjustments = [0., 0.05, 0., 0.]
+        with open(zpath, 'w') as target:
+            target.write('{"z_offset_t2": "nan"}\n')
+        gcmd = GCmd()
+        self.board._reload_z_adjustments(gcmd)
+        self.assertEqual(self.board.z_adjustments[1], 0.05)
+        self.assertIn('last saved Z adjustments', gcmd.messages[0])
+
+    def test_babystep_is_per_nozzle(self):
+        zpath = self._babystep_fixture(2.83)
+        with open(zpath, 'w') as target:
+            target.write('{"z_offset_t1": 0.01, "z_offset_t2": 0.05, '
+                         '"z_offset_t3": -0.02, "z_offset_t4": 0.04}\n')
+        self.board.busy = False
+        self.board.prev_set_gcode_offset = mock.Mock()
+        # T1 attached: only T1's value (z_offset_t2) changes
+        self.board.attached_tool_from_pins = lambda: 1
+        self.board.cmd_set_gcode_offset(GCmd(Z_ADJUST=-0.02))
+        data, _ = self.board._read_stock_json(zpath)
+        self.assertEqual([round(data['z_offset_t%d' % n], 4) for n in range(1, 5)],
+                         [0.01, 0.03, -0.02, 0.04])
+        # then T3 attached: only T3's value (z_offset_t4) changes
+        self.board.attached_tool_from_pins = lambda: 3
+        self.board.cmd_set_gcode_offset(GCmd(Z_ADJUST=0.01))
+        data, _ = self.board._read_stock_json(zpath)
+        self.assertEqual([round(data['z_offset_t%d' % n], 4) for n in range(1, 5)],
+                         [0.01, 0.03, -0.02, 0.05])
+        # and each pickup applies its own nozzle's value
+        self.board.measurements = [[0., 0., 1.3] for _ in range(4)]
+        self.board.station_z = -1.5
+        for tool, expected in ((0, 2.81), (1, 2.83), (2, 2.78), (3, 2.85)):
+            self.board._run.reset_mock()
+            self.board._apply_offsets(tool)
+            self.assertTrue(self.board._run.call_args[0][0].endswith(
+                'Z=%.4f MOVE=0' % expected), (tool, self.board._run.call_args))
+
     def test_babystep_list_and_clear(self):
         zpath = self._babystep_fixture(2.85)          # T1 attached at 2.85
         self.board.busy = False

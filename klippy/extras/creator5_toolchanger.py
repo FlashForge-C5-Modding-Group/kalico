@@ -681,16 +681,49 @@ class Creator5Toolchanger:
     def cmd_set_gcode_offset(self, gcmd):
         self.prev_set_gcode_offset(gcmd)
         if (not self.persist_babystep or self.busy
-                or self._applied_z is None
                 or gcmd.get('Z_ADJUST', None) is None):
             return
         try:
             tool = self.attached_tool_from_pins()
             if tool is not None:
-                self._persist_babystep(gcmd, tool, backup=False)
+                self._save_babystep_step(gcmd, tool,
+                                         gcmd.get_float('Z_ADJUST'))
         except Exception as exc:
             # Never stop a print over the saved copy
             gcmd.respond_info('Baby stepping not saved: %s' % exc)
+
+    def _save_babystep_step(self, gcmd, tool, step):
+        """Add a baby step (SET_GCODE_OFFSET Z_ADJUST) to TOOL's zoffset.json
+        adjustment: the step itself, so it's kept whatever set the offset
+        before it (after a restart with the tool on, for one). The file is
+        read first, so a value written by something else isn't lost."""
+        if not math.isfinite(step) or abs(step) < 0.0005:
+            return
+        if abs(step) > 1.:
+            gcmd.respond_info('T%d Z_ADJUST %.4f mm is too big for baby '
+                              'stepping; not saved' % (tool, step))
+            return
+        self._reload_z_adjustments(gcmd)
+        self._write_z_adjustment(gcmd, tool, self.z_adjustments[tool] + step,
+                                 backup=False)
+        # Counted now: docking or C5_SAVE_BABYSTEP mustn't add it again
+        origin = self.printer.lookup_object('gcode_move').get_status()[
+            'homing_origin'][2]
+        self._applied_z = (tool, origin)
+        gcmd.respond_info('Saved T%d baby stepping %+.4f mm (Z adjustment now '
+                          '%.4f mm)' % (tool, step, self.z_adjustments[tool]))
+
+    def _reload_z_adjustments(self, gcmd=None):
+        """zoffset.json again, so the saved adjustments are what's applied.
+        If it can't be read, the last good values stay (never stop a print
+        over it) and it says so."""
+        try:
+            self._load_zoffset_json()
+        except Exception as exc:
+            logging.warning('creator5_toolchanger: %s', exc)
+            if gcmd is not None:
+                gcmd.respond_info('%s; using the last saved Z adjustments'
+                                  % exc)
 
     def cmd_save_babystep(self, gcmd):
         """Keep the attached tool's baby stepping for later prints."""
@@ -793,6 +826,7 @@ class Creator5Toolchanger:
         correction = self.print_z_corrections[tool]
         if correction is None or not self._printing():
             return
+        self._reload_z_adjustments()
         baseline = self.measurements[tool][2] - self.station_z + correction
         offset = baseline + self.z_adjustments[tool]
         if not math.isfinite(offset) or not 0.5 <= offset <= 5.:
@@ -1910,6 +1944,7 @@ class Creator5Toolchanger:
         return z
 
     def _apply_offsets(self, tool):
+        self._reload_z_adjustments()
         self.print_z_baseline[tool] = None
         offsets = [self.measurements[tool][axis]
                    - self.measurements[0][axis] for axis in range(2)]
