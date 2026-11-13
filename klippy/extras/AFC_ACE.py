@@ -1760,19 +1760,28 @@ class afcACE(afcUnit):
         if (self._ace is not None
             and self._ace.connected):
             slot = self._get_slot(cur_lane.name)
-            try:
-                hw_status = self._ace.get_status(timeout=2.0)
-                if isinstance(hw_status, dict):
-                    slots = hw_status.get("slots", [])
-                    if (slot < len(slots)
-                        and isinstance(slots[slot], dict)):
-                        slot_ready = slots[slot].get("status", "") == "ready"
-                        cur_lane.prep_state = slot_ready
-                        if not slot_ready:
-                            cur_lane.loaded_to_hub = False
-                            self._set_hub_state(cur_lane, False)
-            except Exception as e:
-                self.logger.debug(f"ACE get_status failed during PREP: {e}")
+            slot_ready = None
+            for attempt in range(3):
+                try:
+                    hw_status = self._ace.get_status(timeout=2.0)
+                    if isinstance(hw_status, dict):
+                        slots = hw_status.get("slots", [])
+                        if (slot < len(slots)
+                            and isinstance(slots[slot], dict)):
+                            slot_ready = slots[slot].get("status", "") == "ready"
+                    break
+                except Exception as e:
+                    self.logger.debug(f"ACE get_status failed during PREP (try {attempt + 1}): {e}")
+            if slot_ready is None:
+                # No answer: keep the saved state. Reading it as empty makes the
+                # next poll treat the spool as a fresh insert, which clears it.
+                slot_ready = bool(cur_lane.tool_loaded or cur_lane.loaded_to_hub
+                                  or cur_lane.status in (AFCLaneState.LOADED,
+                                                         AFCLaneState.TOOLED))
+            cur_lane.prep_state = slot_ready
+            if not slot_ready:
+                cur_lane.loaded_to_hub = False
+                self._set_hub_state(cur_lane, False)
         else:
             msg = '<span class=error--text>ACE NOT CONNECTED</span>'
             succeeded = False
