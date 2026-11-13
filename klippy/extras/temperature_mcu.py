@@ -110,6 +110,7 @@ class PrinterTemperatureMCU:
             ("gd32e230x8", self.config_gd32e230x8),
             ("gd32f303xe", self.config_gd32f303xe),
             ("gd32f303xb", self.config_gd32f303xb),
+            ("gd32h7", self.config_gd32h7),
             ("", self.config_unknown),
         ]
         for name, func in cfg_funcs:
@@ -158,6 +159,21 @@ class PrinterTemperatureMCU:
     def config_gd32f303xb(self):
         self.slope = 3.3 / -0.004100
         self.base_temperature = self.calc_base(25.0, 1.45 / 3.3)
+
+    def config_gd32h7(self):
+        # 12-bit factory readings at 3.3 V, at 25 C and -40 C
+        cal_adc_25 = (
+            (self.read16(0x1FF0F7C0) & 0xFFF)
+            * 3.3
+            / (self.reference_voltage * 4095.0)
+        )
+        cal_adc_m40 = (
+            (self.read16(0x1FF0F7C2) & 0xFFF)
+            * 3.3
+            / (self.reference_voltage * 4095.0)
+        )
+        self.slope = (25.0 + 40.0) / (cal_adc_25 - cal_adc_m40)
+        self.base_temperature = self.calc_base(25.0, cal_adc_25)
 
     def config_rp2040(self):
         self.slope = self.reference_voltage / -0.001721

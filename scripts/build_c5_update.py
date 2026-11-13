@@ -346,6 +346,7 @@ def _mainboard_pin_enumeration():
                      for pin in range(16)})
     pins.update({"PH2": 114, "PH3": 115})
     pins.update({"PJ%d" % pin: 144 + pin for pin in range(16)})
+    pins["ADC_TEMPERATURE"] = 0xfe
     return pins
 
 
