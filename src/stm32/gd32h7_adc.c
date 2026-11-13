@@ -13,6 +13,11 @@
 
 DECL_CONSTANT("ADC_MAX", 4095);
 
+// The internal temperature sensor is ADC2 channel 18
+#define ADC_TEMPERATURE_PIN 0xfe
+DECL_ENUMERATION("pin", "ADC_TEMPERATURE", ADC_TEMPERATURE_PIN);
+#define ADC_CTL1_TSVEN1 BIT(23)
+
 enum adc_state {
     ADC_IDLE,
     ADC_ACTIVE,
@@ -32,6 +37,8 @@ pin_to_channel(uint32_t pin)
         return 11;
     if (pin == GPIO('C', 3))
         return 1;
+    if (pin == ADC_TEMPERATURE_PIN)
+        return 18;
     shutdown("Not a valid ADC pin");
     return 0;
 }
@@ -61,7 +68,9 @@ gpio_adc_setup(uint32_t pin)
 {
     uint32_t channel = pin_to_channel(pin);
     adc_init();
-    if (pin != GPIO('C', 3))
+    if (pin == ADC_TEMPERATURE_PIN)
+        ADC_CTL1(ADC2) |= ADC_CTL1_TSVEN1;
+    else if (pin != GPIO('C', 3))
         gpio_peripheral(pin, GPIO_ANALOG, 0);
 
     irqstatus_t flag = irq_save();

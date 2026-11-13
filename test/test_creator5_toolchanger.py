@@ -1160,6 +1160,89 @@ class Creator5OffsetTests(unittest.TestCase):
         data, _ = self.board._read_stock_json(zpath)
         self.assertAlmostEqual(data['z_offset_t2'], 0.03)
 
+    def test_babystep_saved_after_a_restart_with_the_tool_on(self):
+        # After a restart this module hasn't set the offset (_applied_z is
+        # None); the Z_ADJUST step is still added to zoffset.json
+        zpath = self._babystep_fixture(2.83)
+        self.board._applied_z = None
+        self.board.busy = False
+        self.board.attached_tool_from_pins = lambda: 1
+        self.board.prev_set_gcode_offset = mock.Mock()
+        self.board.cmd_set_gcode_offset(GCmd(Z_ADJUST=-0.02))
+        data, _ = self.board._read_stock_json(zpath)
+        self.assertAlmostEqual(data['z_offset_t2'], 0.03)
+
+    def test_babystep_is_not_counted_again_at_dock_or_save(self):
+        zpath = self._babystep_fixture(2.83)
+        self.board.busy = False
+        self.board.attached_tool_from_pins = lambda: 1
+        self.board.prev_set_gcode_offset = mock.Mock()
+        self.board.cmd_set_gcode_offset(GCmd(Z_ADJUST=-0.02))
+        self.board.cmd_save_babystep(GCmd())
+        data, _ = self.board._read_stock_json(zpath)
+        self.assertAlmostEqual(data['z_offset_t2'], 0.03)
+
+    def test_babystep_keeps_a_value_written_by_something_else(self):
+        zpath = self._babystep_fixture(2.83)
+        self.board.busy = False
+        self.board.attached_tool_from_pins = lambda: 1
+        self.board.prev_set_gcode_offset = mock.Mock()
+        # the touchscreen (or a hand edit) set T1 to 0.10 meanwhile
+        with open(zpath, 'w') as target:
+            target.write('{"z_offset_t2": 0.10}\n/* stock comment */\n')
+        self.board.cmd_set_gcode_offset(GCmd(Z_ADJUST=-0.02))
+        data, _ = self.board._read_stock_json(zpath)
+        self.assertAlmostEqual(data['z_offset_t2'], 0.08)
+
+    def test_pickup_applies_what_zoffset_json_says_now(self):
+        zpath = self._babystep_fixture(2.85)
+        self.board.measurements[1] = [0., 0., 1.3]
+        self.board.station_z = -1.5
+        with open(zpath, 'w') as target:
+            target.write('{"z_offset_t2": 0.20}\n')
+        self.board._run.reset_mock()
+        self.board._apply_offsets(1)
+        cmd = self.board._run.call_args[0][0]
+        self.assertTrue(cmd.endswith('Z=3.0000 MOVE=0'), cmd)
+
+    def test_unreadable_zoffset_json_keeps_the_last_values(self):
+        zpath = self._babystep_fixture(2.85)
+        self.board.z_adjustments = [0., 0.05, 0., 0.]
+        with open(zpath, 'w') as target:
+            target.write('{"z_offset_t2": "nan"}\n')
+        gcmd = GCmd()
+        self.board._reload_z_adjustments(gcmd)
+        self.assertEqual(self.board.z_adjustments[1], 0.05)
+        self.assertIn('last saved Z adjustments', gcmd.messages[0])
+
+    def test_babystep_is_per_nozzle(self):
+        zpath = self._babystep_fixture(2.83)
+        with open(zpath, 'w') as target:
+            target.write('{"z_offset_t1": 0.01, "z_offset_t2": 0.05, '
+                         '"z_offset_t3": -0.02, "z_offset_t4": 0.04}\n')
+        self.board.busy = False
+        self.board.prev_set_gcode_offset = mock.Mock()
+        # T1 attached: only T1's value (z_offset_t2) changes
+        self.board.attached_tool_from_pins = lambda: 1
+        self.board.cmd_set_gcode_offset(GCmd(Z_ADJUST=-0.02))
+        data, _ = self.board._read_stock_json(zpath)
+        self.assertEqual([round(data['z_offset_t%d' % n], 4) for n in range(1, 5)],
+                         [0.01, 0.03, -0.02, 0.04])
+        # then T3 attached: only T3's value (z_offset_t4) changes
+        self.board.attached_tool_from_pins = lambda: 3
+        self.board.cmd_set_gcode_offset(GCmd(Z_ADJUST=0.01))
+        data, _ = self.board._read_stock_json(zpath)
+        self.assertEqual([round(data['z_offset_t%d' % n], 4) for n in range(1, 5)],
+                         [0.01, 0.03, -0.02, 0.05])
+        # and each pickup applies its own nozzle's value
+        self.board.measurements = [[0., 0., 1.3] for _ in range(4)]
+        self.board.station_z = -1.5
+        for tool, expected in ((0, 2.81), (1, 2.83), (2, 2.78), (3, 2.85)):
+            self.board._run.reset_mock()
+            self.board._apply_offsets(tool)
+            self.assertTrue(self.board._run.call_args[0][0].endswith(
+                'Z=%.4f MOVE=0' % expected), (tool, self.board._run.call_args))
+
     def test_babystep_list_and_clear(self):
         zpath = self._babystep_fixture(2.85)          # T1 attached at 2.85
         self.board.busy = False
@@ -1322,6 +1405,54 @@ class Creator5OffsetTests(unittest.TestCase):
             'AFC_SELECT_TOOL TOOL=extruder1'])
         self.assertEqual(steps[4:6], [('z', 1), ('xy', 1, 1.9)])
         self.assertIsNone(self.board._stock_pin_approach_z)
+
+    def single_offset_setup(self):
+        self.board.scan_height = None
+        self.board._preflight = mock.Mock(side_effect=[
+            ([], [], 1), ([], [], 1)])
+        self.board._dock_for_offset_reference = lambda gcmd, attached: None
+        self.board._dock = lambda gcmd, tool: None
+        self.board._calibrate_offset_reference = (
+            lambda gcmd, levelboard=True: None)
+        self.board._run = mock.Mock()
+        self.board._with_motion = lambda gcmd, operation: operation()
+        self.board._calibrate_tool_z = lambda gcmd, tool: 1.3
+        self.board._calibrate_tool_xy = lambda gcmd, tool, height: None
+        self.board._apply_offsets = lambda tool: None
+        self.board._lift_after_offset_calibration = lambda gcmd: None
+        self.board.printer.lookup_object.side_effect = None
+        self.board.printer.lookup_object.return_value = mock.Mock(
+            get_status=mock.Mock(return_value={
+                'homing_origin': (.1, .2, .3, 0.), 'state': 'standby'}))
+        self.board.configfile = mock.Mock()
+        self.board.cmd_save_offsets_json = mock.Mock()
+
+    def test_single_offset_save_writes_json_not_save_config(self):
+        # printer.creator5.cfg sets t0..t3_measure_*, so staging them for
+        # SAVE_CONFIG would make every SAVE_CONFIG fail
+        self.single_offset_setup()
+        self.board.cmd_offset_calibrate(GCmd(
+            BUILDPLATE_REMOVED=1, T=1, Z=1, SAVE=1))
+        self.board.cmd_save_offsets_json.assert_called_once()
+        self.board.configfile.set.assert_not_called()
+
+    def test_single_offset_without_save_writes_nothing(self):
+        self.single_offset_setup()
+        self.board.cmd_offset_calibrate(GCmd(
+            BUILDPLATE_REMOVED=1, T=1, Z=1, SAVE=0))
+        self.board.cmd_save_offsets_json.assert_not_called()
+        self.board.configfile.set.assert_not_called()
+
+    def test_reference_save_writes_json_not_save_config(self):
+        self.board.configfile = mock.Mock()
+        self.board.cmd_save_offsets_json = mock.Mock()
+        self.board._calibration_transaction = mock.MagicMock()
+        self.board._with_motion = mock.Mock()
+        self.board._preflight = mock.Mock(return_value=([], [], None))
+        self.board.reference_scan_height = None
+        self.board.cmd_reference_calibrate(GCmd(SAVE=1, BUILDPLATE_REMOVED=1))
+        self.board.cmd_save_offsets_json.assert_called_once()
+        self.board.configfile.set.assert_not_called()
 
     def test_single_offset_plate_check_failure_prevents_pickup_and_fixture(self):
         self.board.scan_height = None
@@ -2051,6 +2182,33 @@ class Creator5OffsetTests(unittest.TestCase):
         self.assertEqual(gcmd.messages,
                          ['attached=T1 dock=1011 grab=0100'])
         self.assertEqual(self.board.active, 1)
+
+    def _plate_step(self, homed, z):
+        toolhead = self.board.printer.lookup_object.return_value
+        toolhead.get_status.return_value = {'homed_axes': homed}
+        toolhead.get_position.return_value = [150., 150., z, 0.]
+        self.board.plate_removal_z = 60.
+        self.board.lower_bed_speed = 10.
+        self.board.gcode = mock.Mock()
+        self.board._move = mock.Mock()
+        self.board._offset_wizard_step(GCmd(), 'plate', 'ALL')
+        prompt = ' '.join(c.args[0] for c in self.board.gcode.respond_raw.call_args_list)
+        return self.board._move, prompt
+
+    def test_offset_wizard_lowers_bed_before_plate_removal(self):
+        move, prompt = self._plate_step('xyz', 10.)
+        move.assert_called_once_with(z=60., feed=600.)
+        self.assertIn('Remove the build plate', prompt)
+
+    def test_offset_wizard_leaves_a_low_bed_and_unhomed_z_alone(self):
+        move, prompt = self._plate_step('xyz', 120.)
+        move.assert_not_called()
+        self.assertIn('Remove the build plate', prompt)
+        self.board.printer.lookup_object.return_value.get_status.return_value = {
+            'homed_axes': 'xy'}
+        self.board._move = mock.Mock()
+        self.board._offset_wizard_step(GCmd(), 'plate', '2')
+        self.board._move.assert_not_called()
 
 
 if __name__ == '__main__':

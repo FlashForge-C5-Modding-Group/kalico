@@ -190,6 +190,10 @@ class Creator5Toolchanger:
         # Where C5_LOWER_BED stops: 5 mm above the bottom of Z travel (256).
         self.lower_bed_z = config.getfloat('lower_bed_z', 254., above=0.,
                                            maxval=256.)
+        # Where the offset wizard lowers the bed before asking for the build
+        # plate to be removed, so it slides out under the nozzle.
+        self.plate_removal_z = config.getfloat('plate_removal_z', 60., above=0.,
+                                               maxval=256.)
         self.dock_approach_speed = config.getfloat(
             'dock_approach_speed', 20., above=0.)
         self.dock_predock_offset = config.getfloat(
@@ -677,16 +681,49 @@ class Creator5Toolchanger:
     def cmd_set_gcode_offset(self, gcmd):
         self.prev_set_gcode_offset(gcmd)
         if (not self.persist_babystep or self.busy
-                or self._applied_z is None
                 or gcmd.get('Z_ADJUST', None) is None):
             return
         try:
             tool = self.attached_tool_from_pins()
             if tool is not None:
-                self._persist_babystep(gcmd, tool, backup=False)
+                self._save_babystep_step(gcmd, tool,
+                                         gcmd.get_float('Z_ADJUST'))
         except Exception as exc:
             # Never stop a print over the saved copy
             gcmd.respond_info('Baby stepping not saved: %s' % exc)
+
+    def _save_babystep_step(self, gcmd, tool, step):
+        """Add a baby step (SET_GCODE_OFFSET Z_ADJUST) to TOOL's zoffset.json
+        adjustment: the step itself, so it's kept whatever set the offset
+        before it (after a restart with the tool on, for one). The file is
+        read first, so a value written by something else isn't lost."""
+        if not math.isfinite(step) or abs(step) < 0.0005:
+            return
+        if abs(step) > 1.:
+            gcmd.respond_info('T%d Z_ADJUST %.4f mm is too big for baby '
+                              'stepping; not saved' % (tool, step))
+            return
+        self._reload_z_adjustments(gcmd)
+        self._write_z_adjustment(gcmd, tool, self.z_adjustments[tool] + step,
+                                 backup=False)
+        # Counted now: docking or C5_SAVE_BABYSTEP mustn't add it again
+        origin = self.printer.lookup_object('gcode_move').get_status()[
+            'homing_origin'][2]
+        self._applied_z = (tool, origin)
+        gcmd.respond_info('Saved T%d baby stepping %+.4f mm (Z adjustment now '
+                          '%.4f mm)' % (tool, step, self.z_adjustments[tool]))
+
+    def _reload_z_adjustments(self, gcmd=None):
+        """zoffset.json again, so the saved adjustments are what's applied.
+        If it can't be read, the last good values stay (never stop a print
+        over it) and it says so."""
+        try:
+            self._load_zoffset_json()
+        except Exception as exc:
+            logging.warning('creator5_toolchanger: %s', exc)
+            if gcmd is not None:
+                gcmd.respond_info('%s; using the last saved Z adjustments'
+                                  % exc)
 
     def cmd_save_babystep(self, gcmd):
         """Keep the attached tool's baby stepping for later prints."""
@@ -789,6 +826,7 @@ class Creator5Toolchanger:
         correction = self.print_z_corrections[tool]
         if correction is None or not self._printing():
             return
+        self._reload_z_adjustments()
         baseline = self.measurements[tool][2] - self.station_z + correction
         offset = baseline + self.z_adjustments[tool]
         if not math.isfinite(offset) or not 0.5 <= offset <= 5.:
@@ -1910,6 +1948,7 @@ class Creator5Toolchanger:
         return z
 
     def _apply_offsets(self, tool):
+        self._reload_z_adjustments()
         self.print_z_baseline[tool] = None
         offsets = [self.measurements[tool][axis]
                    - self.measurements[0][axis] for axis in range(2)]
@@ -1952,12 +1991,10 @@ class Creator5Toolchanger:
         with self._calibration_transaction():
             self._with_motion(gcmd, calibrate)
         if gcmd.get_int('SAVE', 0, minval=0, maxval=1):
-            self.configfile.set(self.section, 'station_x',
-                                '%.4f' % self.station_x)
-            self.configfile.set(self.section, 'station_y',
-                                '%.4f' % self.station_y)
-            self.configfile.set(self.section, 'station_z',
-                                '%.4f' % self.station_z)
+            # extruder.json is what's loaded at startup. Staging these for
+            # SAVE_CONFIG too would clash with printer.creator5.cfg, which
+            # sets them, and make every SAVE_CONFIG fail
+            self.cmd_save_offsets_json(gcmd)
 
     def _dock_for_offset_reference(self, gcmd, attached):
         if attached is None:
@@ -2081,11 +2118,11 @@ class Creator5Toolchanger:
             finally:
                 if single:
                     self._stock_pin_approach_z = None
-        if gcmd.get_int('SAVE', 0, minval=0, maxval=1):
-            axes = 'xyz' if include_z else 'xy'
-            for axis, value in zip(axes, self.measurements[tool]):
-                self.configfile.set(self.section, 't%d_measure_%s' % (tool, axis),
-                                    '%.4f' % value)
+        if gcmd.get_int('SAVE', 0, minval=0, maxval=1) and single:
+            # As for all four tools: extruder.json is the saved set, loaded at
+            # startup. Staging t%d_measure_* for SAVE_CONFIG would clash with
+            # printer.creator5.cfg, which sets them, and fail every SAVE_CONFIG
+            self.cmd_save_offsets_json(gcmd)
         if single:
             self._dock(gcmd, tool)
 
@@ -2351,6 +2388,13 @@ class Creator5Toolchanger:
             label = 'all tools' if tool == 'ALL' else 'T' + tool
             nxt = ('STEP=run TOOL=ALL LEVELBOARD=1' if tool == 'ALL'
                    else 'STEP=probe TOOL=%s' % tool)
+            # Room to take the plate out: homing leaves the nozzle just above it
+            toolhead = self.printer.lookup_object('toolhead')
+            if ('z' in homed
+                    and toolhead.get_position()[2] < self.plate_removal_z - .001):
+                self._move(z=self.plate_removal_z,
+                           feed=self.lower_bed_speed * 60.)
+                toolhead.wait_moves()
             self._prompt('Remove the build plate',
                          ['Calibrating %s. Remove the build plate now, then '
                           'confirm. The probe checks that it is really gone '
@@ -2372,10 +2416,10 @@ class Creator5Toolchanger:
             if tool == 'ALL':
                 self._run('C5_CALIBRATE_ALL_OFFSETS SAVE=1 BUILDPLATE_REMOVED=1')
             else:
+                # SAVE=1 writes extruder.json itself
                 self._run('C5_TOOL_OFFSET_CALIBRATE T=%s Z=1 SAVE=1 '
                           'LEVELBOARD=%d BUILDPLATE_REMOVED=1'
                           % (tool, levelboard))
-                self._run('C5_SAVE_OFFSETS_JSON')
             return
         raise gcmd.error('Unknown STEP %s' % step)
 
