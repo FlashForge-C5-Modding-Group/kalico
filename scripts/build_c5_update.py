@@ -2839,6 +2839,8 @@ def package_update(template, firmware_inputs, output,
     manifest_data = (json.dumps(manifest, sort_keys=True, indent=2) +
                      "\n").encode("utf-8")
     _publish_outputs(output, ciphertext, manifest_data)
+    _write_text_output(Path(str(output) + ".sha256"), "%s  %s\n" % (
+        manifest["output"]["ciphertext_sha256"], Path(output).name))
     return {
         "stage": "package", "package": output.name,
         "manifest": output.name + ".manifest.json",
@@ -2850,6 +2852,41 @@ def package_update(template, firmware_inputs, output,
         } for board in firmware_inputs},
         "validation": manifest["validation"],
     }
+
+
+def _write_text_output(path, text):
+    path = Path(path)
+    if path.exists():
+        raise ToolError("%s already exists" % path.name)
+    path.write_bytes(text.encode("utf-8"))
+
+
+def write_live_update(firmware_inputs, live_dir):
+    # The loose images for OpenCreator's live MCU updates (opencreator-fs
+    # mcu-firmware/): each board's .hex exactly as built and packaged, its
+    # SHA256SUMS, and VERSION, the mcu_version the boards will report.
+    live_dir = Path(live_dir)
+    live_dir.mkdir()
+    versions = set()
+    sums = []
+    for board in sorted(firmware_inputs):
+        products = firmware_inputs[board]
+        target = live_dir / products["firmware"].name
+        shutil.copyfile(products["firmware"], target)
+        sums.append("%s  %s\n" % (
+            hashlib.sha256(target.read_bytes()).hexdigest(), target.name))
+        with open(products["dictionary"], "rb") as handle:
+            versions.add(json.loads(handle.read().decode("utf-8"))
+                         .get("version", ""))
+    if len(versions) != 1 or not next(iter(versions)):
+        raise ToolError("boards report different versions: %s"
+                        % ", ".join(sorted(versions)))
+    version = versions.pop()
+    _write_text_output(live_dir / "SHA256SUMS", "".join(sums))
+    _write_text_output(live_dir / "VERSION", version + "\n")
+    return {"dir": str(live_dir), "version": version,
+            "files": sorted(firmware_inputs[b]["firmware"].name
+                            for b in firmware_inputs)}
 
 
 def run_all_stages(boards, templates, output_dir, outputs, jobs=1,
@@ -2887,9 +2924,11 @@ def run_all_stages(boards, templates, output_dir, outputs, jobs=1,
         package_update(template, firmware_inputs, output,
                        cross_prefix, openssl)
         for template, output in zip(templates, outputs)]
+    live = write_live_update(firmware_inputs, root / "live")
     return {"stage": "all", "builds": build_reports,
             "package": (package_reports if len(package_reports) > 1
-                        else package_reports[0])}
+                        else package_reports[0]),
+            "live": live}
 
 
 def _add_global(parser):
