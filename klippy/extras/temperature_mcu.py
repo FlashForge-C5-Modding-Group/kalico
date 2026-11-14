@@ -111,6 +111,7 @@ class PrinterTemperatureMCU:
             ("gd32f303xe", self.config_gd32f303xe),
             ("gd32f303xb", self.config_gd32f303xb),
             ("gd32h7", self.config_gd32h7),
+            ("n32g45", self.config_n32g45x),
             ("", self.config_unknown),
         ]
         for name, func in cfg_funcs:
@@ -227,6 +228,12 @@ class PrinterTemperatureMCU:
         self.slope = self.reference_voltage / -0.004300
         self.base_temperature = self.calc_base(
             25.0, 1.43 / self.reference_voltage
+        )
+
+    def config_n32g45x(self):
+        self.slope = self.reference_voltage / -0.004100
+        self.base_temperature = self.calc_base(
+            25.0, 1.32 / self.reference_voltage
         )
 
     def config_stm32f2(self):
