@@ -1814,6 +1814,19 @@ class afcACE(afcUnit):
                             "default_color": getattr(self.afc, "default_color", None),
                         })
 
+                # Saved state can say the lane is in the tool while its extruder
+                # says empty; neither branch below runs then, leaving the lane
+                # half loaded. Trust the toolhead sensor to settle it.
+                ext = cur_lane.extruder_obj
+                if (cur_lane.tool_loaded
+                    and ext is not None
+                    and ext.lane_loaded != cur_lane.name):
+                    if (ext.lane_loaded is None
+                        and getattr(ext, "tool_start_state", False)):
+                        ext.lane_loaded = cur_lane.name
+                    else:
+                        cur_lane.tool_loaded = False
+
                 # Assume filament staged at hub on startup
                 if (not cur_lane.tool_loaded
                     and not cur_lane.loaded_to_hub):
