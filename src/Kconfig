@@ -30,6 +30,8 @@ choice
         bool "Allwinner A64 AR100"
     config MACH_LINUX
         bool "Linux process"
+    config MACH_X2600RV
+        bool "Ingenic X2600 RISC-V core"
     config MACH_SIMU
         bool "Host simulator"
 endchoice
@@ -44,6 +46,7 @@ source "src/rp2040/Kconfig"
 source "src/pru/Kconfig"
 source "src/ar100/Kconfig"
 source "src/linux/Kconfig"
+source "src/x2600rv/Kconfig"
 source "src/simulator/Kconfig"
 
 # Generic configuration options for serial ports

@@ -1,0 +1,17 @@
+# Kconfig settings for the Ingenic X2600 RISC-V core
+
+if MACH_X2600RV
+
+config X2600RV_SELECT
+    bool
+    default y
+
+config BOARD_DIRECTORY
+    string
+    default "x2600rv"
+
+config CLOCK_FREQ
+    int
+    default 576000000
+
+endif
