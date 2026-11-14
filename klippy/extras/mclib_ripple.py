@@ -13,7 +13,13 @@ from . import mclib as mclib_mod
 MOTOR_PATH = {'stepper_x': (1., 1.), 'stepper_y': (1., -1.)}
 MAX_HZ = 700.
 MIN_MOTOR_SPEED, MAX_MOTOR_SPEED = 5., 150.
-MAX_AMP = 0.3
+# Good corrections on the Creator 5 stay under 0.05 A; anything larger is a
+# bad fit, and too much current at a high harmonic grinds the motor
+MAX_AMP = 0.06
+# A probe must change the vibration by this share to trust the fit, and a
+# point is only kept if it takes off this share of the vibration power
+MIN_PROBE_EFFECT = 0.1
+MIN_GAIN = 0.36  # power, so 20% less vibration
 
 
 class MCLibRipple:
@@ -26,8 +32,12 @@ class MCLibRipple:
         # Motor speeds (mm/s of motor travel) each harmonic is calibrated
         # at; the correction is interpolated between them
         self.speeds = config.getfloatlist('speeds', (8., 15., 30., 60., 120.))
-        self.probe = config.getfloat('probe', 0.03, above=0., maxval=MAX_AMP)
+        self.probe = config.getfloat('probe', 0.015, above=0., maxval=MAX_AMP)
         self.cruise_time = config.getfloat('cruise_time', .5, above=.1)
+        # Board fans held at one speed while measuring, so their vibration
+        # doesn't change under the measurement (as for input shaper and VFA)
+        self.fan_hold = config.getfloat('fan_hold', .5, minval=0., maxval=1.)
+        self.fan_settle = config.getfloat('fan_settle', 3., minval=0.)
         self.gcode.register_command('MCLIB_RIPPLE_CALIBRATE',
                                     self.cmd_CALIBRATE,
                                     desc=self.cmd_CALIBRATE_help)
@@ -54,6 +64,25 @@ class MCLibRipple:
     def _forward_is_positive(self, mclib):
         # Motor forward (mclib dir 1) is the dir pin high
         return not mclib.stepper.get_dir_inverted()[0]
+
+    # Board fans
+    def _hold_fans(self):
+        """Hold the board fans for a measurement; returns the hold to put
+        back afterwards (an outer _FANS_HOLD is kept)."""
+        fans = self.printer.lookup_object('c5_board_fans', None)
+        if fans is None:
+            return None
+        previous = fans.hold
+        if previous != self.fan_hold:
+            fans.hold = self.fan_hold
+            # Let them reach the held speed before measuring
+            self.printer.lookup_object('toolhead').dwell(self.fan_settle)
+        return (fans, previous)
+
+    @staticmethod
+    def _release_fans(held):
+        if held is not None:
+            held[0].hold = held[1]
 
     # Measurement
     def _move(self, x, y, speed):
@@ -146,7 +175,8 @@ class MCLibRipple:
             for d in (0, 1):
                 P0, P1, P2, P3 = p0[d], pp[0][d], pp[1][d], pp[2][d]
                 g = (P1 + P3 - 2. * P0) / (2. * delta * delta)
-                if g <= 0.:
+                if g * delta * delta < MIN_PROBE_EFFECT * P0:
+                    # The probes barely moved it: noise, not a fit
                     new_c[d] = c[d]
                     continue
                 w = complex((P1 - P3) / (4. * delta),
@@ -161,27 +191,38 @@ class MCLibRipple:
                     best[d] = p_new[d]
                     c[d] = new_c[d]
             delta *= .5
-        return c, start, best
+        ok = {d: best[d] <= (1. - MIN_GAIN) * start[d] for d in (0, 1)}
+        for d in (0, 1):
+            if not ok[d]:
+                c[d] = 0j
+        return c, start, best, ok
 
     def _calibrate_harmonic(self, gcmd, name, mclib, k, rounds, speeds):
         cpm = self._cycles_per_mm(mclib)
         c = {0: 0j, 1: 0j}
         points = []
+        kept = 0
         for v in speeds:
             freq = k * cpm * v
             if freq < 20. or freq > MAX_HZ:
                 continue
-            c, before, after = self._calibrate_point(name, mclib, k, v, c,
-                                                     rounds)
+            c, before, after, ok = self._calibrate_point(name, mclib, k, v,
+                                                         c, rounds)
             points.append((cpm * v, abs(c[1]), cmath.phase(c[1]),
                            abs(c[0]), cmath.phase(c[0])))
+            kept += ok[0] + ok[1]
+
+            def result(d):
+                return ("%.0f -> %.0f" % (math.sqrt(before[d]),
+                                          math.sqrt(after[d]))
+                        if ok[d] else "%.0f, no gain, left off"
+                        % (math.sqrt(before[d]),))
             gcmd.respond_info(
-                "%s harmonic %d at %.0f Hz (%.0f mm/s motor): forward %.0f -> "
-                "%.0f, reverse %.0f -> %.0f mm/s^2"
-                % (name, k, freq, v, math.sqrt(before[1]),
-                   math.sqrt(after[1]), math.sqrt(before[0]),
-                   math.sqrt(after[0])))
-        mclib.set_ripple_table(k, points)
+                "%s harmonic %d at %.0f Hz (%.0f mm/s motor): forward %s, "
+                "reverse %s mm/s^2" % (name, k, freq, v, result(1),
+                                       result(0)))
+        mclib.set_ripple_table(k, points if kept else [])
+        return kept
 
     cmd_CALIBRATE_help = ("Calibrate torque ripple correction for an X/Y "
                           "motor with the accelerometer (STEPPER, "
@@ -206,18 +247,30 @@ class MCLibRipple:
                 self.printer.get_reactor().monotonic())['homed_axes']:
             raise gcmd.error("Home X and Y first")
         saved = toolhead.get_max_velocity()
-        # Stock VFA damping is off for every harmonic being calibrated, as
-        # it is once that harmonic has a ripple table
-        for tdx in (1, 2, 4):
-            if tdx in harmonics:
-                mclib.set_resonance_damp_cmd.send([mclib.oid, tdx, 0, 0, 0])
+        previous = mclib.get_ripple()
+
+        def restore():
+            for k in harmonics:
+                mclib.set_ripple_table(k, previous.get(k, []))
+        fans = self._hold_fans()
+        kept = 0
         try:
             for k in harmonics:
-                self._calibrate_harmonic(gcmd, name, mclib, k, rounds,
-                                         speeds)
+                kept += self._calibrate_harmonic(gcmd, name, mclib, k, rounds,
+                                                 speeds)
+        except Exception:
+            restore()
+            raise
         finally:
+            self._release_fans(fans)
             self.gcode.run_script_from_command(
                 "SET_VELOCITY_LIMIT ACCEL=%.1f" % (saved[1],))
+        if not kept:
+            restore()
+            raise gcmd.error(
+                "%s ripple calibration didn't reduce the vibration anywhere; "
+                "kept the previous correction and saved nothing (check the "
+                "accelerometer and that the board fans are held)" % (name,))
         if gcmd.get_int('SAVE', 1):
             configfile = self.printer.lookup_object('configfile')
             for k in harmonics:
@@ -239,9 +292,11 @@ class MCLibRipple:
         cpm = self._cycles_per_mm(mclib)
         ks = [k for k in range(1, 9) if k * cpm * motor_speed <= MAX_HZ]
         freqs = [k * cpm * motor_speed for k in ks]
+        fans = self._hold_fans()
         try:
             p = self._measure(name, mclib, motor_speed, freqs)
         finally:
+            self._release_fans(fans)
             self.gcode.run_script_from_command(
                 "SET_VELOCITY_LIMIT ACCEL=%.1f" % (saved[1],))
         for d in (1, 0):

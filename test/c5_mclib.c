@@ -910,19 +910,31 @@ test_ripple_correction(void)
     expect_float_close("no correction while holding", m.reference_d,
                        0.0f, 1e-9f);
 
-    // One point holds below its frequency
     uint32_t now = step_many(&m, 0, period, 3);
     c5_mclib_next_step(&m, now + period, C5_NEXT_AT);
     c5_mclib_update(&m, now, 0.0f, 0.0f, &out);
-    // past the only point (50 Hz), fading out to nothing at 75 Hz
+    // A single point applies at every speed (calibration probes use it)
+    expect_float_close("one point applies at any speed", m.reference_d,
+                       -0.05f * sinf(4.0f * m.command_angle), 2e-4f);
+    // Past a table's last point (40, 50 Hz): faded out by 55 Hz
+    c5_mclib_ripple(&m, 4, 1, 0, 2, 40000, 50, 0);
+    c5_mclib_ripple(&m, 4, 1, 1, 2, 50000, 50, 0);
+    c5_mclib_update(&m, now + 1, 0.0f, 0.0f, &out);
     expect_float_close("faded out past the last point", m.reference_d,
                        0.0f, 1e-9f);
+    // Below a table's first point (100, 200 Hz): 78.125 Hz fades to 56.25%
+    c5_mclib_ripple(&m, 4, 1, 0, 2, 100000, 50, 0);
+    c5_mclib_ripple(&m, 4, 1, 1, 2, 200000, 50, 0);
+    c5_mclib_update(&m, now + 1, 0.0f, 0.0f, &out);
+    expect_float_close("fading below the first point", m.reference_d,
+                       -0.05f * 0.5625f * sinf(4.0f * m.command_angle),
+                       2e-4f);
 
     // Two points: 60 Hz 50 mA at 0, 100 Hz 50 mA at pi/2; 78.125 Hz is
     // 45% of the way, so sin part 27.5 mA and cos part 22.5 mA
     c5_mclib_ripple(&m, 4, 1, 0, 2, 60000, 50, 0);
     c5_mclib_ripple(&m, 4, 1, 1, 2, 100000, 50, 1571);
-    c5_mclib_update(&m, now + 1, 0.0f, 0.0f, &out);
+    c5_mclib_update(&m, now + 2, 0.0f, 0.0f, &out);
     float x = 4.0f * m.command_angle;
     float expected = -(0.0275f * sinf(x) + 0.0225f * cosf(x));
     expect_float_close("interpolated correction", m.reference_d,
@@ -930,7 +942,7 @@ test_ripple_correction(void)
 
     // Reverse has its own (empty) table
     c5_mclib_direction(&m, 0);
-    c5_mclib_update(&m, now + 2, 0.0f, 0.0f, &out);
+    c5_mclib_update(&m, now + 3, 0.0f, 0.0f, &out);
     expect_float_close("reverse table empty", m.reference_d, 0.0f, 1e-9f);
 
     c5_mclib_ripple(&m, 4, 1, 0, 0, 0, 0, 0);
@@ -938,6 +950,38 @@ test_ripple_correction(void)
     c5_mclib_ripple(&m, 9, 1, 0, 1, 50000, 50, 0);
     c5_mclib_ripple(&m, 4, 1, 3, 2, 50000, 50, 0);
     CHECK(!m.ripple_active, "bad harmonic or index is ignored");
+}
+
+static void
+test_ripple_replaces_stock_damping(void)
+{
+    struct c5_mclib_motor m;
+    struct c5_mclib_output out;
+    const uint32_t period = 20000; // 78.125 Hz electrical
+
+    setup_xy(&m, 0, 1000, 1000);
+    c5_mclib_direction(&m, 1);
+    c5_mclib_enable(&m, 0);
+    c5_mclib_resonance(&m, 4, 40, 0, 0);
+    uint32_t now = step_many(&m, 0, period, 3);
+    c5_mclib_next_step(&m, now + period, C5_NEXT_AT);
+    c5_mclib_update(&m, now, 0.0f, 0.0f, &out);
+    float stock = m.reference_d;
+    CHECK(fabsf(stock) > 1e-4f, "stock damping applies without a table");
+
+    // A zero-amplitude table covering this speed takes harmonic 4 over
+    c5_mclib_ripple(&m, 4, 1, 0, 2, 50000, 0, 0);
+    c5_mclib_ripple(&m, 4, 1, 1, 2, 100000, 0, 0);
+    c5_mclib_update(&m, now + 1, 0.0f, 0.0f, &out);
+    expect_float_close("table covering the speed replaces stock",
+                       m.reference_d, 0.0f, 1e-9f);
+
+    // Well above the table, stock is back
+    c5_mclib_ripple(&m, 4, 1, 0, 2, 10000, 0, 0);
+    c5_mclib_ripple(&m, 4, 1, 1, 2, 20000, 0, 0);
+    c5_mclib_update(&m, now + 2, 0.0f, 0.0f, &out);
+    CHECK(fabsf(m.reference_d) > 1e-4f,
+          "stock damping returns above the table");
 }
 
 static void
@@ -998,6 +1042,7 @@ main(void)
     test_zero_period_steps();
     test_next_step_interpolation();
     test_ripple_correction();
+    test_ripple_replaces_stock_damping();
     test_stock_boot_microstep_defaults();
     test_nonfinite_control_faults();
     return failures ? 1 : 0;
