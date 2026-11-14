@@ -19,6 +19,7 @@
 DECL_CONSTANT("ADC_MAX", 4095);
 
 #define ADC_TEMPERATURE_PIN 0xfe
+#define ADC_TEMPERATURE_CHAN 16 // ADC1
 DECL_ENUMERATION("pin", "ADC_TEMPERATURE", ADC_TEMPERATURE_PIN);
 
 static const uint8_t adc_pins[] = {
@@ -130,7 +131,6 @@ gpio_adc_setup(uint32_t pin)
     adc_calibrate(adc);
 
     if (pin == ADC_TEMPERATURE_PIN) {
-        NS_ADC1->CTRL2 |= CTRL2_TSVREFE_SET;
         VREF1P2_CTRL |= (1<<10);
     } else {
         gpio_peripheral(pin, GPIO_ANALOG, 0);
@@ -155,8 +155,15 @@ gpio_adc_sample(struct gpio_adc g)
         return 0;
     }
     // ADC timing: clock=4Mhz, Tconv=12.5, Tsamp=41.5, total=13.500us
-    ADC_ConfigRegularChannel(adc, g.chan, 1, ADC_SAMP_TIME_41CYCLES5);
-    adc->CTRL2 |= CTRL2_AD_ON_SET;
+    // Temperature: 239.5 cycle sample; enabled here as ADC1 setups clear it
+    uint32_t ctrl2 = CTRL2_AD_ON_SET;
+    uint8_t samp = ADC_SAMP_TIME_41CYCLES5;
+    if (adc == NS_ADC1 && g.chan == ADC_TEMPERATURE_CHAN) {
+        ctrl2 |= CTRL2_TSVREFE_SET;
+        samp = ADC_SAMP_TIME_239CYCLES5;
+    }
+    ADC_ConfigRegularChannel(adc, g.chan, 1, samp);
+    adc->CTRL2 |= ctrl2;
     adc->CTRL2 |= CTRL2_EXT_TRIG_SWSTART_SET;
 
 need_delay:
