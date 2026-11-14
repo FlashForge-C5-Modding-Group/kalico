@@ -832,6 +832,114 @@ test_zero_period_steps(void)
                   &out, 1, zero_period);
 }
 
+static float
+phase_angle(uint16_t phase)
+{
+    return (float)phase * 0x1.921fb8p-14f;
+}
+
+static void
+test_next_step_interpolation(void)
+{
+    struct c5_mclib_motor m;
+    struct c5_mclib_output out;
+    const uint32_t period = 20000;
+
+    setup_z(&m, 1000, 1000);
+    c5_mclib_direction(&m, 1);
+    c5_mclib_enable(&m, 0);
+    uint32_t now = step_many(&m, 0, period, 4);
+    uint16_t phase = m.phase, inc = m.phase_increment;
+
+    // Slowing down: the next step is two periods away, so halfway through
+    // the last period the angle is a quarter of the way to it.
+    c5_mclib_next_step(&m, now + 2 * period, C5_NEXT_AT);
+    c5_mclib_update(&m, now + period / 2, 0.0f, 0.0f, &out);
+    expect_float_close("slowing step quarter way", m.command_angle,
+                       phase_angle(phase + inc / 4), 1e-6f);
+    c5_mclib_update(&m, now + period, 0.0f, 0.0f, &out);
+    expect_float_close("slowing step halfway", m.command_angle,
+                       phase_angle(phase + inc / 2), 1e-6f);
+
+    // Without the next step's time it assumes the period repeats
+    c5_mclib_next_step(&m, 0, C5_NEXT_UNKNOWN);
+    c5_mclib_update(&m, now + period / 2, 0.0f, 0.0f, &out);
+    expect_float_close("unknown next step halfway", m.command_angle,
+                       phase_angle(phase + inc / 2), 1e-6f);
+
+    // Last queued step: hold on it rather than run past
+    c5_mclib_next_step(&m, 0, C5_NEXT_NONE);
+    c5_mclib_update(&m, now + period, 0.0f, 0.0f, &out);
+    expect_float_close("no next step holds", m.command_angle,
+                       phase_angle(phase), 1e-6f);
+
+    // A step forgets the old next step
+    c5_mclib_step(&m, now + period);
+    expect_u32("step resets next state", m.next_state, C5_NEXT_UNKNOWN);
+
+    // Reversal: the next step goes back, so the angle heads back too
+    now += period;
+    phase = m.phase;
+    c5_mclib_direction(&m, 0);
+    c5_mclib_next_step(&m, now + period, C5_NEXT_AT);
+    c5_mclib_update(&m, now + period / 2, 0.0f, 0.0f, &out);
+    expect_float_close("reversing step halfway", m.command_angle,
+                       phase_angle(phase - inc / 2), 1e-6f);
+
+    // Past the scheduled time it stops just short of the next step
+    c5_mclib_update(&m, now + 3 * period, 0.0f, 0.0f, &out);
+    expect_float_close("late step clamps", m.command_angle,
+                       phase_angle(phase - inc + 1), 1e-6f);
+}
+
+static void
+test_ripple_correction(void)
+{
+    struct c5_mclib_motor m;
+    struct c5_mclib_output out;
+    // exponent 4: 64 steps per electrical cycle, so 20000-tick steps at
+    // 100MHz run the electrical angle at 100e6 / (20000 * 64) = 78.125 Hz
+    const uint32_t period = 20000;
+
+    setup_z(&m, 1000, 1000);
+    c5_mclib_direction(&m, 1);
+    c5_mclib_enable(&m, 0);
+    c5_mclib_ripple(&m, 4, 1, 0, 1, 50000, 50, 0);
+    CHECK(m.ripple_active, "a ripple table turns correction on");
+    c5_mclib_update(&m, 20, 0.0f, 0.0f, &out);
+    expect_float_close("no correction while holding", m.reference_d,
+                       0.0f, 1e-9f);
+
+    // One point holds below its frequency
+    uint32_t now = step_many(&m, 0, period, 3);
+    c5_mclib_next_step(&m, now + period, C5_NEXT_AT);
+    c5_mclib_update(&m, now, 0.0f, 0.0f, &out);
+    // past the only point (50 Hz), fading out to nothing at 75 Hz
+    expect_float_close("faded out past the last point", m.reference_d,
+                       0.0f, 1e-9f);
+
+    // Two points: 60 Hz 50 mA at 0, 100 Hz 50 mA at pi/2; 78.125 Hz is
+    // 45% of the way, so sin part 27.5 mA and cos part 22.5 mA
+    c5_mclib_ripple(&m, 4, 1, 0, 2, 60000, 50, 0);
+    c5_mclib_ripple(&m, 4, 1, 1, 2, 100000, 50, 1571);
+    c5_mclib_update(&m, now + 1, 0.0f, 0.0f, &out);
+    float x = 4.0f * m.command_angle;
+    float expected = -(0.0275f * sinf(x) + 0.0225f * cosf(x));
+    expect_float_close("interpolated correction", m.reference_d,
+                       expected, 3e-4f);
+
+    // Reverse has its own (empty) table
+    c5_mclib_direction(&m, 0);
+    c5_mclib_update(&m, now + 2, 0.0f, 0.0f, &out);
+    expect_float_close("reverse table empty", m.reference_d, 0.0f, 1e-9f);
+
+    c5_mclib_ripple(&m, 4, 1, 0, 0, 0, 0, 0);
+    CHECK(!m.ripple_active, "count 0 clears the table");
+    c5_mclib_ripple(&m, 9, 1, 0, 1, 50000, 50, 0);
+    c5_mclib_ripple(&m, 4, 1, 3, 2, 50000, 50, 0);
+    CHECK(!m.ripple_active, "bad harmonic or index is ignored");
+}
+
 static void
 test_stock_boot_microstep_defaults(void)
 {
@@ -888,6 +996,8 @@ main(void)
     test_retained_fast_history();
     test_pi_saturation_reversal_recovery();
     test_zero_period_steps();
+    test_next_step_interpolation();
+    test_ripple_correction();
     test_stock_boot_microstep_defaults();
     test_nonfinite_control_faults();
     return failures ? 1 : 0;

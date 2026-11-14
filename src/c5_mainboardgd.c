@@ -5,8 +5,10 @@
 // This file may be distributed under the terms of the GNU GPLv3 license.
 
 #include <stdint.h>
+#include "autoconf.h" // CONFIG_CLOCK_FREQ
 #include "basecmd.h" // oid_alloc
 #include "board/irq.h" // irq_save
+#include "board/misc.h" // timer_read_time
 #include "c5_mainboardgd.h" // c5_mainboardgd_init_motors
 #include "command.h" // DECL_COMMAND
 #include "sched.h" // sched_is_shutdown
@@ -54,6 +56,32 @@ c5_mainboardgd_step(uint8_t axis)
 {
     irqstatus_t flag = irq_save();
     c5_mclib_step(get_motor(axis), c5_mainboardgd_motor_time());
+    irq_restore(flag);
+}
+
+#define CLOCKS_PER_MOTOR_TICK (CONFIG_CLOCK_FREQ / C5_MOTOR_TIME_FREQ)
+_Static_assert(CONFIG_CLOCK_FREQ % C5_MOTOR_TIME_FREQ == 0,
+               "mclib motor time must divide the MCU clock");
+
+// The step queue's next step for an axis, in MCU clock ticks
+void
+c5_mainboardgd_set_next_step(uint8_t axis, uint32_t clock, uint8_t due)
+{
+    struct c5_mclib_motor *motor = get_motor(axis);
+    irqstatus_t flag = irq_save();
+    if (!due) {
+        c5_mclib_next_step(motor, 0, C5_NEXT_NONE);
+    } else {
+        int32_t delta = clock - timer_read_time();
+        if (delta < 0)
+            delta = 0;
+        if (delta > CONFIG_CLOCK_FREQ)
+            // Too far ahead to place reliably; guess from the last period
+            c5_mclib_next_step(motor, 0, C5_NEXT_UNKNOWN);
+        else
+            c5_mclib_next_step(motor, c5_mainboardgd_motor_time()
+                               + delta / CLOCKS_PER_MOTOR_TICK, C5_NEXT_AT);
+    }
     irq_restore(flag);
 }
 
@@ -230,3 +258,16 @@ command_mclib_config_slip(uint32_t *args)
     irq_restore(flag);
 }
 DECL_COMMAND(command_mclib_config_slip, "mclib_config_slip oid=%c mode=%c");
+
+void
+command_mclib_set_ripple(uint32_t *args)
+{
+    struct c5_mclib_motor *motor = lookup_motor(args[0]);
+    irqstatus_t flag = irq_save();
+    c5_mclib_ripple(motor, args[1], args[2], args[3], args[4], args[5],
+                    args[6], args[7]);
+    irq_restore(flag);
+}
+DECL_COMMAND(command_mclib_set_ripple,
+             "mclib_set_ripple oid=%c harmonic=%c dir=%c index=%c count=%c"
+             " freq=%u amp=%i phase=%i");

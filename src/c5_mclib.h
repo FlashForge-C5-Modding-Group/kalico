@@ -40,8 +40,11 @@ struct c5_mclib_health {
     uint8_t last_valid, stall_prev;
 };
 
+#define C5_RIPPLE_HARMONICS 8
+#define C5_RIPPLE_POINTS 6
+
 struct c5_mclib_motor {
-    uint32_t last_step, last_period, elapsed;
+    uint32_t last_step, last_period, elapsed, next_step;
     uint32_t stop_timeout, hold_delay, ramp_ticks;
     uint32_t crossover_threshold, slow_threshold;
     float command_angle, stall_threshold;
@@ -55,12 +58,22 @@ struct c5_mclib_motor {
     float resonance_amplitude[3];
     float resonance_phase_forward[3];
     float resonance_phase_reverse[3];
+    // Torque ripple correction for harmonic k+1 of the electrical angle,
+    // per direction: a table of electrical frequency (Hz) against the
+    // correction current (A, as sin and cos parts), while running
+    struct c5_mclib_ripple_table {
+        float freq[C5_RIPPLE_POINTS], sin_part[C5_RIPPLE_POINTS];
+        float cos_part[C5_RIPPLE_POINTS];
+        uint8_t count;
+    } ripple[C5_RIPPLE_HARMONICS][2];
+    uint32_t step_period;
+    uint8_t ripple_active;
     struct c5_mclib_observer observer;
     struct c5_mclib_pi d_pi, q_pi, outer_pi;
     uint16_t phase, phase_increment, exponent;
     uint8_t axis, interpolation, direction;
     uint8_t mode, fast_mode, hold_transition, slow;
-    uint8_t quarter_count, stall, slip_mode;
+    uint8_t quarter_count, stall, slip_mode, next_state;
     struct c5_mclib_health health;
 };
 
@@ -88,8 +101,23 @@ void c5_mclib_stall_threshold(struct c5_mclib_motor *m,
 void c5_mclib_resonance(struct c5_mclib_motor *m,
                         uint8_t tdx, uint32_t amp, uint32_t phase1,
                         uint32_t phase2);
+// Point index of count for harmonic (1..C5_RIPPLE_HARMONICS) ripple
+// correction in direction (0 reverse, 1 forward): electrical frequency in
+// millihertz, amplitude in milliamps, phase in milliradians. Points go in
+// rising frequency; count 0 clears the table.
+void c5_mclib_ripple(struct c5_mclib_motor *m, uint8_t harmonic,
+                     uint8_t direction, uint8_t index, uint8_t count,
+                     uint32_t freq_mhz, int32_t amp_ma, int32_t phase_mrad);
 void c5_mclib_direction(struct c5_mclib_motor *m, uint8_t direction);
 void c5_mclib_step(struct c5_mclib_motor *m, uint32_t now);
+// When the step queue knows its next step: C5_NEXT_AT with its motor time,
+// or C5_NEXT_NONE when no step follows. A step resets it to C5_NEXT_UNKNOWN,
+// where interpolation assumes the last step period repeats.
+#define C5_NEXT_UNKNOWN 0u
+#define C5_NEXT_AT 1u
+#define C5_NEXT_NONE 2u
+void c5_mclib_next_step(struct c5_mclib_motor *m, uint32_t when,
+                        uint8_t state);
 void c5_mclib_enable(struct c5_mclib_motor *m, uint32_t now);
 void c5_mclib_disable(struct c5_mclib_motor *m);
 uint8_t c5_mclib_update(struct c5_mclib_motor *m, uint32_t now,
