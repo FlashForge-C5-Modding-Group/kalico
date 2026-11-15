@@ -536,6 +536,115 @@ c5_mclib_resonance(struct c5_mclib_motor *m,
 }
 
 void
+c5_mclib_ripple(struct c5_mclib_motor *m, uint8_t harmonic,
+                uint8_t direction, uint8_t index, uint8_t count,
+                uint32_t freq_mhz, int32_t amp_ma, int32_t phase_mrad)
+{
+    if (!harmonic || harmonic > C5_RIPPLE_HARMONICS || direction > 1u
+        || count > C5_RIPPLE_POINTS || (count && index >= count))
+        return;
+    struct c5_mclib_ripple_table *t = &m->ripple[harmonic - 1u][direction];
+    t->count = count;
+    if (count) {
+        float amp = (float)amp_ma / 1000.0f;
+        float phase = (float)phase_mrad / 1000.0f;
+        float sine, cosine;
+        sine_cosine(phase, &sine, &cosine);
+        t->freq[index] = (float)freq_mhz / 1000.0f;
+        // amp * sin(x + phase) = sin(x) * amp cos(phase) + cos(x) * amp sin
+        t->sin_part[index] = amp * cosine;
+        t->cos_part[index] = amp * sine;
+    }
+    uint8_t active = 0u;
+    for (uint8_t i = 0; i < C5_RIPPLE_HARMONICS; i++)
+        if (m->ripple[i][0].count || m->ripple[i][1].count)
+            active = 1u;
+    m->ripple_active = active;
+}
+
+// Electrical frequency of the current step rate
+#define MOTOR_TIME_HZ 100000000.0f
+// Outside a table's points the correction fades out: by this factor of
+// the last point's frequency above, to zero at half the first one's below
+// (a one-point table applies at every speed)
+#define RIPPLE_FADE 1.1f
+
+static float
+ripple_frequency(const struct c5_mclib_motor *m)
+{
+    float period = (float)m->step_period * (float)(4u << m->exponent);
+    return period > 0.0f ? MOTOR_TIME_HZ / period : 0.0f;
+}
+
+// How much of harmonic table t applies at freq (1 inside its points, fading
+// to 0 outside), and the interpolated sin and cos parts at full weight
+static float
+ripple_lookup(const struct c5_mclib_ripple_table *t, float freq,
+              float *sp, float *cp)
+{
+    uint8_t n = t->count;
+    if (!n)
+        return 0.0f;
+    if (n == 1u) {
+        // A single point is one correction at every speed
+        *sp = t->sin_part[0];
+        *cp = t->cos_part[0];
+        return 1.0f;
+    }
+    if (freq <= t->freq[0]) {
+        *sp = t->sin_part[0];
+        *cp = t->cos_part[0];
+        float w = 2.0f * freq / t->freq[0] - 1.0f;
+        return w > 0.0f ? w : 0.0f;
+    }
+    float last = t->freq[n - 1u];
+    if (freq >= last) {
+        *sp = t->sin_part[n - 1u];
+        *cp = t->cos_part[n - 1u];
+        float w = 1.0f - (freq - last) / ((RIPPLE_FADE - 1.0f) * last);
+        return w > 0.0f ? w : 0.0f;
+    }
+    uint8_t j = 1u;
+    while (freq > t->freq[j])
+        j++;
+    float f = (freq - t->freq[j - 1u]) / (t->freq[j] - t->freq[j - 1u]);
+    *sp = t->sin_part[j - 1u] + f * (t->sin_part[j] - t->sin_part[j - 1u]);
+    *cp = t->cos_part[j - 1u] + f * (t->cos_part[j] - t->cos_part[j - 1u]);
+    return 1.0f;
+}
+
+static float
+ripple_correction(const struct c5_mclib_motor *m)
+{
+    uint8_t dir = m->direction ? 1u : 0u;
+    float freq = ripple_frequency(m);
+    float correction = 0.0f;
+    for (uint8_t i = 0; i < C5_RIPPLE_HARMONICS; i++) {
+        float sp, cp;
+        float w = ripple_lookup(&m->ripple[i][dir], freq, &sp, &cp);
+        if (w <= 0.0f)
+            continue;
+        float sine, cosine;
+        sine_cosine((float)(i + 1u) * m->command_angle, &sine, &cosine);
+        correction += w * (sp * sine + cp * cosine);
+    }
+    return correction;
+}
+
+// Share of the stock resonance damping for harmonic left to it: none
+// where a ripple table covers the current speed
+static float
+stock_damping_share(const struct c5_mclib_motor *m, uint8_t harmonic)
+{
+    if (m->mode != MODE_RUN)
+        return 1.0f;
+    float sp, cp;
+    float w = ripple_lookup(&m->ripple[harmonic - 1u][m->direction ? 1u : 0u],
+                            ripple_frequency(m), &sp, &cp);
+    return 1.0f - w;
+}
+
+void
 c5_mclib_direction(struct c5_mclib_motor *m, uint8_t direction)
 {
     m->direction = direction;
@@ -546,6 +655,7 @@ c5_mclib_step(struct c5_mclib_motor *m, uint32_t now)
 {
     m->last_period = now - m->last_step;
     m->last_step = now;
+    m->next_state = C5_NEXT_UNKNOWN;
     if (m->direction)
         m->phase = (uint16_t)(m->phase + m->phase_increment);
     else
@@ -563,9 +673,17 @@ c5_mclib_step(struct c5_mclib_motor *m, uint32_t now)
 }
 
 void
+c5_mclib_next_step(struct c5_mclib_motor *m, uint32_t when, uint8_t state)
+{
+    m->next_step = when;
+    m->next_state = state;
+}
+
+void
 c5_mclib_enable(struct c5_mclib_motor *m, uint32_t now)
 {
     m->last_step = now;
+    m->next_state = C5_NEXT_UNKNOWN;
     m->phase = 8192u;
     m->command_angle = 0x1.921fb8p-1f;
     m->phase_increment = (uint16_t)arm_lsl(1u, 14u - m->exponent);
@@ -713,24 +831,37 @@ run_state_update(struct c5_mclib_motor *m, float initial_error)
         m->mode = MODE_HOLD;
     }
 
-    if (m->interpolation) {
-        float ratio = (float)(int32_t)m->elapsed / (float)m->last_period;
+    if (m->interpolation && m->next_state != C5_NEXT_NONE) {
+        // With the next step's time known the angle follows the real
+        // trajectory through speed changes; otherwise assume the last
+        // period repeats.
+        uint32_t period = m->last_period;
+        if (m->next_state == C5_NEXT_AT) {
+            period = m->next_step - m->last_step;
+            if (!period)
+                period = 1u;
+        }
+        m->step_period = period;
+        float ratio = (float)(int32_t)m->elapsed / (float)period;
         int32_t delta = trunc_s32(ratio * (float)m->phase_increment);
         uint16_t interpolated;
         if (m->direction) {
-            if (m->elapsed < m->last_period)
+            if (m->elapsed < period)
                 interpolated = (uint16_t)(m->phase + delta);
             else
                 interpolated = (uint16_t)(m->phase
                                            + m->phase_increment - 1u);
         } else {
-            if (m->elapsed < m->last_period)
+            if (m->elapsed < period)
                 interpolated = (uint16_t)(m->phase - delta);
             else
                 interpolated = (uint16_t)(m->phase
                                            - m->phase_increment + 1u);
         }
         m->command_angle = (float)interpolated * 0x1.921fb8p-14f;
+    } else if (m->interpolation) {
+        // Last step of the queue: stay on it instead of running past
+        m->command_angle = (float)m->phase * 0x1.921fb8p-14f;
     }
 }
 
@@ -757,11 +888,15 @@ nonfast_control(struct c5_mclib_motor *m, float ia, float ib,
             float phase = m->direction ? m->resonance_phase_forward[i]
                 : m->resonance_phase_reverse[i];
             float angle = multiplier[i] * m->command_angle + phase;
-            compensation += m->resonance_amplitude[i]
+            float share = m->ripple_active
+                ? stock_damping_share(m, (uint8_t)multiplier[i]) : 1.0f;
+            compensation += share * m->resonance_amplitude[i]
                 * scalar_sine(angle);
         }
         m->reference_d -= compensation;
     }
+    if (m->ripple_active && m->mode == MODE_RUN)
+        m->reference_d -= ripple_correction(m);
     sine_cosine(m->command_angle, sine, cosine);
     forward_transform(ia, ib, *sine, *cosine,
                       &m->measured_d, &m->measured_q);

@@ -190,6 +190,18 @@ virtual_out_toggle_noirq(struct gpio_out g)
     }
 }
 
+// Step queue hook: pass the next step time on to the motor it drives
+void
+c5_mainboardgd_next_step(struct gpio_out g, uint32_t clock, uint8_t due)
+{
+    if (g.regs != &virtual_pj_bank)
+        return;
+    uint8_t index = virtual_bit_index(g.bit);
+    if (index >= 12 || (index & 3U))
+        return;
+    c5_mainboardgd_set_next_step(pj_axis(index), clock, due);
+}
+
 void
 gpio_out_toggle_noirq(struct gpio_out g)
 {

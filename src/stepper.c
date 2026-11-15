@@ -48,6 +48,17 @@ enum { MF_DIR=1<<0, MF_DIR_LEVEL=1<<1 };
  #define HAVE_SHARED_DIR 0
 #endif
 
+// The Creator 5 mainBoardGD drives its motors itself; tell it when each
+// step is due so it can follow the trajectory between steps.
+#if CONFIG_C5_MAINBOARDGD
+ #include "c5_mainboardgd.h" // c5_mainboardgd_next_step
+ #define HAVE_NEXT_STEP_HOOK 1
+#else
+ #define HAVE_NEXT_STEP_HOOK 0
+ static inline void
+ c5_mainboardgd_next_step(struct gpio_out pin, uint32_t clock, uint8_t due) {}
+#endif
+
 struct stepper {
     struct timer time;
     uint32_t interval;
@@ -69,6 +80,14 @@ enum {
     SF_SINGLE_SCHED=1<<4, SF_OPTIMIZED_PATH=1<<5, SF_HAVE_ADD=1<<6
 };
 
+// Report the next step event (s->time.waketime) or that none is queued
+static inline void
+stepper_note_next(struct stepper *s, uint_fast8_t due)
+{
+    if (HAVE_NEXT_STEP_HOOK)
+        c5_mainboardgd_next_step(s->step_pin, s->time.waketime, due);
+}
+
 static inline void
 stepper_set_dir(struct stepper *s, uint_fast8_t level)
 {
@@ -85,6 +104,7 @@ stepper_load_next(struct stepper *s)
     if (move_queue_empty(&s->mq)) {
         // There is no next move - the queue is empty
         s->count = 0;
+        stepper_note_next(s, 0);
         return SF_DONE;
     }
 
@@ -137,6 +157,7 @@ stepper_load_next(struct stepper *s)
             min_next_time = curtime + s->step_pulse_ticks;
             if (timer_is_before(s->time.waketime, min_next_time))
                 s->time.waketime = min_next_time;
+            stepper_note_next(s, 1);
             return SF_RESCHEDULE;
         }
     }
@@ -144,6 +165,7 @@ stepper_load_next(struct stepper *s)
     // Set new direction (if needed)
     if (need_dir_change || HAVE_SHARED_DIR)
         stepper_set_dir(s, dir_level);
+    stepper_note_next(s, 1);
     return SF_RESCHEDULE;
 }
 
@@ -209,11 +231,12 @@ stepper_event_full(struct timer *t)
     if (likely(count)) {
         s->next_step_time += s->interval;
         s->interval += s->add;
-        if (unlikely(timer_is_before(s->next_step_time, min_next_time)))
-            // The next step event is too close - push it back
-            goto reschedule_min;
         s->count = count;
         s->time.waketime = s->next_step_time;
+        if (unlikely(timer_is_before(s->next_step_time, min_next_time)))
+            // The next step event is too close - push it back
+            s->time.waketime = min_next_time;
+        stepper_note_next(s, 1);
         return SF_RESCHEDULE;
     }
     s->time.waketime = min_next_time;
@@ -373,6 +396,7 @@ stepper_stop(struct trsync_signal *tss, uint8_t reason)
     struct stepper *s = container_of(tss, struct stepper, stop_signal);
     sched_del_timer(&s->time);
     s->next_step_time = s->time.waketime = 0;
+    stepper_note_next(s, 0);
     s->position = -stepper_get_position(s);
     s->count = 0;
     s->flags = ((s->flags & (SF_INVERT_STEP|SF_SINGLE_SCHED|SF_OPTIMIZED_PATH))

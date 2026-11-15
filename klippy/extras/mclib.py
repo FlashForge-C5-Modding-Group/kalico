@@ -11,6 +11,12 @@ from klippy import stepper
 ######################################################################
 
 MAX_CURRENT = 4.0
+RIPPLE_HARMONICS = 8
+RIPPLE_POINTS = 6
+# Calibrated corrections stay well under this; more grinds the motor
+RIPPLE_MAX_AMP = 0.1
+# A single-point correction is held at every speed below this frequency
+RIPPLE_FLAT_HZ = 10000.
 steps = {1: 0, 2: 1, 4: 2, 8: 3, 16: 4, 32: 5, 64: 6, 128: 7, 256: 8}
 stepper_id = {'stepper_x':0, 'stepper_y':1, 'stepper_z':2, 'extruder':3}
 
@@ -46,6 +52,26 @@ class MCLIB:
         self.td4_amp = int(config.getfloat('td4_amp', 0., minval=0., maxval=run_current)* 1000)
         self.td4_phase1 = int(config.getfloat('td4_phase1', 0.)* 1000)
         self.td4_phase2 = int(config.getfloat('td4_phase2', 0.)* 1000)  
+        # Torque ripple correction for harmonic k of the electrical angle:
+        # ripple_<k> = groups of electrical Hz, amp_fwd, phase_fwd, amp_rev,
+        # phase_rev (A, rad), in rising frequency
+        self.ripple = {}
+        for k in range(1, RIPPLE_HARMONICS + 1):
+            vals = config.getfloatlist('ripple_%d' % (k,), None)
+            if vals is None:
+                continue
+            if not vals or len(vals) % 5 or len(vals) > 5 * RIPPLE_POINTS:
+                raise config.error(
+                    "ripple_%d needs groups of 5 values (Hz, amp_fwd, "
+                    "phase_fwd, amp_rev, phase_rev), at most %d"
+                    % (k, RIPPLE_POINTS))
+            points = [tuple(vals[i:i + 5]) for i in range(0, len(vals), 5)]
+            if any(abs(p[1]) > RIPPLE_MAX_AMP or abs(p[3]) > RIPPLE_MAX_AMP
+                   for p in points):
+                raise config.error("ripple_%d: amplitudes over %.2f A"
+                                   % (k, RIPPLE_MAX_AMP))
+            self.ripple[k] = points
+        self.set_ripple_cmd = None
         self.calibrated_damping = {
             1: (self.td1_amp, self.td1_phase1, self.td1_phase2),
             2: (self.td2_amp, self.td2_phase1, self.td2_phase2),
@@ -75,6 +101,9 @@ class MCLIB:
             gcode.register_mux_command("MCLIB_SET_RESONANCE_DAMP", "STEPPER", self.name,
                                    self.cmd_MCLIB_SET_RESONANCE_DAMP,
                                    desc=self.cmd_MCLIB_SET_RESONANCE_DAMP_help)
+            gcode.register_mux_command("MCLIB_SET_RIPPLE", "STEPPER",
+                                       self.name, self.cmd_MCLIB_SET_RIPPLE,
+                                       desc=self.cmd_MCLIB_SET_RIPPLE_help)
             gcode.register_mux_command("MCLIB_APPLY_CALIBRATION", "STEPPER",
                                        self.name, self.cmd_MCLIB_APPLY_CALIBRATION,
                                        desc=self.cmd_MCLIB_APPLY_CALIBRATION_help)
@@ -115,16 +144,88 @@ class MCLIB:
             "mclib_config_slip oid=%c mode=%c")
 
         if self.name != 'extruder':
-            self.mcu.add_config_cmd("mclib_set_resonance_damp oid=%d tdx=1 amp=%u phase1=%u phase2=%u"% (
-                self.oid, self.td1_amp, self.td1_phase1, self.td1_phase2))
-            self.mcu.add_config_cmd("mclib_set_resonance_damp oid=%d tdx=2 amp=%u phase1=%u phase2=%u"% (
-                self.oid, self.td2_amp, self.td2_phase1, self.td2_phase2))
-            self.mcu.add_config_cmd("mclib_set_resonance_damp oid=%d tdx=4 amp=%u phase1=%u phase2=%u"% (
-                self.oid, self.td4_amp, self.td4_phase1, self.td4_phase2))
+            # Older mainboard firmware has no ripple correction
+            self.set_ripple_cmd = self.mcu.try_lookup_command(
+                "mclib_set_ripple oid=%c harmonic=%c dir=%c index=%c count=%c"
+                " freq=%u amp=%i phase=%i")
+            for tdx, (amp, phase1, phase2) in sorted(
+                    self._stock_damping().items()):
+                self.mcu.add_config_cmd(
+                    "mclib_set_resonance_damp oid=%d tdx=%d amp=%u"
+                    " phase1=%u phase2=%u"
+                    % (self.oid, tdx, amp, phase1, phase2))
 
         if self.name != 'extruder':
             self.set_resonance_damp_cmd = self.mcu.lookup_command(
                 "mclib_set_resonance_damp oid=%c tdx=%c amp=%u phase1=%u phase2=%u")
+            if self.set_ripple_cmd is not None:
+                for k in sorted(self.ripple):
+                    for args in self._ripple_args(k):
+                        self.mcu.add_config_cmd(
+                            "mclib_set_ripple oid=%d harmonic=%d dir=%d"
+                            " index=%d count=%d freq=%d amp=%d phase=%d"
+                            % tuple([self.oid] + args))
+            elif self.ripple:
+                logging.warning("%s: ripple correction needs newer mainboard"
+                                " firmware", self.name)
+
+    def _ripple_args(self, harmonic):
+        points = self.ripple.get(harmonic, [])
+        if not points:
+            return [[harmonic, d, 0, 0, 0, 0, 0] for d in (0, 1)]
+        args = []
+        for d in (0, 1):
+            for i, p in enumerate(points):
+                amp, phase = (p[1], p[2]) if d else (p[3], p[4])
+                args.append([harmonic, d, i, len(points),
+                             int(round(p[0] * 1000.)),
+                             int(round(amp * 1000.)),
+                             int(round(phase * 1000.))])
+        return args
+
+    def _stock_damping(self):
+        # Where a ripple table covers the speed, the mainboard uses it in
+        # place of the stock value for that harmonic
+        return dict(self.calibrated_damping)
+
+    def has_ripple(self):
+        return self.set_ripple_cmd is not None
+
+    def get_ripple(self):
+        return {k: list(v) for k, v in self.ripple.items()}
+
+    def set_ripple_table(self, harmonic, points):
+        """points: (electrical Hz, amp_fwd, phase_fwd, amp_rev, phase_rev)
+        in rising frequency; empty clears it. Until restart unless saved."""
+        if points:
+            self.ripple[harmonic] = [tuple(p) for p in points]
+        else:
+            self.ripple.pop(harmonic, None)
+        for args in self._ripple_args(harmonic):
+            self.set_ripple_cmd.send([self.oid] + args)
+
+    def set_ripple(self, harmonic, direction, amp, phase):
+        """One correction for a direction (motor forward is 1) at every
+        speed, keeping the other direction's single value."""
+        old = self.ripple.get(harmonic)
+        other = (0., 0.)
+        if old and len(old) == 1:
+            other = (old[0][3], old[0][4]) if direction else (old[0][1],
+                                                              old[0][2])
+        fwd = (amp, phase) if direction else other
+        rev = other if direction else (amp, phase)
+        if not fwd[0] and not rev[0]:
+            self.set_ripple_table(harmonic, [])
+        else:
+            self.set_ripple_table(
+                harmonic, [(RIPPLE_FLAT_HZ, fwd[0], fwd[1], rev[0], rev[1])])
+
+    def ripple_config_value(self, harmonic):
+        points = self.ripple.get(harmonic)
+        if not points:
+            return None
+        return ", ".join("%.1f, %.4f, %.3f, %.4f, %.3f" % p
+                             for p in points)
 
     cmd_MCLIB_SET_CURRENT_help = "Sets the current of stepper in mclib "
     def cmd_MCLIB_SET_CURRENT(self, gcmd):
@@ -220,7 +321,7 @@ class MCLIB:
         # Values are read from [mclib stepper_*] at startup, including values
         # written by SAVE_CONFIG after VFA calibration.
         for tdx, (amp, phase1, phase2) in sorted(
-                self.calibrated_damping.items()):
+                self._stock_damping().items()):
             if self.set_resonance_damp_cmd is None:
                 self.mcu.add_config_cmd(
                     "mclib_set_resonance_damp oid=%d tdx=%d amp=%u phase1=%u phase2=%u"
@@ -229,6 +330,39 @@ class MCLIB:
                 self.set_resonance_damp_cmd.send(
                     [self.oid, tdx, amp, phase1, phase2])
         gcmd.respond_info("Restored MCLib calibration for %s" % self.name)
+
+    cmd_MCLIB_SET_RIPPLE_help = ("Set or show torque ripple correction "
+                                 "(HARMONIC, DIR=1 forward or 0 reverse, "
+                                 "AMP in A, PHASE in rad; SAVE=1 to save the "
+                                 "tables)")
+    def cmd_MCLIB_SET_RIPPLE(self, gcmd):
+        if self.set_ripple_cmd is None:
+            raise gcmd.error("Ripple correction needs newer mainboard "
+                             "firmware")
+        harmonic = gcmd.get_int('HARMONIC', None, minval=1,
+                                maxval=RIPPLE_HARMONICS)
+        if gcmd.get_int('SAVE', 0):
+            # Store the live tables for SAVE_CONFIG
+            configfile = self.printer.lookup_object('configfile')
+            for k in range(1, RIPPLE_HARMONICS + 1):
+                val = self.ripple_config_value(k)
+                if val is not None:
+                    configfile.set('mclib ' + self.name, 'ripple_%d' % (k,),
+                                   val)
+            gcmd.respond_info("Run SAVE_CONFIG to keep the %s ripple "
+                              "correction" % (self.name,))
+            return
+        if harmonic is None:
+            lines = ["%s ripple_%d: %s" % (self.name, k,
+                                           self.ripple_config_value(k))
+                     for k in sorted(self.ripple)]
+            gcmd.respond_info("\n".join(lines) or
+                              "%s: no ripple correction" % (self.name,))
+            return
+        direction = gcmd.get_int('DIR', minval=0, maxval=1)
+        amp = gcmd.get_float('AMP', minval=0., maxval=RIPPLE_MAX_AMP)
+        phase = gcmd.get_float('PHASE', 0.)
+        self.set_ripple(harmonic, direction, amp, phase)
 
 def load_config_prefix(config):
     return MCLIB(config)
