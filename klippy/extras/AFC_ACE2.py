@@ -1306,6 +1306,14 @@ class afcACE2(afcACE):
             self.logger.error(msg)
             self.gcode.run_script_from_command("PAUSE")
 
+    def _scan_ace_candidates(self) -> List[str]:
+        """
+        ACE 2 candidates for the missing-ACE check: CH34x ttys (by-id or sysfs).
+
+        :return List[str]: candidate tty paths
+        """
+        return _ace2_scan_candidates()
+
     def _make_connection(self, reactor: Reactor, serial_port: str, logger: logging.Logger,
                          baud_rate: int) -> ACE2Connection:
         """

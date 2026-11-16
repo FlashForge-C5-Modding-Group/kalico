@@ -138,6 +138,10 @@ class afc:
 
         # Objects for everything configured for AFC
         self.units: Dict[str, afcUnit] = {}
+        # Units configured but not attached (AFC_ACE fallback_without_ace), and their
+        # saved AFC.var.unit entries, written back unchanged by save_vars
+        self.absent_units: Dict[str, Any] = {}
+        self.absent_unit_vars: Dict[str, Any] = {}
         self.tools: Dict[str, AFCExtruder] = {}
         self.lanes: Dict[str, Union[AFCLane, AFCExtruderStepper]] = {}
         self.hubs       = {}
@@ -1408,6 +1412,9 @@ class afc:
                 cur_lane=self.lanes[NAME]
                 str[cur_unit.name][cur_lane.name]=cur_lane.get_status(save_to_file=True)
                 name.append(cur_lane.name)
+
+        for unit_name, saved in self.absent_unit_vars.items():
+            str.setdefault(unit_name, saved)
 
         str["system"]={}
         str["system"]['current_load']= self.current

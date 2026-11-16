@@ -511,6 +511,8 @@ class AFCLane:
         """
         if self.unit_obj is None:
             raise error("Unit {unit} is not defined in your configuration file. Please defined unit ex. [AFC_BoxTurtle {unit}]".format(unit=self.unit))
+        if getattr(self, "inactive", False):
+            return
 
         if self.led_index is not None:
             # Verify that LED config is found
@@ -659,6 +661,8 @@ class AFCLane:
 
     def handle_moonraker_connect(self) -> None:
         """Initialize lane statistics once while repeating other PREP setup."""
+        if getattr(self, "inactive", False):
+            return
         if (self.unit_obj.type not in EXCLUDE_TYPES
             or (self.unit_obj.type in EXCLUDE_TYPES
                 and "AFC_lane" in self.fullname)):
@@ -677,6 +681,14 @@ class AFCLane:
         """
         # Saving reference to unit
         self.unit_obj: afcUnit = unit_obj
+        if getattr(unit_obj, "absent", False):
+            # The unit's hardware isn't attached (AFC_ACE fallback_without_ace): stay out of
+            # the unit, hub, extruder and AFC lane lists, so the toolhead keeps its
+            # standalone lane and T(n) map, and drop this lane from printer objects.
+            self.inactive = True
+            unit_obj.inactive_lanes.append(self)
+            self.printer.objects.pop(f"AFC_lane {self.name}", None)
+            return
         self.buffer_obj = self.unit_obj.buffer_obj
         add_to_other_obj = False
 

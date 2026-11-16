@@ -123,6 +123,11 @@ class afcPrep:
             error_string += 'AFC.cfg file and make sure the file and path exists.'
             self.afc.error.AFC_error(error_string, False)
 
+        # Units that aren't attached keep their saved lanes for when they're back
+        for unit_name in self.afc.absent_units:
+            if unit_name in units:
+                self.afc.absent_unit_vars[unit_name] = units[unit_name]
+
         # check if Lane is supposed to be loaded in tool head from saved file
         for extruder in self.afc.tools.keys():
             extruder_obj=self.afc.tools[extruder]

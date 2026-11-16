@@ -203,6 +203,13 @@ class afcACE(afcUnit):
         # id). Used only when serial_port: auto; harmless otherwise. Defaults to
         # 1 (the head/only unit), matching the firmware's 1-based numbering.
         self.ace_index = config.getint("ace_index", 1, minval=1)
+        # No ACE on USB at startup: run as if this unit weren't configured, so the
+        # toolheads fall back to their standalone lanes (see _go_absent).
+        self.fallback_without_ace = config.getboolean("fallback_without_ace", True)
+        # Right after boot the ACE can still be enumerating: wait this long for it.
+        self.missing_ace_wait = config.getfloat("missing_ace_wait", 20.0, minval=0.0)
+        self.absent = False
+        self.inactive_lanes: List[Any] = []
         mode = config.get("mode", MODE_COMBINED).lower().strip()
         if mode not in (MODE_COMBINED, MODE_DIRECT):
             error_str = (f"[{config.get_name()}] invalid mode '{mode}'. "
@@ -383,7 +390,12 @@ class afcACE(afcUnit):
         Sets each lane's custom load/unload commands and seeds its loadless
         `_load_state` to False so the native virtual hub reads clear until a
         sync or load drives the loaded-to-hub state.
+
+        With fallback_without_ace and no ACE on USB, the unit goes absent instead.
         """
+        if self.fallback_without_ace and not self._wait_for_ace_hardware():
+            self._go_absent()
+            return
         super().handle_connect()
 
         self.logo = _ams_box_logo(self._LOGO_TITLE, len(self.lanes), self.name)
@@ -394,6 +406,76 @@ class afcACE(afcUnit):
         # False so the virtual hub reads clear until a sync or load sets it.
         for lane in self.lanes.values():
             lane._load_state = False
+
+    def _scan_ace_candidates(self) -> List[str]:
+        """
+        USB serial devices that could be this unit (AFC_ACE2 overrides).
+
+        :return List[str]: candidate tty paths
+        """
+        return _ace_scan_candidates()
+
+    def _ace_hardware_present(self) -> bool:
+        """
+        Whether this unit's ACE is on USB, without opening the port.
+
+        :return bool: True for an existing explicit serial_port, or enough
+            autodetect candidates to cover ace_index
+        """
+        if self.serial_port.strip().lower() != "auto":
+            return os.path.exists(self.serial_port)
+        return len(self._scan_ace_candidates()) >= self.ace_index
+
+    def _wait_for_ace_hardware(self) -> bool:
+        """
+        Check for the ACE, waiting up to missing_ace_wait seconds when the host
+        booted less than two minutes ago (USB may still be enumerating). Runs in
+        klippy:connect, before the reactor serves anything else.
+
+        :return bool: True once the ACE is present
+        """
+        if self._ace_hardware_present():
+            return True
+        try:
+            with open("/proc/uptime") as f:
+                uptime = float(f.read().split()[0])
+        except Exception:
+            uptime = 1e9
+        if uptime > 120.0:
+            return False
+        deadline = time.monotonic() + self.missing_ace_wait
+        while time.monotonic() < deadline:
+            time.sleep(0.5)
+            if self._ace_hardware_present():
+                return True
+        return False
+
+    def _go_absent(self) -> None:
+        """
+        No ACE attached: keep this unit and its lanes out of AFC. The lanes still
+        get the unit's connect event (they need unit_obj) but don't register on
+        the unit, hub or extruder, so each toolhead keeps its standalone lane and
+        T(n) map. The lanes' saved state in AFC.var.unit is carried over unchanged.
+        """
+        self.absent = True
+        self.afc = self.printer.lookup_object('AFC')
+        self.afc.absent_units[self.name] = self
+        msg = (f"{self.name}: no ACE found on USB ({self.serial_port}), running without it. "
+               "Plug it in and restart Klipper to use it.")
+        self.logger.info(msg)
+        logging.info(f"AFC_ACE {msg}")
+        self.printer.send_event("AFC_unit_{}:connect".format(self.name), self)
+
+    def _drop_orphan_hubs(self) -> None:
+        """
+        Remove the hubs that only this absent unit's lanes used (ACE virtual hubs),
+        so they don't show up empty in AFC's status.
+        """
+        for lane in self.inactive_lanes:
+            hub = self.afc.hubs.get(getattr(lane, "hub", None) or "")
+            if hub is not None and not hub.lanes:
+                self.afc.hubs.pop(hub.name, None)
+                self.printer.objects.pop(f"AFC_hub {hub.name}", None)
 
     def _handle_klippy_disconnect(self) -> None:
         """
@@ -514,6 +596,12 @@ class afcACE(afcUnit):
         defer the ACE serial connect onto a reactor callback so it runs once the
         reactor is fully up.
         """
+        if self.absent:
+            self._first_connect_pending = False
+            self._drop_orphan_hubs()
+            self.afc.gcode.respond_info(f"{self.name}: no ACE found, running without it "
+                                        "(heads use their standalone lanes)")
+            return
         # Seed each lane's virtual-hub state now, so the hub is right even if the
         # ACE never connects. No-op for physical hubs.
         for lane in self.lanes.values():

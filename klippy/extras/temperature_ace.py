@@ -34,6 +34,7 @@
 # channel defaults to 'default' (the single box/env temp from get_status,
 # unchanged from before). The other channels are ACE2-only.
 
+import contextlib
 import logging
 from typing import Any, Callable, Dict, Optional, Tuple, TYPE_CHECKING
 
@@ -125,10 +126,16 @@ class TemperatureACE:
         except Exception:
             pass
 
+        absent = False
+        with contextlib.suppress(Exception):
+            absent = self.ace_unit_name in self.printer.lookup_object("AFC").absent_units
         if self._ace_unit:
             if getattr(self._ace_unit, "type", "") == "ACE2":
                 self._has_humidity = True
             self._log().info(f"temperature_ace: linked to AFC_ACE unit '{self.ace_unit_name}'")
+        elif absent:
+            # AFC_ACE fallback_without_ace: the ACE isn't plugged in, not a config mistake
+            self._log().info(f"temperature_ace: ACE '{self.ace_unit_name}' not attached; reporting 0C")
         else:
             self._log().warning(
                 f"temperature_ace: AFC_ACE unit '{self.ace_unit_name}' not found; reporting 0C")
