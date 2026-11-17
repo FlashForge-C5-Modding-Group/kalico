@@ -1350,6 +1350,7 @@ class AFCExtruder:
             self.response['status'] = State.PRINTING
         else:
             self.response['status'] = self.status
+        self.response['extruder_name'] = self.th_extruder_name
 
         return self.response
 
