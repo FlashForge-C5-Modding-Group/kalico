@@ -518,7 +518,7 @@ class afcUnit:
                 continue
             try:
                 script = f'SET_LED_EFFECT EFFECT={effect} STOP=1'
-                self.gcode.run_script_from_command(script)
+                self.afc.run_script(script)
             except Exception:
                 pass
 
@@ -535,7 +535,7 @@ class afcUnit:
         try:
             effect_name = f"{name}_{effect_suffix}"
             if f"led_effect {effect_name}" in self.printer.objects:
-                self.gcode.run_script_from_command(f"SET_LED_EFFECT EFFECT={effect_name}")
+                self.afc.run_script(f"SET_LED_EFFECT EFFECT={effect_name}")
                 self.afc.active_led_effects.append(effect_name)
         except Exception:
             pass
@@ -668,6 +668,16 @@ class afcUnit:
         if not self._check_led_state(lane, "unloaded"): return
         self._trigger_led_state(lane, static_color=lane.led_not_ready, effect_suffix="unloaded")
 
+    def finish_unload(self, lane: AFCLane) -> None:
+        """
+        AFC calls this after every unload_sequence exit, success, failure, or a
+        custom_unload_cmd/heating-error path that bypasses unit_unload_lane, so a
+        unit can release any state it set up in lane_unloading/prepare_unload.
+        No-op here; override for units that need guaranteed cleanup.
+
+        :param lane: Lane that finished (or aborted) an unload.
+        """
+
     def lane_loading(self, lane: AFCLane) -> None:
         """
         Common function for setting a lanes led when lane is loading, this can be called when
@@ -745,14 +755,19 @@ class afcUnit:
         if not self._check_led_state(lane, "fault"): return
         self._trigger_led_state(lane, static_color=lane.led_fault, effect_suffix="fault")
 
-    def select_lane( self, lane: AFCLane, sel_prep:bool=False ) -> tuple[bool, float|int]:
+    def select_lane( self, lane: AFCLane, sel_dir:bool=False,
+                     disable_selector:bool=False ) -> tuple[bool, float|int]:
         """
         Common method to select a units lane.
 
         Override in unit specific file if needed
 
         :param lane: AFCLane object for lane to select
-        :param sel_prep: Set to true is selection is happing during prep macro
+        :param sel_dir: Set to True when selection happens as part of loading a lane,
+                        so units with a direction-sensitive selector can move toward
+                        the load direction
+        :param disable_selector: Set to True to disable the selector motor after selecting
+        :return type: tuple of (homed, distance moved)
         """
         return True, 0.0
 
@@ -791,8 +806,19 @@ class afcUnit:
         self._print_function_not_defined(self.system_Test.__name__)
         return False
 
-    def calibrate_bowden(self, cur_lane, dis, tol):
+    def calibrate_bowden(self, cur_lane: AFCLane, dis: float, tol: float,
+                         gcmd: GCodeCommand) -> tuple[bool, str, float]:
+        """
+        Placeholder, overridden by units that support bowden/dist_hub calibration.
+
+        :param cur_lane: Lane to use for calibration
+        :param dis: Distance step to move when calibrating
+        :param tol: Tolerance for fine adjustments during calibration
+        :param gcmd: command context the calibration is run through
+        :return type: tuple of (success, message, calibrated length)
+        """
         self._print_function_not_defined(self.calibrate_bowden.__name__)
+        return False, "", 0.0
 
     def calibrate_td1(self, cur_lane, dis, tol):
         self._print_function_not_defined(self.calibrate_td1.__name__)
@@ -806,8 +832,18 @@ class afcUnit:
     def calc_position(self, cur_lane, state, pos, short_move, tolerance):
         self._print_function_not_defined(self.calc_position.__name__)
 
-    def calibrate_lane(self, cur_lane, tol):
+    def calibrate_lane(self, cur_lane: AFCLane, tol: float,
+                       gcmd: GCodeCommand) -> tuple[bool, str, float]:
+        """
+        Placeholder, overridden by units that support dist_hub calibration.
+
+        :param cur_lane: Lane to use for calibration
+        :param tol: Tolerance for fine adjustments during calibration
+        :param gcmd: command context the calibration is run through
+        :return type: tuple of (success, message, calibrated length)
+        """
         self._print_function_not_defined(self.calibrate_lane.__name__)
+        return False, "", 0.0
 
     def unselect_lane(self, move_distance: float=50):
         self._print_function_not_defined(self.unselect_lane.__name__)
