@@ -206,7 +206,7 @@ class MotionGuardTest(unittest.TestCase):
         self.assertIn('about 1.000', text)
 
 
-    def test_slip_watch_only_applies_in_test_mode(self):
+    def test_slip_watch_applies_in_prints_and_test_mode(self):
         g = self.guard(slip_watch='holding')
         self.assertEqual({m.slip_mode for m in self.motors.values()}, {0})
         gcmd = mock.Mock()
@@ -219,12 +219,12 @@ class MotionGuardTest(unittest.TestCase):
         self.assertEqual({m.slip_mode for m in self.motors.values()}, {2})
         self.state = 'printing'
         g._poll(0.)
-        self.assertEqual({m.slip_mode for m in self.motors.values()}, {0})
-        self.state = 'standby'
-        g._poll(0.)
         self.assertEqual({m.slip_mode for m in self.motors.values()}, {2})
         values['TEST'] = 0
         g.cmd_GUARD(gcmd)
+        self.assertEqual({m.slip_mode for m in self.motors.values()}, {2})
+        self.state = 'standby'
+        g._poll(0.)
         self.assertEqual({m.slip_mode for m in self.motors.values()}, {0})
         self.assertEqual(g.get_status(0.)['slip_watch'], 'always')
 

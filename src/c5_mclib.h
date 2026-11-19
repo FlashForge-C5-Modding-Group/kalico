@@ -23,6 +23,7 @@ struct c5_mclib_observer {
     float estimated_current_a, estimated_current_b;
     float injection_a, injection_b;
     float filtered_injection_a, filtered_injection_b;
+    float injection_scale;
     float raw_angle, previous_raw_angle, compensation;
     float instantaneous_speed, filtered_speed, scaled_speed;
     float angle;
@@ -40,13 +41,38 @@ struct c5_mclib_health {
     uint8_t last_valid, stall_prev;
 };
 
+// Control loop duration bookkeeping: max and total cycles spent in the
+// control update per axis, over the samples counted since the last
+// c5_mclib_take_timing(). The caller measures the time around
+// c5_mclib_update(); this only accumulates.
+struct c5_mclib_timing {
+    uint32_t max, total, samples;
+    float d_integral_sum;
+    uint32_t d_integral_samples;
+    // squared current error while holding still (current sense noise)
+    float hold_noise_sum;
+    uint32_t hold_noise_samples;
+};
+
+
 #define C5_RIPPLE_HARMONICS 8
+#define C5_ANALYZE_HARMONICS 8
 #define C5_RIPPLE_POINTS 6
 
 struct c5_mclib_motor {
     uint32_t last_step, last_period, elapsed, next_step;
     uint32_t stop_timeout, hold_delay, ramp_ticks;
     uint32_t crossover_threshold, slow_threshold;
+    uint32_t crossover_hysteresis, damping_threshold;
+    float feedforward_gain;
+    // current PI gains at 100% (1 kHz bandwidth), for c5_mclib_pi_scale()
+    float pi_kp_base, pi_ki_base;
+    // slow part of the load angle, taken out before its harmonics are summed
+    float load_angle_lp;
+    // load angle harmonics against the commanded angle, per direction
+    float harm_cos[2][C5_ANALYZE_HARMONICS], harm_sin[2][C5_ANALYZE_HARMONICS];
+    uint32_t harm_count[2];
+    uint8_t harm_armed;
     float command_angle, stall_threshold;
     float resistance, inductance, motor_constant;
     float run_current, hold_current, active_current, decay_increment;
@@ -74,7 +100,14 @@ struct c5_mclib_motor {
     uint8_t axis, interpolation, direction;
     uint8_t mode, fast_mode, hold_transition, slow;
     uint8_t quarter_count, stall, slip_mode, next_state;
+    // Observer back-EMF estimate while (nearly) still, in the command frame:
+    // the bridge's dead time and the resistance mismatch. Taken out of the
+    // estimate to follow skipped steps below the fast-move speed.
+    float emf_base_d, emf_base_q, emf_resid_d, emf_resid_q;
+    uint16_t emf_learned, skipped;
+    uint8_t track_source;
     struct c5_mclib_health health;
+    struct c5_mclib_timing timing;
 };
 
 struct c5_mclib_acq {
@@ -125,6 +158,22 @@ uint8_t c5_mclib_update(struct c5_mclib_motor *m, uint32_t now,
 uint8_t c5_mclib_stalled(const struct c5_mclib_motor *m);
 void c5_mclib_take_health(struct c5_mclib_motor *m,
                           struct c5_mclib_health *out);
+void c5_mclib_note_timing(struct c5_mclib_motor *m, uint32_t cycles);
+void c5_mclib_take_timing(struct c5_mclib_motor *m,
+                          struct c5_mclib_timing *out);
+// Observer high-frequency injection scale in percent (100 = stock).
+// Lower values reduce the injected correction voltage; the angle
+// estimate degrades, so this is for bench experiments only.
+void c5_mclib_injection_scale(struct c5_mclib_motor *m, uint32_t percent);
+// d-axis back-EMF and cross-coupling feedforward in percent (0 = off)
+void c5_mclib_feedforward(struct c5_mclib_motor *m, uint32_t percent);
+// Current PI gains in percent of the stock 1 kHz bandwidth (100 = stock)
+void c5_mclib_pi_scale(struct c5_mclib_motor *m, uint32_t percent);
+// Load angle harmonic analysis: arm clears and starts it; the sums are read
+// with c5_mclib_take_harmonics
+void c5_mclib_arm_harmonics(struct c5_mclib_motor *m);
+void c5_mclib_take_harmonics(struct c5_mclib_motor *m, uint8_t dir,
+                             float *cosines, float *sines, uint32_t *count);
 // Slip tracking: C5_SLIP_MOVING only in fast moves (with the stall
 // detector), C5_SLIP_HOLDING also while holding still, C5_SLIP_ALWAYS
 // whenever the motor is enabled.
@@ -132,6 +181,12 @@ void c5_mclib_take_health(struct c5_mclib_motor *m,
 #define C5_SLIP_HOLDING 1u
 #define C5_SLIP_ALWAYS 2u
 void c5_mclib_slip_mode(struct c5_mclib_motor *m, uint8_t mode);
+// TRACKING: C5_TRACK_OFF restarts the drift on the next sample,
+// C5_TRACK_ON follows it, C5_TRACK_GAP skips this sample (the angle estimate
+// can't be trusted) and keeps the reference.
+#define C5_TRACK_OFF 0u
+#define C5_TRACK_ON 1u
+#define C5_TRACK_GAP 2u
 void c5_mclib_track_health(struct c5_mclib_motor *m, float error,
                            uint8_t armed, uint8_t tracking);
 void c5_mclib_acq_init(struct c5_mclib_acq *a);

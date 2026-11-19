@@ -392,6 +392,47 @@ test_slip_tracking(void)
 }
 
 static void
+test_slip_gaps(void)
+{
+    struct c5_mclib_motor m;
+    struct c5_mclib_health h;
+    int i;
+
+    // A gap keeps the reference: the drift goes on from the last sample
+    c5_mclib_init(&m, 0);
+    c5_mclib_track_health(&m, 0.0f, 0, C5_TRACK_ON);
+    c5_mclib_track_health(&m, 1.0f, 0, C5_TRACK_ON);
+    c5_mclib_track_health(&m, 0.0f, 0, C5_TRACK_GAP);
+    c5_mclib_track_health(&m, 2.0f, 0, C5_TRACK_ON);
+    c5_mclib_take_health(&m, &h);
+    CHECK(h.tracked == 3 && h.drift > 1.99f && h.drift < 2.01f,
+          "a gap must keep the reference");
+
+    // An offset off the whole cycle fades; a counted cycle stays
+    c5_mclib_init(&m, 0);
+    for (i = 0; i < 200000; i++)
+        c5_mclib_track_health(&m, 2.0f, 0, C5_TRACK_ON);
+    c5_mclib_track_health(&m, 3.0f, 0, C5_TRACK_ON);
+    for (i = 0; i < 100000; i++)
+        c5_mclib_track_health(&m, 3.0f, 0, C5_TRACK_ON);
+    c5_mclib_take_health(&m, &h);
+    CHECK(h.drift < 0.01f && h.drift > -0.01f && h.slips == 0,
+          "an offset must fade back to the cycle");
+    float e = 0.0f;
+    for (i = 0; i < 800; i++) {
+        e += 0.01f;
+        if (e > 3.14159265f)
+            e -= 6.2831853f;
+        c5_mclib_track_health(&m, e, 0, C5_TRACK_ON);
+    }
+    for (i = 0; i < 100000; i++)
+        c5_mclib_track_health(&m, e, 0, C5_TRACK_ON);
+    c5_mclib_take_health(&m, &h);
+    CHECK(h.slips == 1 && h.drift > 6.27f && h.drift < 6.29f,
+          "a counted cycle must stay counted");
+}
+
+static void
 test_slip_modes(void)
 {
     struct c5_mclib_motor m;
@@ -404,11 +445,29 @@ test_slip_modes(void)
     c5_mclib_take_health(&m, &h);
     CHECK(h.tracked == 0, "moving mode must not track while holding");
 
+    // Holding still there's no back-EMF to follow: a gap, not a sample
     c5_mclib_slip_mode(&m, C5_SLIP_HOLDING);
     c5_mclib_update(&m, 200u, 0.0f, 0.0f, &out);
     c5_mclib_take_health(&m, &h);
-    CHECK(h.tracked == 1 && h.samples == 0,
-          "holding mode must track while holding");
+    CHECK(h.tracked == 0 && h.samples == 0,
+          "holding still without back-EMF must not be tracked");
+    CHECK(m.track_source == 0u, "a gap must not pick an angle source");
+
+    // Once the standstill part is learned, back-EMF from the rotor moving
+    // is tracked
+    for (uint32_t i = 0; i < 2100u; i++)
+        c5_mclib_update(&m, 300u + i, 0.0f, 0.0f, &out);
+    m.observer.filtered_injection_a = 0.0f;
+    m.observer.filtered_injection_b = 0.0f;
+    c5_mclib_take_health(&m, &h);
+    m.emf_resid_d = 1.0f;
+    m.emf_resid_q = 0.0f;
+    m.emf_base_d = -1.0f;
+    m.observer.filter_coefficient = 0.0f;
+    c5_mclib_update(&m, 5000u, 0.0f, 0.0f, &out);
+    c5_mclib_take_health(&m, &h);
+    CHECK(h.tracked == 1 && m.track_source == 2u,
+          "back-EMF while holding must be tracked");
 
     c5_mclib_disable(&m);
     c5_mclib_slip_mode(&m, C5_SLIP_ALWAYS);
@@ -1032,6 +1091,7 @@ main(void)
     test_stall_gating_and_wrap();
     test_health_counters();
     test_slip_tracking();
+    test_slip_gaps();
     test_slip_modes();
     test_hold_run_and_current_ramp();
     test_acquisition();

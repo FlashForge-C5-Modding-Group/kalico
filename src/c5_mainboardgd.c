@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include "autoconf.h" // CONFIG_CLOCK_FREQ
 #include "basecmd.h" // oid_alloc
+#include "board/internal.h" // DWT
 #include "board/irq.h" // irq_save
 #include "board/misc.h" // timer_read_time
 #include "c5_mainboardgd.h" // c5_mainboardgd_init_motors
@@ -113,7 +114,11 @@ uint8_t
 c5_mainboardgd_control(uint8_t axis, uint32_t now, float ia, float ib,
                        struct c5_mclib_output *out)
 {
-    return c5_mclib_update(get_motor(axis), now, ia, ib, out);
+    struct c5_mclib_motor *motor = get_motor(axis);
+    uint32_t start = DWT->CYCCNT;
+    uint8_t status = c5_mclib_update(motor, now, ia, ib, out);
+    c5_mclib_note_timing(motor, DWT->CYCCNT - start);
+    return status;
 }
 
 static struct c5_mclib_motor *
@@ -146,6 +151,8 @@ command_config_mclib(uint32_t *args)
     binding->motor->q_pi.kp = prepared.q_pi.kp;
     binding->motor->d_pi.ki = prepared.d_pi.ki;
     binding->motor->q_pi.ki = prepared.q_pi.ki;
+    binding->motor->pi_kp_base = prepared.pi_kp_base;
+    binding->motor->pi_ki_base = prepared.pi_ki_base;
     binding->motor->observer.a = prepared.observer.a;
     binding->motor->observer.b = prepared.observer.b;
     irq_restore(flag);
@@ -164,6 +171,10 @@ command_mclib_config_microstep(uint32_t *args)
     motor->exponent = prepared.exponent;
     motor->phase_increment = prepared.phase_increment;
     motor->stop_timeout = prepared.stop_timeout;
+    motor->crossover_threshold = prepared.crossover_threshold;
+    motor->crossover_hysteresis = prepared.crossover_hysteresis;
+    motor->damping_threshold = prepared.damping_threshold;
+    motor->slow_threshold = prepared.slow_threshold;
     irq_restore(flag);
 }
 DECL_COMMAND(command_mclib_config_microstep,
@@ -250,6 +261,30 @@ command_mclib_query_status(uint32_t *args)
 DECL_COMMAND(command_mclib_query_status, "mclib_query_status oid=%c");
 
 void
+command_mclib_query_timing(uint32_t *args)
+{
+    uint8_t oid = args[0];
+    struct c5_mclib_motor *motor = lookup_motor(oid);
+    struct c5_mclib_timing t;
+    irqstatus_t flag = irq_save();
+    c5_mclib_take_timing(motor, &t);
+    irq_restore(flag);
+    uint32_t d_integral = t.d_integral_samples
+        ? (uint32_t)(t.d_integral_sum * 1000.0f
+                     / (float)t.d_integral_samples) : 0u;
+    // RMS current error while holding, in microamps
+    uint32_t hold_noise = t.hold_noise_samples
+        ? (uint32_t)(__builtin_sqrtf(t.hold_noise_sum
+                                     / (float)t.hold_noise_samples)
+                     * 1000000.0f) : 0u;
+    sendf("mclib_timing oid=%c max=%u total=%u samples=%u"
+          " d_integral=%u d_samples=%u hold_noise=%u hold_samples=%u",
+          oid, t.max, t.total, t.samples, d_integral, t.d_integral_samples,
+          hold_noise, t.hold_noise_samples);
+}
+DECL_COMMAND(command_mclib_query_timing, "mclib_query_timing oid=%c");
+
+void
 command_mclib_config_slip(uint32_t *args)
 {
     struct c5_mclib_motor *motor = lookup_motor(args[0]);
@@ -258,6 +293,71 @@ command_mclib_config_slip(uint32_t *args)
     irq_restore(flag);
 }
 DECL_COMMAND(command_mclib_config_slip, "mclib_config_slip oid=%c mode=%c");
+
+void
+command_mclib_set_injection(uint32_t *args)
+{
+    struct c5_mclib_motor *motor = lookup_motor(args[0]);
+    irqstatus_t flag = irq_save();
+    c5_mclib_injection_scale(motor, args[1]);
+    irq_restore(flag);
+}
+DECL_COMMAND(command_mclib_set_injection,
+             "mclib_set_injection oid=%c scale=%u");
+
+void
+command_mclib_set_feedforward(uint32_t *args)
+{
+    struct c5_mclib_motor *motor = lookup_motor(args[0]);
+    irqstatus_t flag = irq_save();
+    c5_mclib_feedforward(motor, args[1]);
+    irq_restore(flag);
+}
+DECL_COMMAND(command_mclib_set_feedforward,
+             "mclib_set_feedforward oid=%c gain=%u");
+
+void
+command_mclib_set_pi_scale(uint32_t *args)
+{
+    struct c5_mclib_motor *motor = lookup_motor(args[0]);
+    irqstatus_t flag = irq_save();
+    c5_mclib_pi_scale(motor, args[1]);
+    irq_restore(flag);
+}
+DECL_COMMAND(command_mclib_set_pi_scale,
+             "mclib_set_pi_scale oid=%c percent=%u");
+
+void
+command_mclib_arm_harmonics(uint32_t *args)
+{
+    struct c5_mclib_motor *motor = lookup_motor(args[0]);
+    irqstatus_t flag = irq_save();
+    c5_mclib_arm_harmonics(motor);
+    irq_restore(flag);
+}
+DECL_COMMAND(command_mclib_arm_harmonics, "mclib_arm_harmonics oid=%c");
+
+// Mean load angle harmonic (cos, sin) in 1e-7 electrical radians. One
+// reply per query: a burst of replies overflows the transmit buffer.
+void
+command_mclib_query_harmonics(uint32_t *args)
+{
+    uint8_t oid = args[0], dir = args[1] ? 1u : 0u, harmonic = args[2];
+    struct c5_mclib_motor *motor = lookup_motor(oid);
+    if (harmonic < 1u || harmonic > C5_ANALYZE_HARMONICS)
+        shutdown("Invalid mclib harmonic");
+    float c[C5_ANALYZE_HARMONICS], s[C5_ANALYZE_HARMONICS];
+    uint32_t n;
+    irqstatus_t flag = irq_save();
+    c5_mclib_take_harmonics(motor, dir, c, s, &n);
+    irq_restore(flag);
+    float scale = n ? 2.0f * 1e7f / (float)n : 0.0f;
+    sendf("mclib_harmonics oid=%c dir=%c harmonic=%c count=%u c=%i s=%i",
+          oid, dir, harmonic, n, (int32_t)(c[harmonic - 1u] * scale),
+          (int32_t)(s[harmonic - 1u] * scale));
+}
+DECL_COMMAND(command_mclib_query_harmonics,
+             "mclib_query_harmonics oid=%c dir=%c harmonic=%c");
 
 void
 command_mclib_set_ripple(uint32_t *args)

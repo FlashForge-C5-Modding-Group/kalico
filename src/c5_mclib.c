@@ -372,6 +372,7 @@ observer_phase(struct c5_mclib_observer *o, float current,
         value = -o->injection_magnitude;
     else
         value = o->inner_slope * error;
+    value *= o->injection_scale;
     *injection = value;
     float estimate = o->b * (previous_voltage - value) + o->a * old_estimate;
     *filtered += o->filter_coefficient * (value - *filtered);
@@ -417,6 +418,8 @@ c5_mclib_init(struct c5_mclib_motor *m, uint8_t axis)
     m->hold_delay = 100000000u;
     m->ramp_ticks = 200000000u;
     m->crossover_threshold = 2343u;
+    m->crossover_hysteresis = 100u;
+    m->damping_threshold = 2468u;
     m->slow_threshold = 37500u;
     m->interpolation = 1u;
     m->slow = 1u;
@@ -458,6 +461,7 @@ c5_mclib_init(struct c5_mclib_motor *m, uint8_t axis)
     pi_reset(&m->q_pi);
     pi_reset(&m->outer_pi);
     m->observer.injection_magnitude = 36.0f;
+    m->observer.injection_scale = 1.0f;
     m->observer.error_threshold = 0.5f;
     m->observer.inner_slope = 72.0f;
     m->observer.filter_coefficient = 0x1.a8ebd0p-3f;
@@ -487,8 +491,20 @@ c5_mclib_configure(struct c5_mclib_motor *m,
     m->q_pi.kp = proportional;
     m->d_pi.ki = integral;
     m->q_pi.ki = integral;
+    m->pi_kp_base = proportional;
+    m->pi_ki_base = integral;
     m->observer.a = observer_a;
     m->observer.b = observer_b;
+}
+
+// Step-period thresholds were tuned at 16 microsteps (exponent 4); keep
+// them at the same motor speed for other microstep settings
+static uint32_t
+scale_step_ticks(uint32_t ticks, uint16_t exponent)
+{
+    if (exponent >= 4u)
+        return ticks >> (exponent - 4u);
+    return ticks << (4u - exponent);
 }
 
 void
@@ -499,6 +515,10 @@ c5_mclib_microstep(struct c5_mclib_motor *m,
     m->exponent = exponent;
     m->phase_increment = (uint16_t)arm_lsl(1u, 14u - exponent);
     m->stop_timeout = arm_lsl(8333333u, 8u - exponent);
+    m->crossover_threshold = scale_step_ticks(2343u, exponent);
+    m->crossover_hysteresis = scale_step_ticks(100u, exponent);
+    m->damping_threshold = scale_step_ticks(2468u, exponent);
+    m->slow_threshold = scale_step_ticks(37500u, exponent);
 }
 
 void
@@ -693,6 +713,7 @@ c5_mclib_enable(struct c5_mclib_motor *m, uint32_t now)
     m->reference_d = m->active_current * cosine;
     m->reference_q = m->active_current * sine;
     m->mode = MODE_HOLD;
+    m->emf_learned = 0u;
 }
 
 void
@@ -713,6 +734,32 @@ c5_mclib_disable(struct c5_mclib_motor *m)
 // near +-pi in one direction, so follow it unwrapped instead of counting
 // wraps; the hysteresis keeps noise at a cycle boundary from counting.
 #define SLIP_HYSTERESIS 0.5f
+// The drift off the nearest whole cycle fades with a ~1 s time constant: a
+// real slip takes a few tens of ms, while the small offsets left at each
+// switch between angle sources and gaps would otherwise add up over a print.
+#define SLIP_LEAK 5e-5f
+// Below the fast-move speed the angle comes from the observer's back-EMF
+// estimate minus its standstill part (emf_base), only while what is left is
+// over SLIP_GATE volts: under that the rotor is (nearly) still and the angle
+// is noise, and the reference is kept until it's back. The back-EMF only
+// gives the rotor angle up to pi (it flips with the rotor's direction), so
+// of the two the one nearest the last is taken.
+#define SLIP_GATE 0.25f
+// what is left is low-passed at ~130 Hz first (current sense noise), unless
+// it's over EMF_RAW_GATE: well clear of the noise, and a rotor running away
+// turns faster than the filter follows
+#define EMF_RESID_LP 0.04f
+#define EMF_RAW_GATE_SQUARED (1.0f * 1.0f)
+#define SLIP_GATE_SQUARED (SLIP_GATE * SLIP_GATE)
+// emf_base follows with ~0.1 s, from samples within EMF_LEARN_GATE of it
+// (a slip in progress isn't learned); the first EMF_WARMUP samples after
+// enabling learn faster and take everything.
+#define EMF_LEARN 5e-4f
+#define EMF_LEARN_FAST 5e-3f
+#define EMF_LEARN_GATE_SQUARED (0.6f * 0.6f)
+#define EMF_WARMUP 2000u
+#define SLIP_RATE_MARGIN 3.0f
+#define CONTROL_PERIOD 5e-5f
 
 void
 c5_mclib_slip_mode(struct c5_mclib_motor *m, uint8_t mode)
@@ -730,13 +777,17 @@ c5_mclib_track_health(struct c5_mclib_motor *m, float error, uint8_t armed,
     if (m->stall && !h->stall_prev)
         h->stall_count++;
     h->stall_prev = m->stall;
-    if (!tracking) {
+    if (tracking == C5_TRACK_OFF) {
         h->last_valid = 0u;
         return;
     }
+    if (tracking == C5_TRACK_GAP)
+        return;
     if (!h->last_valid) {
         h->drift = 0.0f;
         h->level = 0;
+    } else if (h->last_valid == 2u) {
+        // switched angle source: this sample is the new reference
     } else {
         float step = error - h->last_error;
         if (step > ANGLE_PI_CORRECTION)
@@ -747,6 +798,8 @@ c5_mclib_track_health(struct c5_mclib_motor *m, float error, uint8_t armed,
     }
     h->last_error = error;
     h->last_valid = 1u;
+    h->drift -= SLIP_LEAK * (h->drift
+                             - (float)h->level * ANGLE_TAU_CORRECTION);
     while (h->drift > ((float)h->level + 0.5f) * ANGLE_TAU_CORRECTION
            + SLIP_HYSTERESIS) {
         h->level++;
@@ -784,6 +837,82 @@ c5_mclib_track_health(struct c5_mclib_motor *m, float error, uint8_t armed,
         h->samples++;
 }
 
+// Commanded electrical speed in rad/s, signed (0 while holding)
+static float
+commanded_omega(const struct c5_mclib_motor *m)
+{
+    if (m->mode != MODE_RUN)
+        return 0.0f;
+    uint32_t period = m->interpolation && m->step_period
+        ? m->step_period : m->last_period;
+    if ((int32_t)m->elapsed > (int32_t)period)
+        period = m->elapsed;
+    if (!period)
+        return 0.0f;
+    float omega = ANGLE_TAU * MOTOR_TIME_HZ
+        / ((float)period * (float)(4u << m->exponent));
+    return m->direction ? omega : -omega;
+}
+
+// Angle error below the fast-move speed, from the back-EMF estimate with its
+// standstill part taken out. Returns 0 when it can't be trusted.
+static uint8_t
+low_speed_error(struct c5_mclib_motor *m, float *error, float *max_step)
+{
+    struct c5_mclib_observer *o = &m->observer;
+    float sine, cosine, zd, zq;
+    sine_cosine(m->command_angle, &sine, &cosine);
+    forward_transform(o->filtered_injection_a, o->filtered_injection_b,
+                      sine, cosine, &zd, &zq);
+    float omega = commanded_omega(m);
+    // Learn the standstill part when (nearly) still: the back-EMF expected
+    // at the commanded speed is -motor_constant * omega on d.
+    if (m->mode == MODE_HOLD || m->slow) {
+        float dd = zd + m->motor_constant * omega - m->emf_base_d;
+        float dq = zq - m->emf_base_q;
+        if (m->emf_learned < EMF_WARMUP) {
+            m->emf_base_d += EMF_LEARN_FAST * dd;
+            m->emf_base_q += EMF_LEARN_FAST * dq;
+            m->emf_learned++;
+        } else if (dd * dd + dq * dq < EMF_LEARN_GATE_SQUARED) {
+            m->emf_base_d += EMF_LEARN * dd;
+            m->emf_base_q += EMF_LEARN * dq;
+        }
+    }
+    if (m->emf_learned < EMF_WARMUP)
+        return 0u;
+    m->emf_resid_d += EMF_RESID_LP * (zd - m->emf_base_d - m->emf_resid_d);
+    m->emf_resid_q += EMF_RESID_LP * (zq - m->emf_base_q - m->emf_resid_q);
+    float rd = zd - m->emf_base_d, rq = zq - m->emf_base_q;
+    if (rd * rd + rq * rq < EMF_RAW_GATE_SQUARED) {
+        rd = m->emf_resid_d;
+        rq = m->emf_resid_q;
+        if (rd * rd + rq * rq < SLIP_GATE_SQUARED)
+            return 0u;
+    }
+    // The angle can't turn faster than the rotor speed this back-EMF
+    // means (plus the command's); a faster swing is the vector passing near
+    // zero as the rotor turns around.
+    float rotor = sqrt_positive(rd * rd + rq * rq) / m->motor_constant;
+    *max_step = SLIP_RATE_MARGIN * CONTROL_PERIOD
+        * (rotor + __builtin_fabsf(omega)) + 0.01f;
+    float ra, rb;
+    inverse_transform(rd, rq, sine, cosine, &ra, &rb);
+    float angle = atan_like(-ra, rb)
+        + atan_like(omega, o->compensation_denominator);
+    float e;
+    if (m->axis < 2u || m->direction)
+        e = m->command_angle - angle + 0x1.921fb8p+0f;
+    else
+        e = angle - m->command_angle + 0x1.921fb8p+0f;
+    while (e > ANGLE_PI_CORRECTION)
+        e -= ANGLE_TAU_CORRECTION;
+    while (e < -ANGLE_PI_CORRECTION)
+        e += ANGLE_TAU_CORRECTION;
+    *error = e;
+    return 1u;
+}
+
 static void
 update_stall_state(struct c5_mclib_motor *m, float ia, float ib,
                    float initial_error)
@@ -799,17 +928,67 @@ update_stall_state(struct c5_mclib_motor *m, float ia, float ib,
     uint8_t armed = !m->hold_transition && !m->slow
         && m->quarter_count >= 17u;
     m->stall = decision && armed;
-    uint8_t tracking = armed
+    uint8_t wanted = armed
         || (m->slip_mode == C5_SLIP_HOLDING && m->mode == MODE_HOLD)
         || (m->slip_mode == C5_SLIP_ALWAYS && m->mode != MODE_DISABLED);
-    c5_mclib_track_health(m, initial_error, armed, tracking);
+    // Fast moves use the observer's angle, anything slower the low-speed
+    // estimate. A switch between them, or an untrusted sample, is a gap.
+    uint8_t source = 0u, tracking = C5_TRACK_OFF;
+    float error = initial_error, max_step = 0.0f;
+    if (armed) {
+        source = 1u;
+        tracking = C5_TRACK_ON;
+    } else if (wanted) {
+        source = 2u;
+        tracking = low_speed_error(m, &error, &max_step)
+            ? C5_TRACK_ON : C5_TRACK_GAP;
+    } else if (m->mode != MODE_DISABLED) {
+        low_speed_error(m, &error, &max_step);   // keep emf_base learned
+        error = initial_error;
+    }
+    struct c5_mclib_health *h = &m->health;
+    if (tracking == C5_TRACK_ON && source != m->track_source
+        && h->last_valid)
+        h->last_valid = 2u;
+    else if (tracking == C5_TRACK_ON && source == 2u && h->last_valid) {
+        float d = error - h->last_error;
+        if (d > ANGLE_PI_CORRECTION)
+            d -= ANGLE_TAU_CORRECTION;
+        else if (d < -ANGLE_PI_CORRECTION)
+            d += ANGLE_TAU_CORRECTION;
+        if (d > ANGLE_HALF_PI)
+            error -= ANGLE_PI;
+        else if (d < -ANGLE_HALF_PI)
+            error += ANGLE_PI;
+        if (error > ANGLE_PI_CORRECTION)
+            error -= ANGLE_TAU_CORRECTION;
+        else if (error < -ANGLE_PI_CORRECTION)
+            error += ANGLE_TAU_CORRECTION;
+        d = error - h->last_error;
+        if (d > ANGLE_PI_CORRECTION)
+            d -= ANGLE_TAU_CORRECTION;
+        else if (d < -ANGLE_PI_CORRECTION)
+            d += ANGLE_TAU_CORRECTION;
+        if (__builtin_fabsf(d) > max_step * (float)(m->skipped + 1u))
+            tracking = C5_TRACK_GAP;
+    }
+    if (tracking == C5_TRACK_GAP) {
+        if (m->skipped != UINT16_MAX)
+            m->skipped++;
+    } else {
+        m->skipped = 0u;
+    }
+    if (tracking != C5_TRACK_GAP)
+        m->track_source = source;
+    c5_mclib_track_health(m, error, armed, tracking);
 }
 
 static void
 run_state_update(struct c5_mclib_motor *m, float initial_error)
 {
     if (m->axis < 2u) {
-        if (m->last_period < m->crossover_threshold - 100u
+        if (m->last_period
+            < m->crossover_threshold - m->crossover_hysteresis
             && !m->fast_mode) {
             float sine, cosine;
             sine_cosine(initial_error, &sine, &cosine);
@@ -821,7 +1000,8 @@ run_state_update(struct c5_mclib_motor *m, float initial_error)
                 - speed_term * m->reference_q;
             m->fast_mode = 1u;
         }
-        if (m->last_period > m->crossover_threshold + 100u)
+        if (m->last_period
+            > m->crossover_threshold + m->crossover_hysteresis)
             m->fast_mode = 0u;
     }
 
@@ -875,13 +1055,38 @@ hold_current_update(struct c5_mclib_motor *m)
     m->active_current = next > m->hold_current ? next : m->hold_current;
 }
 
+#define FEEDFORWARD_LIMIT (0.75f * VOLTAGE_LIMIT)
+
+// d-axis voltage the motor needs at the commanded speed: back-EMF plus the
+// L*w*iq cross-coupling, so the PI only corrects what is left
+static float
+feedforward_d(const struct c5_mclib_motor *m)
+{
+    if (m->mode != MODE_RUN || m->slow || m->axis >= 2u)
+        return 0.0f;
+    uint32_t period = m->interpolation && m->step_period
+        ? m->step_period : m->last_period;
+    if ((int32_t)m->elapsed > (int32_t)period)
+        period = m->elapsed;
+    if (!period)
+        return 0.0f;
+    float omega = ANGLE_TAU * MOTOR_TIME_HZ
+        / ((float)period * (float)(4u << m->exponent));
+    if (!m->direction)
+        omega = -omega;
+    float v = -omega * (m->inductance * m->reference_q
+                        + m->motor_constant);
+    v = clip_upper_lower(v, -FEEDFORWARD_LIMIT, FEEDFORWARD_LIMIT);
+    return m->feedforward_gain * v;
+}
+
 static void
 nonfast_control(struct c5_mclib_motor *m, float ia, float ib,
                 float *sine, float *cosine)
 {
     m->reference_d = 0.0f;
     m->reference_q = m->active_current;
-    if (m->axis < 2u && m->last_period >= 2468u) {
+    if (m->axis < 2u && m->last_period >= m->damping_threshold) {
         static const float multiplier[3] = { 1.0f, 2.0f, 4.0f };
         float compensation = 0.0f;
         for (uint8_t i = 0; i < 3u; i++) {
@@ -902,6 +1107,19 @@ nonfast_control(struct c5_mclib_motor *m, float ia, float ib,
                       &m->measured_d, &m->measured_q);
     m->requested_d = pi_update(&m->d_pi, m->reference_d, m->measured_d);
     m->requested_q = pi_update(&m->q_pi, m->reference_q, m->measured_q);
+    if (m->mode == MODE_HOLD) {
+        float ed = m->measured_d - m->reference_d;
+        float eq = m->measured_q - m->reference_q;
+        m->timing.hold_noise_sum += ed * ed + eq * eq;
+        m->timing.hold_noise_samples++;
+    }
+    if (m->mode == MODE_RUN && !m->slow && m->axis < 2u) {
+        float d_int = m->d_pi.integral;
+        m->timing.d_integral_sum += d_int < 0.0f ? -d_int : d_int;
+        m->timing.d_integral_samples++;
+    }
+    if (m->feedforward_gain > 0.0f)
+        m->requested_d += feedforward_d(m);
 
     if (m->requested_d > VOLTAGE_LIMIT) {
         m->requested_d = VOLTAGE_LIMIT;
@@ -969,6 +1187,37 @@ pwm_phase(float voltage, uint32_t *compare, uint8_t *negative)
     }
 }
 
+// The load angle (commanded minus observed, in electrical radians): its
+// slow part is the load, the rest is the rotor leading and lagging plus the
+// observer's own error. Its harmonics against the commanded angle can be
+// measured, in non-fast moves on X/Y above the slow threshold. (Feeding it
+// back as d current was tried: the observer's large 4th harmonic error went
+// straight into the motor.)
+#define LOAD_ANGLE_LP 0.0025f       // ~8 Hz at 20 kHz
+
+static void
+load_angle_update(struct c5_mclib_motor *m, float error)
+{
+    uint8_t moving = m->axis < 2u && m->mode == MODE_RUN && !m->fast_mode
+        && !m->slow;
+    if (!moving) {
+        m->load_angle_lp = error;
+        return;
+    }
+    m->load_angle_lp += LOAD_ANGLE_LP * (error - m->load_angle_lp);
+    float ac = error - m->load_angle_lp;
+    if (m->harm_armed) {
+        uint8_t dir = m->direction ? 1u : 0u;
+        for (uint8_t i = 0; i < C5_ANALYZE_HARMONICS; i++) {
+            float sine, cosine;
+            sine_cosine((float)(i + 1u) * m->command_angle, &sine, &cosine);
+            m->harm_cos[dir][i] += ac * cosine;
+            m->harm_sin[dir][i] += ac * sine;
+        }
+        m->harm_count[dir]++;
+    }
+}
+
 uint8_t
 c5_mclib_update(struct c5_mclib_motor *m, uint32_t now,
                  float ia, float ib, struct c5_mclib_output *out)
@@ -1001,6 +1250,7 @@ c5_mclib_update(struct c5_mclib_motor *m, uint32_t now,
     else if (initial_error < -ANGLE_PI_CORRECTION)
         initial_error += ANGLE_TAU_CORRECTION;
     update_stall_state(m, ia, ib, initial_error);
+    load_angle_update(m, initial_error);
 
     if (m->mode == MODE_RUN)
         run_state_update(m, initial_error);
@@ -1047,6 +1297,86 @@ c5_mclib_take_health(struct c5_mclib_motor *m, struct c5_mclib_health *out)
     m->health.stall_count = 0u;
     m->health.samples = 0u;
     m->health.tracked = 0u;
+}
+
+void
+c5_mclib_note_timing(struct c5_mclib_motor *m, uint32_t cycles)
+{
+    if (cycles > m->timing.max)
+        m->timing.max = cycles;
+    m->timing.total += cycles;
+    if (m->timing.samples != UINT32_MAX)
+        m->timing.samples++;
+}
+
+void
+c5_mclib_take_timing(struct c5_mclib_motor *m,
+                     struct c5_mclib_timing *out)
+{
+    *out = m->timing;
+    m->timing.max = 0;
+    m->timing.total = 0;
+    m->timing.samples = 0;
+    m->timing.d_integral_sum = 0.0f;
+    m->timing.d_integral_samples = 0;
+    m->timing.hold_noise_sum = 0.0f;
+    m->timing.hold_noise_samples = 0;
+}
+
+void
+c5_mclib_pi_scale(struct c5_mclib_motor *m, uint32_t percent)
+{
+    if (percent < 25u)
+        percent = 25u;
+    if (percent > 400u)
+        percent = 400u;
+    if (m->pi_kp_base == 0.0f) {
+        m->pi_kp_base = m->d_pi.kp;
+        m->pi_ki_base = m->d_pi.ki;
+    }
+    float s = (float)percent / 100.0f;
+    m->d_pi.kp = m->q_pi.kp = m->pi_kp_base * s;
+    m->d_pi.ki = m->q_pi.ki = m->pi_ki_base * s;
+}
+
+void
+c5_mclib_arm_harmonics(struct c5_mclib_motor *m)
+{
+    memset(m->harm_cos, 0, sizeof(m->harm_cos));
+    memset(m->harm_sin, 0, sizeof(m->harm_sin));
+    m->harm_count[0] = m->harm_count[1] = 0u;
+    m->harm_armed = 1u;
+}
+
+void
+c5_mclib_take_harmonics(struct c5_mclib_motor *m, uint8_t dir,
+                        float *cosines, float *sines, uint32_t *count)
+{
+    dir = dir ? 1u : 0u;
+    for (uint8_t i = 0; i < C5_ANALYZE_HARMONICS; i++) {
+        cosines[i] = m->harm_cos[dir][i];
+        sines[i] = m->harm_sin[dir][i];
+    }
+    *count = m->harm_count[dir];
+}
+
+void
+c5_mclib_feedforward(struct c5_mclib_motor *m, uint32_t percent)
+{
+    if (percent > 100u)
+        percent = 100u;
+    m->feedforward_gain = (float)percent / 100.0f;
+}
+
+void
+c5_mclib_injection_scale(struct c5_mclib_motor *m, uint32_t percent)
+{
+    float scale = (float)percent / 100.0f;
+    if (scale > 1.0f)
+        scale = 1.0f;
+    if (scale < 0.1f)
+        scale = 0.1f;
+    m->observer.injection_scale = scale;
 }
 
 void

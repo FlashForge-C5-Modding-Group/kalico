@@ -23,6 +23,7 @@ stepper_id = {'stepper_x':0, 'stepper_y':1, 'stepper_z':2, 'extruder':3}
 class MCLIB:
     def __init__(self, config):
         self.printer = config.get_printer()
+        self.reactor = self.printer.get_reactor()
         self.stepper_name = " ".join(config.get_name().split()[1:])
         self.name = config.get_name().split()[-1]
         if not config.has_section(self.stepper_name):
@@ -43,6 +44,10 @@ class MCLIB:
         self.hold_current = int(config.getfloat('hold_current', run_current, minval=0., maxval=run_current)* 1000)
         self.interpolate = config.getboolean('interpolate', True)
         self.stall_threshold = int(config.getfloat('stall_threshold', self.bus_voltage, above=0.)* 1000)
+        self.feedforward = config.getint('feedforward', 0, minval=0, maxval=100)
+        # current PI bandwidth in percent of stock (1 kHz)
+        self.pi_scale = config.getint('current_bandwidth', 100, minval=25,
+                                      maxval=400)
         self.td1_amp = int(config.getfloat('td1_amp', 0., minval=0., maxval=run_current)* 1000)
         self.td1_phase1 = int(config.getfloat('td1_phase1', 0.)* 1000)
         self.td1_phase2 = int(config.getfloat('td1_phase2', 0.)* 1000)
@@ -90,11 +95,31 @@ class MCLIB:
         self.query_status_cmd = None
         self.set_stall_cmd = None
         self.set_slip_cmd = None
+        self.query_timing_cmd = None
+        self.last_timing = None
         self.health = self._empty_health()
         self.last_status = None
         gcode.register_mux_command("MCLIB_SET_STALL", "STEPPER", self.name,
                                    self.cmd_MCLIB_SET_STALL,
                                    desc=self.cmd_MCLIB_SET_STALL_help)
+        gcode.register_mux_command("MCLIB_TIMING", "STEPPER", self.name,
+                                   self.cmd_MCLIB_TIMING,
+                                   desc=self.cmd_MCLIB_TIMING_help)
+
+        self.set_injection_cmd = None
+        self.set_feedforward_cmd = None
+        self.set_pi_scale_cmd = None
+        self.arm_harmonics_cmd = self.query_harmonics_cmd = None
+        self.harmonics = {}
+        gcode.register_mux_command("MCLIB_SET_BANDWIDTH", "STEPPER",
+                                   self.name, self.cmd_MCLIB_SET_BANDWIDTH,
+                                   desc=self.cmd_MCLIB_SET_BANDWIDTH_help)
+        gcode.register_mux_command("MCLIB_SET_FEEDFORWARD", "STEPPER",
+                                   self.name, self.cmd_MCLIB_SET_FEEDFORWARD,
+                                   desc=self.cmd_MCLIB_SET_FEEDFORWARD_help)
+        gcode.register_mux_command("MCLIB_SET_INJECTION", "STEPPER", self.name,
+                                   self.cmd_MCLIB_SET_INJECTION,
+                                   desc=self.cmd_MCLIB_SET_INJECTION_help)
 
         self.set_resonance_damp_cmd = None
         if self.name != 'extruder':
@@ -142,6 +167,37 @@ class MCLIB:
                                        self.oid)
         self.set_slip_cmd = self.mcu.try_lookup_command(
             "mclib_config_slip oid=%c mode=%c")
+        # Control-loop duration counts; absent on older firmware
+        self.query_timing_cmd = self.mcu.try_lookup_command(
+            "mclib_query_timing oid=%c")
+        if self.query_timing_cmd is not None:
+            self.mcu.register_response(self._handle_timing, "mclib_timing",
+                                       self.oid)
+        # Observer injection scale; absent on older firmware
+        self.set_injection_cmd = self.mcu.try_lookup_command(
+            "mclib_set_injection oid=%c scale=%u")
+        self.set_feedforward_cmd = self.mcu.try_lookup_command(
+            "mclib_set_feedforward oid=%c gain=%u")
+        if self.set_feedforward_cmd is not None and self.feedforward:
+            self.mcu.add_config_cmd("mclib_set_feedforward oid=%d gain=%u"
+                                    % (self.oid, self.feedforward))
+        # Current bandwidth and the load angle analysis; absent on older
+        # firmware
+        self.set_pi_scale_cmd = self.mcu.try_lookup_command(
+            "mclib_set_pi_scale oid=%c percent=%u")
+        if self.set_pi_scale_cmd is not None and self.pi_scale != 100:
+            self.mcu.add_config_cmd("mclib_set_pi_scale oid=%d percent=%u"
+                                    % (self.oid, self.pi_scale))
+        self.arm_harmonics_cmd = self.mcu.try_lookup_command(
+            "mclib_arm_harmonics oid=%c")
+        self.query_harmonics_cmd = self.mcu.try_lookup_command(
+            "mclib_query_harmonics oid=%c dir=%c harmonic=%c")
+        if self.query_harmonics_cmd is not None:
+            self.mcu.register_response(self._handle_harmonics,
+                                       "mclib_harmonics", self.oid)
+        if self.pi_scale != 100 and self.set_pi_scale_cmd is None:
+            logging.warning("%s: current_bandwidth needs newer mainboard"
+                            " firmware", self.name)
 
         if self.name != 'extruder':
             # Older mainboard firmware has no ripple correction
@@ -267,6 +323,113 @@ class MCLIB:
             return False
         self.query_status_cmd.send([self.oid])
         return True
+
+    def query_timing(self):
+        """Ask the MCU for control-loop cycle counts since the last query.
+        The reply lands in self.last_timing."""
+        if self.query_timing_cmd is None:
+            return False
+        self.query_timing_cmd.send([self.oid])
+        return True
+
+    def _handle_timing(self, params):
+        self.last_timing = params
+
+    # Load angle harmonics
+    def has_harmonics(self):
+        return self.query_harmonics_cmd is not None
+
+    def arm_harmonics(self):
+        self.arm_harmonics_cmd.send([self.oid])
+
+    def _handle_harmonics(self, params):
+        self.harmonics[(params['dir'], params['harmonic'])] = params
+
+    def read_harmonics(self):
+        """{(direction, harmonic): (complex electrical rad, samples)} of
+        the load angle since arm_harmonics(); direction 1 forward."""
+        self.harmonics = {}
+        for d in (0, 1):
+            for k in range(1, 9):
+                self.query_harmonics_cmd.send([self.oid, d, k])
+                for _ in range(20):
+                    if (d, k) in self.harmonics:
+                        break
+                    self.reactor.pause(self.reactor.monotonic() + 0.02)
+                else:
+                    raise self.printer.command_error(
+                        "%s: no load angle harmonic %d from the MCU"
+                        % (self.name, k))
+        return {key: (complex(p['c'], p['s']) * 1e-7, p['count'])
+                for key, p in self.harmonics.items()}
+
+    cmd_MCLIB_SET_BANDWIDTH_help = ("Set the current controller bandwidth in"
+                                    " percent of stock (PERCENT, 100 = 1 kHz)")
+    def cmd_MCLIB_SET_BANDWIDTH(self, gcmd):
+        if self.set_pi_scale_cmd is None:
+            raise gcmd.error("%s: firmware has no mclib_set_pi_scale"
+                             % (self.name,))
+        percent = gcmd.get_int('PERCENT', minval=25, maxval=400)
+        self.set_pi_scale_cmd.send([self.oid, percent])
+        self.pi_scale = percent
+        gcmd.respond_info("%s: current bandwidth %d%% (until restart; set"
+                          " current_bandwidth in [mclib %s] to keep it)"
+                          % (self.name, percent, self.name))
+
+    cmd_MCLIB_TIMING_help = ("Report control loop duration in CPU cycles"
+                             " (max and average) since the last query")
+    def cmd_MCLIB_TIMING(self, gcmd):
+        if self.query_timing_cmd is None:
+            raise gcmd.error("%s: firmware has no mclib_query_timing"
+                             % (self.name,))
+        self.last_timing = None
+        self.query_timing_cmd.send([self.oid])
+        for _ in range(20):
+            if self.last_timing is not None:
+                break
+            self.reactor.pause(self.reactor.monotonic() + 0.05)
+        t = self.last_timing
+        if t is None:
+            raise gcmd.error("%s: no timing response" % (self.name,))
+        average = (float(t['total']) / t['samples']) if t['samples'] else 0.
+        msg = ("%s: max %u cycles, avg %.0f cycles over %u control updates"
+               % (self.name, t['max'], average, t['samples']))
+        if t.get('d_samples'):
+            msg += ("\n%s: d-axis PI integral avg %.3f V over %u moving"
+                    " updates (feedforward %d%%)"
+                    % (self.name, t['d_integral'] / 1000., t['d_samples'],
+                       self.feedforward))
+        if t.get('hold_samples'):
+            msg += ("\n%s: current noise while holding %.1f mA RMS over %u"
+                    " updates" % (self.name, t['hold_noise'] / 1000.,
+                                  t['hold_samples']))
+        gcmd.respond_info(msg)
+
+    cmd_MCLIB_SET_FEEDFORWARD_help = ("Set the d-axis back-EMF and"
+                                      " cross-coupling feedforward"
+                                      " (percent, 0 = off)")
+    def cmd_MCLIB_SET_FEEDFORWARD(self, gcmd):
+        if self.set_feedforward_cmd is None:
+            raise gcmd.error("%s: firmware has no mclib_set_feedforward"
+                             % (self.name,))
+        gain = gcmd.get_int('GAIN', minval=0, maxval=100)
+        self.set_feedforward_cmd.send([self.oid, gain])
+        self.feedforward = gain
+        gcmd.respond_info("%s: feedforward %d%% (until restart; set"
+                          " feedforward in [mclib %s] to keep it)"
+                          % (self.name, gain, self.name))
+
+    cmd_MCLIB_SET_INJECTION_help = ("Scale the observer's high-frequency"
+                                    " injection (percent, 100 = stock)"
+                                    " for bench experiments")
+    def cmd_MCLIB_SET_INJECTION(self, gcmd):
+        if self.set_injection_cmd is None:
+            raise gcmd.error("%s: firmware has no mclib_set_injection"
+                             % (self.name,))
+        scale = gcmd.get_int('SCALE', 100, minval=10, maxval=100)
+        self.set_injection_cmd.send([self.oid, scale])
+        gcmd.respond_info("%s: injection scale %d%% (until restart)"
+                          % (self.name, scale))
 
     def take_health(self):
         h, self.health = self.health, self._empty_health()

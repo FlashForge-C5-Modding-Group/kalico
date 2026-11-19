@@ -6,9 +6,10 @@
 
 AXES = ('stepper_x', 'stepper_y', 'stepper_z')
 ACTIONS = ('warn', 'pause')
-# When the firmware follows the angle drift for skipped steps. Prints always
-# use moving: holding and always count false slips while printing, so they
-# only apply in test mode (pulling the carriage by hand).
+# When the firmware follows the angle drift for skipped steps: fast moves
+# only, also while holding still, or always (slow moves too). Holding and
+# always need the mainboard firmware with the low-speed estimate; older
+# firmware counts false slips with them.
 SLIP_WATCH = {'moving': 0, 'holding': 1, 'always': 2}
 
 
@@ -74,7 +75,7 @@ class C5MotionGuard:
 
     def _send_slip_watch(self, real_print=False):
         mode = 0
-        if self.test_mode and not real_print:
+        if self.test_mode or real_print:
             mode = SLIP_WATCH[self.slip_watch]
         if mode == self.sent_mode:
             return self.sent_ok
