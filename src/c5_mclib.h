@@ -33,12 +33,26 @@ struct c5_mclib_observer {
 // electrical cycles lost or gained (a cycle is four full steps), the
 // torque range, and how far the angle error drifted from where it was when
 // the stall detector armed.
+// One counted slip (kind 0) or a tracking stretch that ended with slips
+// still counted (kind 1), with the motor state at that moment
+#define C5_SLIP_LOG 16
+struct c5_mclib_slip_event {
+    uint32_t step_time, period, segment;
+    float error, step, drift, speed, omega;
+    int8_t level;
+    uint8_t kind, source, mode, fast_mode, slow, direction;
+};
+
 struct c5_mclib_health {
     float torque_min, torque_max, error_min, error_max, last_error;
     float drift;
     int32_t slips, level;
     uint32_t slip_total, stall_count, samples, tracked;
     uint8_t last_valid, stall_prev;
+    // samples since this tracking stretch began
+    uint32_t segment;
+    struct c5_mclib_slip_event log[C5_SLIP_LOG];
+    uint8_t log_count, log_next;
 };
 
 // Control loop duration bookkeeping: max and total cycles spent in the
@@ -189,6 +203,10 @@ void c5_mclib_slip_mode(struct c5_mclib_motor *m, uint8_t mode);
 #define C5_TRACK_GAP 2u
 void c5_mclib_track_health(struct c5_mclib_motor *m, float error,
                            uint8_t armed, uint8_t tracking);
+// Slip log: index 0 is the oldest kept event; returns 0 past the end
+uint8_t c5_mclib_slip_event(const struct c5_mclib_motor *m, uint8_t index,
+                            struct c5_mclib_slip_event *out);
+void c5_mclib_clear_slip_log(struct c5_mclib_motor *m);
 void c5_mclib_acq_init(struct c5_mclib_acq *a);
 uint8_t c5_mclib_acquire(struct c5_mclib_acq *a,
                          int16_t raw0, int16_t raw1, float *ia, float *ib);

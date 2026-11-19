@@ -105,6 +105,11 @@ class MCLIB:
         gcode.register_mux_command("MCLIB_TIMING", "STEPPER", self.name,
                                    self.cmd_MCLIB_TIMING,
                                    desc=self.cmd_MCLIB_TIMING_help)
+        self.query_slip_cmd = self.clear_slip_cmd = None
+        self.slip_events = {}
+        gcode.register_mux_command("MCLIB_SLIP_LOG", "STEPPER", self.name,
+                                   self.cmd_MCLIB_SLIP_LOG,
+                                   desc=self.cmd_MCLIB_SLIP_LOG_help)
 
         self.set_injection_cmd = None
         self.set_feedforward_cmd = None
@@ -173,6 +178,14 @@ class MCLIB:
         if self.query_timing_cmd is not None:
             self.mcu.register_response(self._handle_timing, "mclib_timing",
                                        self.oid)
+        # Slip log; absent on older firmware
+        self.query_slip_cmd = self.mcu.try_lookup_command(
+            "mclib_query_slip_event oid=%c index=%c")
+        self.clear_slip_cmd = self.mcu.try_lookup_command(
+            "mclib_clear_slip_log oid=%c")
+        if self.query_slip_cmd is not None:
+            self.mcu.register_response(self._handle_slip_event,
+                                       "mclib_slip_event", self.oid)
         # Observer injection scale; absent on older firmware
         self.set_injection_cmd = self.mcu.try_lookup_command(
             "mclib_set_injection oid=%c scale=%u")
@@ -334,6 +347,46 @@ class MCLIB:
 
     def _handle_timing(self, params):
         self.last_timing = params
+
+    def _handle_slip_event(self, params):
+        self.slip_events[params['index']] = params
+
+    cmd_MCLIB_SLIP_LOG_help = ("List the last 16 counted slips with the motor"
+                               " state at each (CLEAR=1 empties it)")
+    def cmd_MCLIB_SLIP_LOG(self, gcmd):
+        if self.query_slip_cmd is None:
+            raise gcmd.error("%s: firmware has no slip log" % (self.name,))
+        if gcmd.get_int('CLEAR', 0):
+            self.clear_slip_cmd.send([self.oid])
+            gcmd.respond_info("%s: slip log cleared" % (self.name,))
+            return
+        lines = []
+        for index in range(16):
+            self.slip_events.pop(index, None)
+            self.query_slip_cmd.send([self.oid, index])
+            for _ in range(20):
+                if index in self.slip_events:
+                    break
+                self.reactor.pause(self.reactor.monotonic() + 0.02)
+            e = self.slip_events.get(index)
+            if e is None or not e['valid']:
+                break
+            state = e['state']
+            mode = {0: 'off', 1: 'hold', 2: 'run'}.get(state & 3, '?')
+            lines.append(
+                "%s %s src=%s %s%s%s %s level=%d after %d samples"
+                " step_time=%u period=%u error=%.3f step=%.3f drift=%.3f"
+                " observer=%d cmd=%d rad/s"
+                % ('slip' if not e['kind'] else 'ended counted',
+                   'fwd' if state & 16 else 'rev',
+                   {1: 'fast', 2: 'low'}.get(e['source'], e['source']),
+                   mode, ' fast_mode' if state & 4 else '',
+                   ' slow' if state & 8 else '', '', e['level'],
+                   e['segment'], e['step_time'], e['period'],
+                   e['error'] / 1000., e['step'] / 1000.,
+                   e['drift'] / 1000., e['speed'], e['omega']))
+        gcmd.respond_info("%s: %d slip events\n%s" % (
+            self.name, len(lines), "\n".join(lines)))
 
     # Load angle harmonics
     def has_harmonics(self):

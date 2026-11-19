@@ -260,6 +260,45 @@ command_mclib_query_status(uint32_t *args)
 }
 DECL_COMMAND(command_mclib_query_status, "mclib_query_status oid=%c");
 
+// One slip log entry per query (a burst overflows the transmit buffer)
+void
+command_mclib_query_slip_event(uint32_t *args)
+{
+    uint8_t oid = args[0], index = args[1];
+    struct c5_mclib_motor *motor = lookup_motor(oid);
+    struct c5_mclib_slip_event e;
+    irqstatus_t flag = irq_save();
+    uint8_t ok = c5_mclib_slip_event(motor, index, &e);
+    irq_restore(flag);
+    if (!ok) {
+        sendf("mclib_slip_event oid=%c index=%c valid=%c kind=%c source=%c"
+              " state=%c level=%i segment=%u step_time=%u period=%u"
+              " error=%i step=%i drift=%i speed=%i omega=%i",
+              oid, index, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        return;
+    }
+    uint8_t state = e.mode | (e.fast_mode << 2) | (e.slow << 3)
+        | (e.direction << 4);
+    sendf("mclib_slip_event oid=%c index=%c valid=%c kind=%c source=%c"
+          " state=%c level=%i segment=%u step_time=%u period=%u"
+          " error=%i step=%i drift=%i speed=%i omega=%i",
+          oid, index, 1, e.kind, e.source, state, (int32_t)e.level,
+          e.segment, e.step_time, e.period, milli(e.error), milli(e.step),
+          milli(e.drift), (int32_t)e.speed, (int32_t)e.omega);
+}
+DECL_COMMAND(command_mclib_query_slip_event,
+             "mclib_query_slip_event oid=%c index=%c");
+
+void
+command_mclib_clear_slip_log(uint32_t *args)
+{
+    struct c5_mclib_motor *motor = lookup_motor(args[0]);
+    irqstatus_t flag = irq_save();
+    c5_mclib_clear_slip_log(motor);
+    irq_restore(flag);
+}
+DECL_COMMAND(command_mclib_clear_slip_log, "mclib_clear_slip_log oid=%c");
+
 void
 command_mclib_query_timing(uint32_t *args)
 {

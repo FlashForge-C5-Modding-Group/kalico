@@ -767,6 +767,53 @@ c5_mclib_slip_mode(struct c5_mclib_motor *m, uint8_t mode)
     m->slip_mode = mode > C5_SLIP_ALWAYS ? C5_SLIP_ALWAYS : mode;
 }
 
+static float commanded_omega(const struct c5_mclib_motor *m);
+
+static void
+log_slip(struct c5_mclib_motor *m, uint8_t kind, float error, float step)
+{
+    struct c5_mclib_health *h = &m->health;
+    struct c5_mclib_slip_event *e = &h->log[h->log_next];
+    e->step_time = m->last_step;
+    e->period = m->last_period;
+    e->segment = h->segment;
+    e->error = error;
+    e->step = step;
+    e->drift = h->drift;
+    e->speed = m->observer.filtered_speed;
+    e->omega = commanded_omega(m);
+    e->level = (int8_t)h->level;
+    e->kind = kind;
+    e->source = m->track_source;
+    e->mode = m->mode;
+    e->fast_mode = m->fast_mode;
+    e->slow = m->slow;
+    e->direction = m->direction;
+    h->log_next = (uint8_t)((h->log_next + 1u) % C5_SLIP_LOG);
+    if (h->log_count < C5_SLIP_LOG)
+        h->log_count++;
+}
+
+uint8_t
+c5_mclib_slip_event(const struct c5_mclib_motor *m, uint8_t index,
+                    struct c5_mclib_slip_event *out)
+{
+    const struct c5_mclib_health *h = &m->health;
+    if (index >= h->log_count)
+        return 0u;
+    uint8_t first = (uint8_t)((h->log_next + C5_SLIP_LOG - h->log_count)
+                              % C5_SLIP_LOG);
+    *out = h->log[(first + index) % C5_SLIP_LOG];
+    return 1u;
+}
+
+void
+c5_mclib_clear_slip_log(struct c5_mclib_motor *m)
+{
+    m->health.log_count = 0u;
+    m->health.log_next = 0u;
+}
+
 // ARMED: the stall detector is armed (torque range is only taken then).
 // TRACKING: follow the angle drift for slips.
 void
@@ -778,18 +825,22 @@ c5_mclib_track_health(struct c5_mclib_motor *m, float error, uint8_t armed,
         h->stall_count++;
     h->stall_prev = m->stall;
     if (tracking == C5_TRACK_OFF) {
+        if (h->last_valid && h->level)
+            log_slip(m, 1u, h->last_error, 0.0f);
         h->last_valid = 0u;
         return;
     }
     if (tracking == C5_TRACK_GAP)
         return;
+    float step = 0.0f;
     if (!h->last_valid) {
         h->drift = 0.0f;
         h->level = 0;
+        h->segment = 0u;
     } else if (h->last_valid == 2u) {
         // switched angle source: this sample is the new reference
     } else {
-        float step = error - h->last_error;
+        step = error - h->last_error;
         if (step > ANGLE_PI_CORRECTION)
             step -= ANGLE_TAU_CORRECTION;
         else if (step < -ANGLE_PI_CORRECTION)
@@ -798,6 +849,8 @@ c5_mclib_track_health(struct c5_mclib_motor *m, float error, uint8_t armed,
     }
     h->last_error = error;
     h->last_valid = 1u;
+    if (h->segment != UINT32_MAX)
+        h->segment++;
     h->drift -= SLIP_LEAK * (h->drift
                              - (float)h->level * ANGLE_TAU_CORRECTION);
     while (h->drift > ((float)h->level + 0.5f) * ANGLE_TAU_CORRECTION
@@ -805,12 +858,14 @@ c5_mclib_track_health(struct c5_mclib_motor *m, float error, uint8_t armed,
         h->level++;
         h->slips++;
         h->slip_total++;
+        log_slip(m, 0u, error, step);
     }
     while (h->drift < ((float)h->level - 0.5f) * ANGLE_TAU_CORRECTION
            - SLIP_HYSTERESIS) {
         h->level--;
         h->slips--;
         h->slip_total++;
+        log_slip(m, 0u, error, step);
     }
     if (!h->tracked) {
         h->error_min = h->error_max = h->drift;
