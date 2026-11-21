@@ -233,6 +233,10 @@ class Creator5Toolchanger:
             'dock_seat_retries', 2, minval=0)
         self.dock_retry_speed = config.getfloat(
             'dock_retry_speed', 40., above=0.)
+        # A wheel stop with filament at the presence switch is a clog only if
+        # the switch still sees filament this much later (a runout tail can be
+        # between the wheel and the switch when the wheel stops)
+        self.clog_confirm_ms = config.getint('clog_confirm_ms', 1000, minval=0)
         # A lock that turns without catching the head leaves it in its holder
         # when the carriage pulls back; grab it again this many times. Unlike
         # stock, which re-approaches until the mount switch closes and then
@@ -1642,14 +1646,30 @@ class Creator5Toolchanger:
                 'T%d wheel failure: active tool state is inconsistent; '
                 'print paused' % tool)
             return
-        if not lane.extruder_obj.tool_start_state:
-            # The separate presence switch owns runout and infinite spool.
-            # Its callback may be racing this encoder event.
+        # The presence switch owns runout and infinite spool, but it is
+        # debounced (debounce_delay, 10 s on a Creator 5) while the wheel
+        # reports a stop after detection_length mm. At a runout the tail has
+        # already left the switch when the wheel stops, but the debounced state
+        # still says present, so judge by the raw switch: empty means runout,
+        # and its handler takes over once the debounce runs out.
+        if not self._tool_start_present(lane.extruder_obj):
+            return
+        # The tail may be between the wheel and the switch: look once more
+        self._pause_ms(self.clog_confirm_ms)
+        if not self._tool_start_present(lane.extruder_obj):
             return
         afc.error.AFC_error(
             'E0163: Paused. T%d clog detected: filament is present but the '
             'wheel stopped moving. Clear the filament path before resuming.'
             % tool)
+
+    def _tool_start_present(self, extruder):
+        """The presence switch's raw state, ahead of its debounce."""
+        button = getattr(extruder, 'debounce_button_start', None)
+        raw = getattr(button, 'physical_state', None)
+        if raw is not None:
+            return bool(raw)
+        return bool(extruder.tool_start_state)
 
     def cmd_runout_switch(self, gcmd):
         """Continue a print paused by TOOL's runout on tool TO."""
