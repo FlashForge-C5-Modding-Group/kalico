@@ -42,7 +42,7 @@ MATERIAL_TEMPS = {
     "pla": 215, "pla+": 220, "plapro": 220, "silk": 225, "plasilk": 225,
     "plamatte": 215, "matte": 215, "placf": 225, "plagf": 225, "wood": 210,
     "plawood": 210, "plametal": 220, "glow": 215,
-    "petg": 240, "petg+": 245, "petgcf": 250, "petggf": 250, "petghf": 245,
+    "petg": 250, "petg+": 255, "petgcf": 260, "petggf": 260, "petghf": 255,
     "pctg": 255, "pet": 250, "petcf": 270, "cpe": 250,
     "abs": 255, "abs+": 255, "abscf": 260, "absgf": 260,
     "asa": 260, "asacf": 265, "asagf": 265,
