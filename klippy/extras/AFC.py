@@ -36,7 +36,8 @@ if TYPE_CHECKING:
 # Nozzle temperatures (C) by filament type, for spools with no temperature of
 # their own when default_material_temps has nothing as specific. Keys are
 # matched against the lane's material ignoring case, spaces and separators;
-# the longest matching key wins, so PLA-CF finds placf before pla.
+# the longest matching key wins, so PLA-CF finds placf before pla. Nothing
+# here goes over 320 C, the Creator 5 hotend's safe limit.
 MATERIAL_TEMPS = {
     "pla": 215, "pla+": 220, "plapro": 220, "silk": 225, "plasilk": 225,
     "plamatte": 215, "matte": 215, "placf": 225, "plagf": 225, "wood": 210,
@@ -49,9 +50,10 @@ MATERIAL_TEMPS = {
     "pc": 270, "pccf": 275, "pcgf": 275, "pcabs": 260, "pcpbt": 265,
     "pa": 270, "nylon": 260, "pa6": 270, "pa12": 260, "pacf": 280,
     "pagf": 280, "pa6cf": 285, "pa6gf": 285, "pa12cf": 270, "paht": 290,
-    "pahtcf": 295, "ppa": 295, "ppacf": 300,
+    "pahtcf": 300, "ppa": 295, "ppacf": 310, "ppagf": 310,
+    "pps": 310, "ppscf": 320, "ppsgf": 320,
     "pp": 230, "ppcf": 240, "ppgf": 240,
-    "tpu": 225, "tpe": 225, "flex": 225, "peba": 230,
+    "tpu": 225, "tpe": 225, "flex": 225, "peba": 230, "pebax": 230,
     "pva": 210, "bvoh": 210, "pvb": 210,
 }
 
