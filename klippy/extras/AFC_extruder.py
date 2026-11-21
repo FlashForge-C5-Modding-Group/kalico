@@ -1354,8 +1354,29 @@ class AFCExtruder:
         else:
             self.response['status'] = self.status
         self.response['extruder_name'] = self.th_extruder_name
+        # What a load of this tool should heat to, for load macros
+        self.response['load_temp'] = self._load_temp()
 
         return self.response
+
+    def _load_temp(self) -> float:
+        """
+        Load temperature for the lane that feeds this tool: the loaded lane,
+        else the tool's own standalone lane, else its first lane.
+
+        :return float: Temperature in C, 0 when no lane is known
+        """
+        lane = self.lanes.get(self.lane_loaded) if self.lane_loaded else None
+        if lane is None:
+            lane = getattr(self, 'tc_lane', None)
+        if lane is None and self.lanes:
+            lane = next(iter(self.lanes.values()))
+        if lane is None:
+            return 0.
+        try:
+            return round(self.afc.lane_load_temp(lane), 1)
+        except Exception:
+            return 0.
 
 def load_config_prefix(config):
     return AFCExtruder(config)

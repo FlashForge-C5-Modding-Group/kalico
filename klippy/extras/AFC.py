@@ -828,6 +828,29 @@ class afc:
                     break
         return float(temp_value), using_min_value
 
+    def lane_load_temp(self, cur_lane: AFCLane) -> float:
+        """
+        Temperature to load a lane at, chosen like a toolchange does: the
+        spool's own temperature (Spoolman), else its material in
+        default_material_temps, else the default there.
+
+        :param cur_lane: Lane to be loaded
+        :return float: Temperature in C, 0 when the lane has no heater
+        """
+        try:
+            heater = cur_lane.extruder_obj.toolhead_extruder.get_heater()
+        except Exception:
+            return 0.
+        saved = getattr(self, 'heater', None)
+        self.heater = heater
+        try:
+            temp, _ = self._get_default_material_temps(cur_lane)
+        except Exception:
+            temp = 0.
+        finally:
+            self.heater = saved
+        return temp
+
     def _check_extruder_temp(self, cur_lane: AFCLane, no_wait: bool=False):
         """
         Helper function that check to see if extruder needs to be heated, and wait for hotend
