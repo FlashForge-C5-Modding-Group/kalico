@@ -174,6 +174,7 @@ c5_fault_note_host(void)
 void __visible
 c5_stall_tick_body(uint32_t *frame)
 {
+    uint32_t start = DWT->CYCCNT;
     TIMER_INTF(TIMER6) = ~TIMER_INTF_UPIF;
     // Brown-out reset is disabled in this part's factory option bytes, so a
     // supply sag short of the power-down threshold is otherwise invisible.
@@ -182,6 +183,7 @@ c5_stall_tick_body(uint32_t *frame)
     if (PMU_CS & PMU_CS_LVDF)
         lvd_events++;
     c5_fault_stall_check(frame);
+    c5_mainboardgd_irq_cycles(C5_IRQ_TICK, DWT->CYCCNT - start);
 }
 
 void __visible __attribute__((naked))

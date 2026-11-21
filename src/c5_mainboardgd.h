@@ -21,6 +21,15 @@ void c5_mainboardgd_next_step(struct gpio_out pin, uint32_t clock,
                               uint8_t due);
 void c5_mainboardgd_set_next_step(uint8_t axis, uint32_t clock,
                                   uint8_t due);
+void c5_mainboardgd_step_clock(uint32_t clock);
+void c5_mainboardgd_step_mode(struct gpio_out pin, uint8_t both_edges);
+// Interrupts that can preempt the motor control loop report how long they
+// ran, so the timing query can tell their time from the loop's own
+#define C5_IRQ_SERIAL 0
+#define C5_IRQ_TIMER 1
+#define C5_IRQ_TICK 2
+#define C5_IRQ_SOURCES 3
+void c5_mainboardgd_irq_cycles(uint8_t source, uint32_t cycles);
 void c5_mainboardgd_enable(uint8_t axis, uint8_t enable);
 uint8_t c5_mainboardgd_stalled(uint8_t axis);
 uint8_t c5_mainboardgd_control(uint8_t axis, uint32_t now,

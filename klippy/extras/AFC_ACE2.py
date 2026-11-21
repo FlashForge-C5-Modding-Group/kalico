@@ -36,7 +36,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union, TYPE_CHECKING
 
 from extras.AFC_ACE import (
     afcACE, ACEConnection, ACESerialError, ACETimeoutError, REQUEST_TIMEOUT,
-    _ACE_CLAIMED_PORTS,
+    _ACE_CLAIMED_PORTS, debug_enabled,
 )
 
 if TYPE_CHECKING:
@@ -1051,7 +1051,8 @@ class ACE2Connection(ACEConnection):
             error_str = f"ACE2 write failed: {e}"
             raise ACESerialError(error_str)
 
-        self._logger.debug(f"ACE2 TX: id={request_id} {method} {params or {}}")
+        if debug_enabled(self._logger):
+            self._logger.debug(f"ACE2 TX: id={request_id} {method} {params or {}}")
         deadline = self._reactor.monotonic() + timeout
         # try/finally so both pending maps are always cleared, even if wait() is
         # interrupted.
@@ -1106,7 +1107,8 @@ class ACE2Connection(ACEConnection):
             self._logger.debug(f"ACE2 async write failed: {e}")
             self.reconnect()      # disconnect signal, reconnect immediately
             return
-        self._logger.debug(f"ACE2 TX (async): id={request_id} {method}")
+        if debug_enabled(self._logger):
+            self._logger.debug(f"ACE2 TX (async): id={request_id} {method}")
 
     def _response_matches_pending(self, response_id: int, response: Any) -> bool:
         """
@@ -1135,7 +1137,8 @@ class ACE2Connection(ACEConnection):
         responses = decode_frames(buf, self._logger)
         self._read_buffer = bytes(buf)
         for response in responses:
-            self._logger.debug(f"ACE2 RX: {response}")
+            if debug_enabled(self._logger):
+                self._logger.debug(f"ACE2 RX: {response}")
             self._handle_response(response)
 
     def start_rollback_assist(self, slot_index: int, timeout: float = 2.0) -> Any:

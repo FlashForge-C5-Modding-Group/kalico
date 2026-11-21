@@ -89,6 +89,35 @@ the noise in the current measurement. Query it once to reset, wait a few seconds
 still, and query again. Here it is about 1.5 mA RMS at 1.8 A, so ADC noise isn't a source of motor noise.
 The first query after moves includes the settling at the end of the move, so it reads higher.
 
+It also shows, while the motor moves, how long each control update takes, the longest gap between two
+updates (one control period is 50 us at 20 kHz), how many updates came a period or more late, the longest
+update counting only its own time, and the most a single update lost to each interrupt that can preempt it
+(serial, Klipper's timer and the 100 Hz stall tick). Measured on a Creator 5 Pro with fast X/Y moves at
+600 mm/s: about 2,800 cycles per update on X, 2,400 on Y and 1,500 on Z (600 MHz), so the three motors use about
+a fifth of each control period. The longest update is 9 us, the longest gap 53 us, and no update is late.
+
+The control path (the motor interrupts and everything they call) runs from RAM (`C5_FAST`, the `.ramfunc`
+section). From flash, an update whose code had dropped out of the cache took up to 28 us while moving and
+136 us after boot, and lost control periods. The step hooks stay in flash: in RAM they stop being inlined into
+Klipper's timer dispatch, and steps then took up to 18 us out of single control updates.
+
+## Stepping
+
+- Each step is timed from its scheduled clock, not from when the timer interrupt got to it, so the step
+  periods the interpolation and the fast-mode switch use don't pick up interrupt latency.
+- With firmware that declares `C5_MAINBOARD_STEP_BOTH_EDGE`, `[mclib]` asks for step-on-both-edges on its
+  stepper, so a step is one timer event instead of a step and an unstep. Older firmware counts only rising
+  edges, and the host then keeps the step and unstep events. Host and firmware need to match: firmware without
+  the constant on a host that forced both edges would move half the distance.
+- The mainboard firmware is built for the hard-float ABI (`-mfloat-abi=hard`), which made the control update
+  about 5% faster than `softfp`.
+- Between steps the motor angle moves linearly to the next step's scheduled time. `interpolation_mode:
+  quadratic` in `[mclib]` (or `MCLIB_SET_INTERPOLATION STEPPER=... MODE=quadratic`) instead follows the parabola
+  through the previous, current and next step, which is exact at constant acceleration with perfect step times.
+  It measured about 9% more toolhead vibration at 50-200 Hz in short accelerating moves (two runs each,
+  repeatable): Klipper's step times carry up to 25 us of compression error, and the quadratic term, taken from
+  the ratio of two step periods, amplifies it. Linear is the default.
+
 ## Zero-crossing compensation (tried, not kept)
 
 Adding a voltage in the direction of each phase's current near its zero crossing (dead-time compensation)

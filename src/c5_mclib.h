@@ -9,6 +9,10 @@
 
 #include <stdint.h>
 
+// The motor control path runs from RAM: a flash refill after the cache lost
+// it made single control updates take up to ~140 us instead of ~5 us
+#define C5_FAST __attribute__((section(".ramfunc.c5")))
+
 struct c5_mclib_pi {
     float kp, ki;
     float integral_min, integral_max;
@@ -66,6 +70,19 @@ struct c5_mclib_timing {
     // squared current error while holding still (current sense noise)
     float hold_noise_sum;
     uint32_t hold_noise_samples;
+    // the same while running (update cost without the idle samples), the
+    // longest gap between control updates in motor ticks, and the updates
+    // that came a period or more late (a sample was lost)
+    uint64_t run_total;
+    uint32_t run_max, run_samples;
+    uint32_t gap_max, missed, last_update;
+    uint8_t have_last;
+    // Current tracking ripple while running below the fast-move speed: the
+    // d/q current error with its slow part (under ~100 Hz) taken out, which
+    // is the torque ripple the motor makes audible
+    float ripple_lp_d, ripple_lp_q;
+    double ripple_sum;
+    uint32_t ripple_samples;
 };
 
 
@@ -111,7 +128,11 @@ struct c5_mclib_motor {
     struct c5_mclib_observer observer;
     struct c5_mclib_pi d_pi, q_pi, outer_pi;
     uint16_t phase, phase_increment, exponent;
-    uint8_t axis, interpolation, direction;
+    // interpolation: 0 off, C5_INTERP_LINEAR or C5_INTERP_QUADRATIC
+    uint8_t axis, interpolation, direction, step_direction, reversed;
+    // commanded speed against the step period's average speed (quadratic
+    // interpolation speeds up and slows down within a step)
+    float speed_scale;
     uint8_t mode, fast_mode, hold_transition, slow;
     uint8_t quarter_count, stall, slip_mode, next_state;
     // Observer back-EMF estimate while (nearly) still, in the command frame:
@@ -139,8 +160,14 @@ struct c5_mclib_output {
 void c5_mclib_init(struct c5_mclib_motor *m, uint8_t axis);
 void c5_mclib_configure(struct c5_mclib_motor *m,
                         uint32_t rs, uint32_t ls, uint32_t km);
+#define C5_INTERP_LINEAR 1u
+#define C5_INTERP_QUADRATIC 2u
+// The quadratic angle with the commanded speed (feedforward and observer
+// compensation) left at the step's average, for testing
+#define C5_INTERP_QUADRATIC_ANGLE 3u
 void c5_mclib_microstep(struct c5_mclib_motor *m,
                         uint8_t interpolate, uint16_t exponent);
+void c5_mclib_interpolation(struct c5_mclib_motor *m, uint8_t mode);
 void c5_mclib_current(struct c5_mclib_motor *m,
                       uint32_t run_ma, uint32_t hold_ma);
 void c5_mclib_stall_threshold(struct c5_mclib_motor *m,
@@ -172,7 +199,8 @@ uint8_t c5_mclib_update(struct c5_mclib_motor *m, uint32_t now,
 uint8_t c5_mclib_stalled(const struct c5_mclib_motor *m);
 void c5_mclib_take_health(struct c5_mclib_motor *m,
                           struct c5_mclib_health *out);
-void c5_mclib_note_timing(struct c5_mclib_motor *m, uint32_t cycles);
+void c5_mclib_note_timing(struct c5_mclib_motor *m, uint32_t cycles,
+                          uint32_t now);
 void c5_mclib_take_timing(struct c5_mclib_motor *m,
                           struct c5_mclib_timing *out);
 // Observer high-frequency injection scale in percent (100 = stock).

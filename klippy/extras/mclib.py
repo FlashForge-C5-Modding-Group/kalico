@@ -17,7 +17,14 @@ RIPPLE_POINTS = 6
 RIPPLE_MAX_AMP = 0.1
 # A single-point correction is held at every speed below this frequency
 RIPPLE_FLAT_HZ = 10000.
+TIMING_RUN_FORMAT = (
+    "mclib_timing_run oid=%c run_max=%u run_avg=%u run_samples=%u"
+    " gap_max=%u missed=%u timer_max=%u own_max=%u serial_max=%u"
+    " timer_steal=%u tick_steal=%u")
 steps = {1: 0, 2: 1, 4: 2, 8: 3, 16: 4, 32: 5, 64: 6, 128: 7, 256: 8}
+# How the motor angle moves between steps (firmware without quadratic treats
+# it as linear)
+INTERPOLATION_MODES = {'linear': 1, 'quadratic': 2, 'quadratic_angle': 3}
 stepper_id = {'stepper_x':0, 'stepper_y':1, 'stepper_z':2, 'extruder':3}
 
 class MCLIB:
@@ -43,6 +50,13 @@ class MCLIB:
         self.run_current = int(run_current * 1000)
         self.hold_current = int(config.getfloat('hold_current', run_current, minval=0., maxval=run_current)* 1000)
         self.interpolate = config.getboolean('interpolate', True)
+        self.interpolation_mode = config.getchoice(
+            'interpolation_mode', INTERPOLATION_MODES, 'linear')
+        # How early a compressed step may come (Kalico's default is 25 us);
+        # less makes the step times the interpolation follows more exact
+        self.step_error = config.getfloat('step_error', None, minval=0.000001,
+                                          maxval=0.000025)
+        self.set_interpolation_cmd = None
         self.stall_threshold = int(config.getfloat('stall_threshold', self.bus_voltage, above=0.)* 1000)
         self.feedforward = config.getint('feedforward', 0, minval=0, maxval=100)
         # current PI bandwidth in percent of stock (1 kHz)
@@ -90,13 +104,18 @@ class MCLIB:
         gcode.register_mux_command("MCLIB_SET_CURRENT", "STEPPER", self.name,
                                    self.cmd_MCLIB_SET_CURRENT,
                                    desc=self.cmd_MCLIB_SET_CURRENT_help)
+        gcode.register_mux_command("MCLIB_SET_INTERPOLATION", "STEPPER",
+                                   self.name,
+                                   self.cmd_MCLIB_SET_INTERPOLATION,
+                                   desc=self.cmd_MCLIB_SET_INTERPOLATION_help)
 
         # Motion health (c5_motion_guard): totals since the last take_health()
         self.query_status_cmd = None
         self.set_stall_cmd = None
         self.set_slip_cmd = None
         self.query_timing_cmd = None
-        self.last_timing = None
+        self.last_timing = self.last_timing_run = self.last_quality = None
+        self.has_timing_run = self.has_quality = False
         self.health = self._empty_health()
         self.last_status = None
         gcode.register_mux_command("MCLIB_SET_STALL", "STEPPER", self.name,
@@ -143,6 +162,12 @@ class MCLIB:
         force_move = self.printer.lookup_object("force_move")
         self.stepper = force_move.lookup_stepper(self.stepper_name)
         self.mcu = self.stepper.get_mcu()
+        # Firmware that counts both step pin edges takes a step as one timer
+        # event instead of a step and an unstep
+        if self.mcu.get_constants().get("C5_MAINBOARD_STEP_BOTH_EDGE"):
+            self.stepper.setup_default_pulse_duration(0.000000100, True)
+        if self.step_error is not None:
+            self.stepper.set_max_step_error(self.step_error)
         self.mcu.register_config_callback(self._build_config)
 
     def _build_config(self):
@@ -152,7 +177,8 @@ class MCLIB:
             self.oid, self.stepper_name, self.motor_rs, self.motor_ls, self.motor_km))
 
         self.mcu.add_config_cmd("mclib_config_microstep oid=%d interpolate=%d mstep=%u" % (
-            self.oid, self.interpolate, self.microstep))
+            self.oid, self.interpolation_mode if self.interpolate else 0,
+            self.microstep))
             
         self.mcu.add_config_cmd("mclib_set_current oid=%d run_current=%u hold_current=%u"% (
             self.oid, self.run_current, self.hold_current))
@@ -178,6 +204,21 @@ class MCLIB:
         if self.query_timing_cmd is not None:
             self.mcu.register_response(self._handle_timing, "mclib_timing",
                                        self.oid)
+            # Moving-only timing and preemption; absent on older firmware
+            self.has_timing_run = self.mcu.try_lookup_command(
+                TIMING_RUN_FORMAT) is not None
+            if self.has_timing_run:
+                self.mcu.register_response(self._handle_timing_run,
+                                           "mclib_timing_run", self.oid)
+            self.has_quality = self.mcu.try_lookup_command(
+                "mclib_quality oid=%c ripple=%u ripple_samples=%u"
+            ) is not None
+            if self.has_quality:
+                self.mcu.register_response(self._handle_quality,
+                                           "mclib_quality", self.oid)
+        # Interpolation mode at run time; absent on older firmware
+        self.set_interpolation_cmd = self.mcu.try_lookup_command(
+            "mclib_set_interpolation oid=%c mode=%c")
         # Slip log; absent on older firmware
         self.query_slip_cmd = self.mcu.try_lookup_command(
             "mclib_query_slip_event oid=%c index=%c")
@@ -348,6 +389,12 @@ class MCLIB:
     def _handle_timing(self, params):
         self.last_timing = params
 
+    def _handle_timing_run(self, params):
+        self.last_timing_run = params
+
+    def _handle_quality(self, params):
+        self.last_quality = params
+
     def _handle_slip_event(self, params):
         self.slip_events[params['index']] = params
 
@@ -435,10 +482,13 @@ class MCLIB:
         if self.query_timing_cmd is None:
             raise gcmd.error("%s: firmware has no mclib_query_timing"
                              % (self.name,))
-        self.last_timing = None
+        self.last_timing = self.last_timing_run = self.last_quality = None
         self.query_timing_cmd.send([self.oid])
         for _ in range(20):
-            if self.last_timing is not None:
+            if self.last_timing is not None and (
+                    self.last_timing_run is not None
+                    or not self.has_timing_run) and (
+                    self.last_quality is not None or not self.has_quality):
                 break
             self.reactor.pause(self.reactor.monotonic() + 0.05)
         t = self.last_timing
@@ -456,7 +506,52 @@ class MCLIB:
             msg += ("\n%s: current noise while holding %.1f mA RMS over %u"
                     " updates" % (self.name, t['hold_noise'] / 1000.,
                                   t['hold_samples']))
+        r = self.last_timing_run
+        if r is not None:
+            t = r
+            mhz = self.mcu.seconds_to_clock(1.) / 1000000.
+            msg += ("\n%s: while moving max %u cycles (%.1f us), avg %u"
+                    " cycles over %u updates"
+                    % (self.name, t['run_max'], t['run_max'] / mhz,
+                       t['run_avg'], t['run_samples']))
+            msg += ("\n%s: longest gap between updates %.1f us, %u late"
+                    " updates (a period or more lost); longest Klipper timer"
+                    " interrupt %.1f us"
+                    % (self.name, t['gap_max'] / 100., t['missed'],
+                       t['timer_max'] / mhz))
+            msg += ("\n%s: longest update without interrupts %.1f us; most"
+                    " one update lost to serial %.1f us, Klipper timer %.1f"
+                    " us, stall tick %.1f us"
+                    % (self.name, t['own_max'] / mhz, t['serial_max'] / mhz,
+                       t['timer_steal'] / mhz, t['tick_steal'] / mhz))
+        q = self.last_quality
+        if q is not None and q['ripple_samples']:
+            msg += ("\n%s: current ripple above 100 Hz while moving %.2f mA"
+                    " RMS over %u updates"
+                    % (self.name, q['ripple'] / 1000., q['ripple_samples']))
         gcmd.respond_info(msg)
+
+    cmd_MCLIB_SET_INTERPOLATION_help = ("Set how the motor angle moves"
+                                        " between steps (MODE=linear or"
+                                        " quadratic)")
+    def cmd_MCLIB_SET_INTERPOLATION(self, gcmd):
+        if self.set_interpolation_cmd is None:
+            raise gcmd.error("%s: firmware has no mclib_set_interpolation"
+                             % (self.name,))
+        mode = gcmd.get('MODE').lower()
+        # off: no interpolation at all, for comparisons
+        modes = dict(INTERPOLATION_MODES, off=0)
+        if mode not in modes:
+            raise gcmd.error("MODE must be one of %s"
+                             % (", ".join(sorted(modes)),))
+        if not self.interpolate:
+            raise gcmd.error("%s: interpolate is off in [mclib %s]"
+                             % (self.name, self.name))
+        self.set_interpolation_cmd.send([self.oid, modes[mode]])
+        self.interpolation_mode = modes[mode]
+        gcmd.respond_info("%s: %s interpolation (until restart; set"
+                          " interpolation_mode in [mclib %s] to keep it)"
+                          % (self.name, mode, self.name))
 
     cmd_MCLIB_SET_FEEDFORWARD_help = ("Set the d-axis back-EMF and"
                                       " cross-coupling feedforward"

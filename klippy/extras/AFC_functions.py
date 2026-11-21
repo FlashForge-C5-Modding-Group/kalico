@@ -757,8 +757,13 @@ class afcFunction:
 
     def check_absolute_mode( self, func_name:str="" ):
         """
-        Function to verifies that coordinates and extruder is in absolute mode, sets back to absolute mode
-        if relative mode is set
+        Function to verify that coordinates are in absolute mode, setting them back to absolute mode
+        if relative mode is set.
+
+        The extrusion mode is left alone: AFC's own extruder moves (move_e_pos) work in toolhead
+        coordinates whatever the mode. Forcing absolute extrusion here, ahead of the pause saving
+        the G-code state, made a print sliced with relative extrusion resume in absolute mode, so
+        its next small retract became a move back to E≈0 (e.g. -38500 mm).
 
         :params func_name: String for name of function that function is being called from,
                            this is added to debug log to aid in debugging
@@ -768,9 +773,6 @@ class afcFunction:
         if not self.afc.gcode_move.absolute_coord:
             self.logger.debug("Printer coords not in absolute mode, setting to absolute mode")
             self.afc.gcode_move.absolute_coord = True
-        if not get_gcode_absolute_extrude(self.afc.gcode_move):
-            self.logger.debug("Printer extruder not in absolute mode, setting to absolute mode")
-            set_gcode_absolute_extrude(self.afc.gcode_move, True)
 
     def get_extruder_pos(self, eventtime=None, past_extruder_position=None, extruder=None):
         """

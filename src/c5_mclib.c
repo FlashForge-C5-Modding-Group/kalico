@@ -110,7 +110,7 @@ static const float sine_table[131] = {
     0x1.0000000000000p+0f, 0x1.fff6220000000p-1f,
 };
 
-static inline int32_t
+C5_FAST static inline int32_t
 trunc_s32(float x)
 {
     if (x != x)
@@ -122,7 +122,7 @@ trunc_s32(float x)
     return (int32_t)x;
 }
 
-static inline uint32_t
+C5_FAST static inline uint32_t
 trunc_u32(float x)
 {
     if (!(x > 0.0f))
@@ -132,20 +132,20 @@ trunc_u32(float x)
     return (uint32_t)x;
 }
 
-static inline uint32_t
+C5_FAST static inline uint32_t
 arm_lsl(uint32_t value, uint32_t shift)
 {
     shift &= 0xffu;
     return shift < 32u ? value << shift : 0u;
 }
 
-static inline uint32_t
+C5_FAST static inline uint32_t
 arm_udiv(uint32_t numerator, uint32_t denominator)
 {
     return denominator ? numerator / denominator : 0u;
 }
 
-static inline float
+C5_FAST static inline float
 clip_upper_lower(float value, float lower, float upper)
 {
     if (value > upper)
@@ -155,7 +155,7 @@ clip_upper_lower(float value, float lower, float upper)
     return value;
 }
 
-static inline float
+C5_FAST static inline float
 reduce_angle(float angle)
 {
     while (angle >= ANGLE_TAU)
@@ -165,7 +165,7 @@ reduce_angle(float angle)
     return angle;
 }
 
-static void
+C5_FAST static void
 sine_cosine(float angle, float *sine, float *cosine)
 {
     float x = reduce_angle(angle);
@@ -200,7 +200,7 @@ sine_cosine(float angle, float *sine, float *cosine)
     *cosine = cosine_negative ? -cv : cv;
 }
 
-static float
+C5_FAST static float
 scalar_sine(float angle)
 {
     float x = reduce_angle(angle);
@@ -230,7 +230,7 @@ scalar_sine(float angle)
     return base + (q - integer) * difference;
 }
 
-static float
+C5_FAST static float
 atan_interpolate(float q, uint8_t negative, uint8_t guard,
                  float addition, uint8_t add_before)
 {
@@ -249,7 +249,7 @@ atan_interpolate(float q, uint8_t negative, uint8_t guard,
     return a + fraction * difference + addition;
 }
 
-static float
+C5_FAST static float
 atan_like(float x, float y)
 {
     float q;
@@ -287,7 +287,7 @@ atan_like(float x, float y)
     return atan_interpolate(q, 0, 1, ANGLE_PI, 1);
 }
 
-static void
+C5_FAST static void
 pi_init(struct c5_mclib_pi *pi, float kp, float ki,
         float integral_limit, float output_limit)
 {
@@ -299,7 +299,7 @@ pi_init(struct c5_mclib_pi *pi, float kp, float ki,
     pi->output_max = output_limit;
 }
 
-static float
+C5_FAST static float
 pi_update(struct c5_mclib_pi *pi, float reference, float measurement)
 {
     float error = reference - measurement;
@@ -319,7 +319,7 @@ pi_update(struct c5_mclib_pi *pi, float reference, float measurement)
     return output;
 }
 
-static void
+C5_FAST static void
 pi_reset(struct c5_mclib_pi *pi)
 {
     pi->error = 0.0f;
@@ -327,7 +327,7 @@ pi_reset(struct c5_mclib_pi *pi)
     pi->output = 0.0f;
 }
 
-static void
+C5_FAST static void
 forward_transform(float ia, float ib, float sine, float cosine,
                   float *d, float *q)
 {
@@ -335,7 +335,7 @@ forward_transform(float ia, float ib, float sine, float cosine,
     *q = ib * cosine - ia * sine;
 }
 
-static void
+C5_FAST static void
 inverse_transform(float vd, float vq, float sine, float cosine,
                   float *va, float *vb)
 {
@@ -343,13 +343,13 @@ inverse_transform(float vd, float vq, float sine, float cosine,
     *vb = vd * sine + vq * cosine;
 }
 
-static inline float
+C5_FAST static inline float
 sqrt_positive(float value)
 {
     return value > 0.0f ? __builtin_sqrtf(value) : 0.0f;
 }
 
-static void
+C5_FAST static void
 observer_reset(struct c5_mclib_observer *o)
 {
     o->previous_raw_angle = 0.0f;
@@ -359,7 +359,7 @@ observer_reset(struct c5_mclib_observer *o)
     o->filtered_injection_b = 0.0f;
 }
 
-static float
+C5_FAST static float
 observer_phase(struct c5_mclib_observer *o, float current,
                float previous_voltage, float old_estimate,
                float *injection, float *filtered)
@@ -379,7 +379,7 @@ observer_phase(struct c5_mclib_observer *o, float current,
     return estimate;
 }
 
-static void
+C5_FAST static void
 observer_update(struct c5_mclib_motor *m, float ia, float ib)
 {
     struct c5_mclib_observer *o = &m->observer;
@@ -409,7 +409,7 @@ observer_update(struct c5_mclib_motor *m, float ia, float ib)
     o->angle = reduce_angle(raw + o->compensation);
 }
 
-void
+C5_FAST void
 c5_mclib_init(struct c5_mclib_motor *m, uint8_t axis)
 {
     memset(m, 0, sizeof(*m));
@@ -421,7 +421,8 @@ c5_mclib_init(struct c5_mclib_motor *m, uint8_t axis)
     m->crossover_hysteresis = 100u;
     m->damping_threshold = 2468u;
     m->slow_threshold = 37500u;
-    m->interpolation = 1u;
+    m->interpolation = C5_INTERP_LINEAR;
+    m->speed_scale = 1.0f;
     m->slow = 1u;
 
     float pi_limit = 0x1.7fd70ap+4f;
@@ -468,7 +469,7 @@ c5_mclib_init(struct c5_mclib_motor *m, uint8_t axis)
     m->observer.compensation_denominator = 0x1.473fd2p+12f;
 }
 
-void
+C5_FAST void
 c5_mclib_configure(struct c5_mclib_motor *m,
                     uint32_t rs, uint32_t ls, uint32_t km)
 {
@@ -499,7 +500,7 @@ c5_mclib_configure(struct c5_mclib_motor *m,
 
 // Step-period thresholds were tuned at 16 microsteps (exponent 4); keep
 // them at the same motor speed for other microstep settings
-static uint32_t
+C5_FAST static uint32_t
 scale_step_ticks(uint32_t ticks, uint16_t exponent)
 {
     if (exponent >= 4u)
@@ -507,7 +508,7 @@ scale_step_ticks(uint32_t ticks, uint16_t exponent)
     return ticks << (4u - exponent);
 }
 
-void
+C5_FAST void
 c5_mclib_microstep(struct c5_mclib_motor *m,
                     uint8_t interpolate, uint16_t exponent)
 {
@@ -521,7 +522,16 @@ c5_mclib_microstep(struct c5_mclib_motor *m,
     m->slow_threshold = scale_step_ticks(37500u, exponent);
 }
 
-void
+C5_FAST void
+c5_mclib_interpolation(struct c5_mclib_motor *m, uint8_t mode)
+{
+    if (mode > C5_INTERP_QUADRATIC_ANGLE)
+        mode = C5_INTERP_QUADRATIC_ANGLE;
+    m->interpolation = mode;
+    m->speed_scale = 1.0f;
+}
+
+C5_FAST void
 c5_mclib_current(struct c5_mclib_motor *m,
                   uint32_t run_ma, uint32_t hold_ma)
 {
@@ -536,13 +546,13 @@ c5_mclib_current(struct c5_mclib_motor *m,
         m->decay_increment = m->run_current - m->hold_current;
 }
 
-void
+C5_FAST void
 c5_mclib_stall_threshold(struct c5_mclib_motor *m, uint32_t threshold)
 {
     m->stall_threshold = (float)threshold / 1000.0f;
 }
 
-void
+C5_FAST void
 c5_mclib_resonance(struct c5_mclib_motor *m,
                     uint8_t tdx, uint32_t amp, uint32_t phase1,
                     uint32_t phase2)
@@ -555,7 +565,7 @@ c5_mclib_resonance(struct c5_mclib_motor *m,
     m->resonance_phase_reverse[slot] = (float)phase2 / 1000.0f;
 }
 
-void
+C5_FAST void
 c5_mclib_ripple(struct c5_mclib_motor *m, uint8_t harmonic,
                 uint8_t direction, uint8_t index, uint8_t count,
                 uint32_t freq_mhz, int32_t amp_ma, int32_t phase_mrad)
@@ -589,7 +599,7 @@ c5_mclib_ripple(struct c5_mclib_motor *m, uint8_t harmonic,
 // (a one-point table applies at every speed)
 #define RIPPLE_FADE 1.1f
 
-static float
+C5_FAST static float
 ripple_frequency(const struct c5_mclib_motor *m)
 {
     float period = (float)m->step_period * (float)(4u << m->exponent);
@@ -598,7 +608,7 @@ ripple_frequency(const struct c5_mclib_motor *m)
 
 // How much of harmonic table t applies at freq (1 inside its points, fading
 // to 0 outside), and the interpolated sin and cos parts at full weight
-static float
+C5_FAST static float
 ripple_lookup(const struct c5_mclib_ripple_table *t, float freq,
               float *sp, float *cp)
 {
@@ -633,7 +643,7 @@ ripple_lookup(const struct c5_mclib_ripple_table *t, float freq,
     return 1.0f;
 }
 
-static float
+C5_FAST static float
 ripple_correction(const struct c5_mclib_motor *m)
 {
     uint8_t dir = m->direction ? 1u : 0u;
@@ -653,7 +663,7 @@ ripple_correction(const struct c5_mclib_motor *m)
 
 // Share of the stock resonance damping for harmonic left to it: none
 // where a ripple table covers the current speed
-static float
+C5_FAST static float
 stock_damping_share(const struct c5_mclib_motor *m, uint8_t harmonic)
 {
     if (m->mode != MODE_RUN)
@@ -676,6 +686,8 @@ c5_mclib_step(struct c5_mclib_motor *m, uint32_t now)
     m->last_period = now - m->last_step;
     m->last_step = now;
     m->next_state = C5_NEXT_UNKNOWN;
+    m->reversed = m->direction != m->step_direction;
+    m->step_direction = m->direction;
     if (m->direction)
         m->phase = (uint16_t)(m->phase + m->phase_increment);
     else
@@ -699,7 +711,7 @@ c5_mclib_next_step(struct c5_mclib_motor *m, uint32_t when, uint8_t state)
     m->next_state = state;
 }
 
-void
+C5_FAST void
 c5_mclib_enable(struct c5_mclib_motor *m, uint32_t now)
 {
     m->last_step = now;
@@ -716,7 +728,7 @@ c5_mclib_enable(struct c5_mclib_motor *m, uint32_t now)
     m->emf_learned = 0u;
 }
 
-void
+C5_FAST void
 c5_mclib_disable(struct c5_mclib_motor *m)
 {
     m->active_current = 0.0f;
@@ -724,6 +736,7 @@ c5_mclib_disable(struct c5_mclib_motor *m)
     m->reference_q = 0.0f;
     observer_reset(&m->observer);
     m->mode = MODE_DISABLED;
+    m->speed_scale = 1.0f;
     m->stall = 0u;
     m->slow = 1u;
     m->hold_transition = 0u;
@@ -761,7 +774,7 @@ c5_mclib_disable(struct c5_mclib_motor *m)
 #define SLIP_RATE_MARGIN 3.0f
 #define CONTROL_PERIOD 5e-5f
 
-void
+C5_FAST void
 c5_mclib_slip_mode(struct c5_mclib_motor *m, uint8_t mode)
 {
     m->slip_mode = mode > C5_SLIP_ALWAYS ? C5_SLIP_ALWAYS : mode;
@@ -769,7 +782,7 @@ c5_mclib_slip_mode(struct c5_mclib_motor *m, uint8_t mode)
 
 static float commanded_omega(const struct c5_mclib_motor *m);
 
-static void
+C5_FAST static void
 log_slip(struct c5_mclib_motor *m, uint8_t kind, float error, float step)
 {
     struct c5_mclib_health *h = &m->health;
@@ -794,7 +807,7 @@ log_slip(struct c5_mclib_motor *m, uint8_t kind, float error, float step)
         h->log_count++;
 }
 
-uint8_t
+C5_FAST uint8_t
 c5_mclib_slip_event(const struct c5_mclib_motor *m, uint8_t index,
                     struct c5_mclib_slip_event *out)
 {
@@ -807,7 +820,7 @@ c5_mclib_slip_event(const struct c5_mclib_motor *m, uint8_t index,
     return 1u;
 }
 
-void
+C5_FAST void
 c5_mclib_clear_slip_log(struct c5_mclib_motor *m)
 {
     m->health.log_count = 0u;
@@ -816,7 +829,7 @@ c5_mclib_clear_slip_log(struct c5_mclib_motor *m)
 
 // ARMED: the stall detector is armed (torque range is only taken then).
 // TRACKING: follow the angle drift for slips.
-void
+C5_FAST void
 c5_mclib_track_health(struct c5_mclib_motor *m, float error, uint8_t armed,
                       uint8_t tracking)
 {
@@ -893,7 +906,7 @@ c5_mclib_track_health(struct c5_mclib_motor *m, float error, uint8_t armed,
 }
 
 // Commanded electrical speed in rad/s, signed (0 while holding)
-static float
+C5_FAST static float
 commanded_omega(const struct c5_mclib_motor *m)
 {
     if (m->mode != MODE_RUN)
@@ -904,14 +917,14 @@ commanded_omega(const struct c5_mclib_motor *m)
         period = m->elapsed;
     if (!period)
         return 0.0f;
-    float omega = ANGLE_TAU * MOTOR_TIME_HZ
+    float omega = ANGLE_TAU * MOTOR_TIME_HZ * m->speed_scale
         / ((float)period * (float)(4u << m->exponent));
     return m->direction ? omega : -omega;
 }
 
 // Angle error below the fast-move speed, from the back-EMF estimate with its
 // standstill part taken out. Returns 0 when it can't be trusted.
-static uint8_t
+C5_FAST static uint8_t
 low_speed_error(struct c5_mclib_motor *m, float *error, float *max_step)
 {
     struct c5_mclib_observer *o = &m->observer;
@@ -968,7 +981,7 @@ low_speed_error(struct c5_mclib_motor *m, float *error, float *max_step)
     return 1u;
 }
 
-static void
+C5_FAST static void
 update_stall_state(struct c5_mclib_motor *m, float ia, float ib,
                    float initial_error)
 {
@@ -1038,7 +1051,28 @@ update_stall_state(struct c5_mclib_motor *m, float ia, float ib,
     c5_mclib_track_health(m, error, armed, tracking);
 }
 
-static void
+// High-pass corner of the ripple metric: 1 - exp(-2 pi 100 Hz / 20 kHz)
+#define RIPPLE_LP 0.0309f
+
+C5_FAST static void
+note_ripple(struct c5_mclib_motor *m)
+{
+    struct c5_mclib_timing *t = &m->timing;
+    float ed = m->measured_d - m->reference_d;
+    float eq = m->measured_q - m->reference_q;
+    t->ripple_lp_d += RIPPLE_LP * (ed - t->ripple_lp_d);
+    t->ripple_lp_q += RIPPLE_LP * (eq - t->ripple_lp_q);
+    float hd = ed - t->ripple_lp_d, hq = eq - t->ripple_lp_q;
+    t->ripple_sum += (double)(hd * hd + hq * hq);
+    if (t->ripple_samples != UINT32_MAX)
+        t->ripple_samples++;
+}
+
+// Bounds the quadratic term so the angle never runs backwards within a step
+// (|k| <= 1 keeps the speed 1 - k (1 - 2u) at or above zero)
+#define QUADRATIC_K_LIMIT 0.9f
+
+C5_FAST static void
 run_state_update(struct c5_mclib_motor *m, float initial_error)
 {
     if (m->axis < 2u) {
@@ -1078,6 +1112,21 @@ run_state_update(struct c5_mclib_motor *m, float initial_error)
         }
         m->step_period = period;
         float ratio = (float)(int32_t)m->elapsed / (float)period;
+        m->speed_scale = 1.0f;
+        if (m->interpolation >= C5_INTERP_QUADRATIC
+            && m->next_state == C5_NEXT_AT && !m->reversed
+            && m->elapsed < period) {
+            // The parabola through the previous, this and the next step
+            // (exact at constant acceleration), so the speed doesn't jump
+            // at every step: position u - k u (1 - u) of the step, speed
+            // 1 - k (1 - 2u) times the step's average
+            float t = (float)period, tp = (float)m->last_period;
+            float k = t * (tp - t) / (tp * (t + tp));
+            k = clip_upper_lower(k, -QUADRATIC_K_LIMIT, QUADRATIC_K_LIMIT);
+            if (m->interpolation == C5_INTERP_QUADRATIC)
+                m->speed_scale = 1.0f - k * (1.0f - 2.0f * ratio);
+            ratio -= k * ratio * (1.0f - ratio);
+        }
         int32_t delta = trunc_s32(ratio * (float)m->phase_increment);
         uint16_t interpolated;
         if (m->direction) {
@@ -1100,7 +1149,7 @@ run_state_update(struct c5_mclib_motor *m, float initial_error)
     }
 }
 
-static void
+C5_FAST static void
 hold_current_update(struct c5_mclib_motor *m)
 {
     uint32_t ramp_start = m->stop_timeout + m->hold_delay;
@@ -1114,7 +1163,7 @@ hold_current_update(struct c5_mclib_motor *m)
 
 // d-axis voltage the motor needs at the commanded speed: back-EMF plus the
 // L*w*iq cross-coupling, so the PI only corrects what is left
-static float
+C5_FAST static float
 feedforward_d(const struct c5_mclib_motor *m)
 {
     if (m->mode != MODE_RUN || m->slow || m->axis >= 2u)
@@ -1125,7 +1174,7 @@ feedforward_d(const struct c5_mclib_motor *m)
         period = m->elapsed;
     if (!period)
         return 0.0f;
-    float omega = ANGLE_TAU * MOTOR_TIME_HZ
+    float omega = ANGLE_TAU * MOTOR_TIME_HZ * m->speed_scale
         / ((float)period * (float)(4u << m->exponent));
     if (!m->direction)
         omega = -omega;
@@ -1135,7 +1184,7 @@ feedforward_d(const struct c5_mclib_motor *m)
     return m->feedforward_gain * v;
 }
 
-static void
+C5_FAST static void
 nonfast_control(struct c5_mclib_motor *m, float ia, float ib,
                 float *sine, float *cosine)
 {
@@ -1193,7 +1242,7 @@ nonfast_control(struct c5_mclib_motor *m, float ia, float ib,
     }
 }
 
-static void
+C5_FAST static void
 fast_control(struct c5_mclib_motor *m, float ia, float ib,
              float *sine, float *cosine)
 {
@@ -1218,7 +1267,7 @@ fast_control(struct c5_mclib_motor *m, float ia, float ib,
                                     - m->requested_d * m->requested_d);
 }
 
-static void
+C5_FAST static void
 pwm_phase(float voltage, uint32_t *compare, uint8_t *negative)
 {
     float normalized = voltage * DUTY_SCALE;
@@ -1250,7 +1299,7 @@ pwm_phase(float voltage, uint32_t *compare, uint8_t *negative)
 // straight into the motor.)
 #define LOAD_ANGLE_LP 0.0025f       // ~8 Hz at 20 kHz
 
-static void
+C5_FAST static void
 load_angle_update(struct c5_mclib_motor *m, float error)
 {
     uint8_t moving = m->axis < 2u && m->mode == MODE_RUN && !m->fast_mode
@@ -1273,7 +1322,7 @@ load_angle_update(struct c5_mclib_motor *m, float error)
     }
 }
 
-uint8_t
+C5_FAST uint8_t
 c5_mclib_update(struct c5_mclib_motor *m, uint32_t now,
                  float ia, float ib, struct c5_mclib_output *out)
 {
@@ -1318,6 +1367,9 @@ c5_mclib_update(struct c5_mclib_motor *m, uint32_t now,
     else
         nonfast_control(m, ia, ib, &sine, &cosine);
 
+    if (m->mode == MODE_RUN && !(m->axis < 2u && m->fast_mode))
+        note_ripple(m);
+
     float va, vb;
     inverse_transform(m->requested_d, m->requested_q,
                       sine, cosine, &va, &vb);
@@ -1337,13 +1389,13 @@ c5_mclib_update(struct c5_mclib_motor *m, uint32_t now,
     return 1;
 }
 
-uint8_t
+C5_FAST uint8_t
 c5_mclib_stalled(const struct c5_mclib_motor *m)
 {
     return m->stall;
 }
 
-void
+C5_FAST void
 c5_mclib_take_health(struct c5_mclib_motor *m, struct c5_mclib_health *out)
 {
     *out = m->health;
@@ -1354,17 +1406,41 @@ c5_mclib_take_health(struct c5_mclib_motor *m, struct c5_mclib_health *out)
     m->health.tracked = 0u;
 }
 
-void
-c5_mclib_note_timing(struct c5_mclib_motor *m, uint32_t cycles)
+// One control period in motor ticks (20 kHz)
+#define CONTROL_TICKS ((uint32_t)(MOTOR_TIME_HZ * CONTROL_PERIOD + 0.5f))
+
+C5_FAST void
+c5_mclib_note_timing(struct c5_mclib_motor *m, uint32_t cycles, uint32_t now)
 {
-    if (cycles > m->timing.max)
-        m->timing.max = cycles;
-    m->timing.total += cycles;
-    if (m->timing.samples != UINT32_MAX)
-        m->timing.samples++;
+    struct c5_mclib_timing *t = &m->timing;
+    if (cycles > t->max)
+        t->max = cycles;
+    t->total += cycles;
+    if (t->samples != UINT32_MAX)
+        t->samples++;
+    if (m->mode == MODE_DISABLED) {
+        t->have_last = 0u;
+        return;
+    }
+    if (t->have_last) {
+        uint32_t gap = now - t->last_update;
+        if (gap > t->gap_max)
+            t->gap_max = gap;
+        if (gap > CONTROL_TICKS + CONTROL_TICKS / 2u)
+            t->missed++;
+    }
+    t->last_update = now;
+    t->have_last = 1u;
+    if (m->mode != MODE_RUN)
+        return;
+    if (cycles > t->run_max)
+        t->run_max = cycles;
+    t->run_total += cycles;
+    if (t->run_samples != UINT32_MAX)
+        t->run_samples++;
 }
 
-void
+C5_FAST void
 c5_mclib_take_timing(struct c5_mclib_motor *m,
                      struct c5_mclib_timing *out)
 {
@@ -1376,9 +1452,16 @@ c5_mclib_take_timing(struct c5_mclib_motor *m,
     m->timing.d_integral_samples = 0;
     m->timing.hold_noise_sum = 0.0f;
     m->timing.hold_noise_samples = 0;
+    m->timing.run_max = 0;
+    m->timing.run_total = 0;
+    m->timing.run_samples = 0;
+    m->timing.gap_max = 0;
+    m->timing.missed = 0;
+    m->timing.ripple_sum = 0.0;
+    m->timing.ripple_samples = 0;
 }
 
-void
+C5_FAST void
 c5_mclib_pi_scale(struct c5_mclib_motor *m, uint32_t percent)
 {
     if (percent < 25u)
@@ -1394,7 +1477,7 @@ c5_mclib_pi_scale(struct c5_mclib_motor *m, uint32_t percent)
     m->d_pi.ki = m->q_pi.ki = m->pi_ki_base * s;
 }
 
-void
+C5_FAST void
 c5_mclib_arm_harmonics(struct c5_mclib_motor *m)
 {
     memset(m->harm_cos, 0, sizeof(m->harm_cos));
@@ -1403,7 +1486,7 @@ c5_mclib_arm_harmonics(struct c5_mclib_motor *m)
     m->harm_armed = 1u;
 }
 
-void
+C5_FAST void
 c5_mclib_take_harmonics(struct c5_mclib_motor *m, uint8_t dir,
                         float *cosines, float *sines, uint32_t *count)
 {
@@ -1415,7 +1498,7 @@ c5_mclib_take_harmonics(struct c5_mclib_motor *m, uint8_t dir,
     *count = m->harm_count[dir];
 }
 
-void
+C5_FAST void
 c5_mclib_feedforward(struct c5_mclib_motor *m, uint32_t percent)
 {
     if (percent > 100u)
@@ -1423,7 +1506,7 @@ c5_mclib_feedforward(struct c5_mclib_motor *m, uint32_t percent)
     m->feedforward_gain = (float)percent / 100.0f;
 }
 
-void
+C5_FAST void
 c5_mclib_injection_scale(struct c5_mclib_motor *m, uint32_t percent)
 {
     float scale = (float)percent / 100.0f;
@@ -1434,7 +1517,7 @@ c5_mclib_injection_scale(struct c5_mclib_motor *m, uint32_t percent)
     m->observer.injection_scale = scale;
 }
 
-void
+C5_FAST void
 c5_mclib_acq_init(struct c5_mclib_acq *a)
 {
     memset(a, 0, sizeof(*a));
@@ -1445,7 +1528,7 @@ c5_mclib_acq_init(struct c5_mclib_acq *a)
     a->calibrating = 1u;
 }
 
-uint8_t
+C5_FAST uint8_t
 c5_mclib_acquire(struct c5_mclib_acq *a,
                   int16_t raw0, int16_t raw1, float *ia, float *ib)
 {
@@ -1473,7 +1556,7 @@ c5_mclib_acquire(struct c5_mclib_acq *a,
     return 1;
 }
 
-void
+C5_FAST void
 c5_mclib_acq_polarity(struct c5_mclib_acq *a, uint8_t signs)
 {
     a->signs = signs;

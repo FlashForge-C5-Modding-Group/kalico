@@ -213,6 +213,10 @@ class Creator5Toolchanger:
         self.post_select_accel = config.getfloat(
             'post_select_accel', None, above=0.)
         self.approach_x = config.getfloat('approach_x', 250.)
+        # Line up on a dock's Y this far inboard of approach_x, so the run in
+        # to the dock is straight along X instead of a fast diagonal that
+        # corners right at approach_x
+        self.dock_lane_lead = config.getfloat('dock_lane_lead', 15., minval=0.)
         self.pre_dock_x = config.getfloat('pre_dock_x', 280.)
         self.pullback = config.getfloat('pullback', 20., above=0.)
         self.pickup_latch_wait_ms = config.getint('pickup_latch_wait_ms',
@@ -233,6 +237,15 @@ class Creator5Toolchanger:
             'dock_seat_retries', 2, minval=0)
         self.dock_retry_speed = config.getfloat(
             'dock_retry_speed', 40., above=0.)
+        # A wheel stop with filament at the presence switch is a clog only if
+        # the switch still sees filament this much later (a runout tail can be
+        # between the wheel and the switch when the wheel stops)
+        self.clog_confirm_ms = config.getint('clog_confirm_ms', 1000, minval=0)
+        # When every approach fails, X/Y may have lost steps: back out,
+        # move Z by dock_rehome_z (relative), G28 X Y, and dock once more
+        # before giving up.
+        self.dock_rehome = config.getboolean('dock_rehome', True)
+        self.dock_rehome_z = config.getfloat('dock_rehome_z', 2.)
         # A lock that turns without catching the head leaves it in its holder
         # when the carriage pulls back; grab it again this many times. Unlike
         # stock, which re-approaches until the mount switch closes and then
@@ -1177,13 +1190,15 @@ class Creator5Toolchanger:
 
     def _travel_to_lane(self, y, feed):
         # Inboard of approach_x nothing sits between the head and the dock
-        # lane, so go there in one diagonal move instead of X then Y.
+        # lane. Line up on the lane dock_lane_lead inboard of approach_x and
+        # come in along X from there.
+        entry_x = self.approach_x - self.dock_lane_lead
         toolhead = self.printer.lookup_object('toolhead')
-        if toolhead.get_position()[0] <= self.approach_x + .001:
-            self._move(x=self.approach_x, y=y, feed=feed)
-        else:
+        if toolhead.get_position()[0] > entry_x + .001:
+            self._move(x=entry_x, feed=feed)
+        self._move(x=entry_x, y=y, feed=feed)
+        if self.dock_lane_lead:
             self._move(x=self.approach_x, feed=feed)
-            self._move(y=y, feed=feed)
 
     def _raise_z(self):
         toolhead = self.printer.lookup_object('toolhead')
@@ -1295,29 +1310,15 @@ class Creator5Toolchanger:
             self.dock_seat_timeout_ms)
         return seated, mounted, poll
 
-    def _dock(self, gcmd, tool, raise_z=True):
-        x, y = self.docks[tool]
-        clear_feed = self.clear_travel_speed * 60.
-        if self.persist_babystep and self._printing():
-            self._persist_babystep(gcmd, tool)
-        # Do not clear nozzle Z while a tool is physically mounted.  A
-        # previously selected tool may have been left at zero by a slicer.
-        origin_z = self.printer.lookup_object('gcode_move').get_status()[
-            'homing_origin'][2]
-        if not math.isfinite(origin_z) or origin_z < 0.5:
-            self._apply_offsets(tool)
-        # Dock motion uses physical coordinates, independent of XY offsets.
-        self._run('SET_GCODE_OFFSET X=0 Y=0 MOVE=0')
-        if raise_z:
-            self._raise_z()
-        approach_feed = self.dock_approach_speed * 60.
+    def _approach_dock(self, gcmd, tool, x, y, clear_feed, approach_feed,
+                       approaches):
+        # Returns the (dock, mount) switch states after the last approach.
         self._travel_to_lane(y, clear_feed)
         self._move(x=x - self.dock_predock_offset, feed=clear_feed)
         self._move(x=x - 10., feed=approach_feed)
         # Release only with the head seated in its holder and the carriage at
         # the mount. After lost steps the dock position is wrong, and an
         # unchecked release dropped the head; keep it locked on instead.
-        approaches = self.dock_seat_retries + 1
         for attempt in range(approaches):
             feed = approach_feed
             if attempt:
@@ -1344,7 +1345,51 @@ class Creator5Toolchanger:
                         tool, attempt + 1, approaches,
                         'closed' if seated else 'open',
                         'closed' if mounted else 'open'))
-        else:
+        return seated, mounted
+
+    def _rehome_xy_for_dock(self, gcmd, tool, x, approaches):
+        # The head is still locked on: pull it clear of the dock, move Z by
+        # dock_rehome_z, and re-home X/Y so the next approach uses a fresh
+        # position.
+        gcmd.respond_info(
+            'T%d not seated after %d approaches; X/Y may have lost steps. '
+            'Re-homing X/Y at Z%+.1f and docking again'
+            % (tool, approaches, self.dock_rehome_z))
+        self._move(x=x - self.dock_predock_offset,
+                   feed=self.dock_retry_speed * 60.)
+        toolhead = self.printer.lookup_object('toolhead')
+        status = toolhead.get_status(self.printer.get_reactor().monotonic())
+        if self.dock_rehome_z and 'z' in status.get('homed_axes', ''):
+            z = toolhead.get_position()[2] + self.dock_rehome_z
+            z = min(max(z, status['axis_minimum'].z),
+                    status['axis_maximum'].z)
+            self._move(z=z, feed=self.clearance_z_speed * 60.)
+        self._run('G28 X Y')
+
+    def _dock(self, gcmd, tool, raise_z=True):
+        x, y = self.docks[tool]
+        clear_feed = self.clear_travel_speed * 60.
+        if self.persist_babystep and self._printing():
+            self._persist_babystep(gcmd, tool)
+        # Do not clear nozzle Z while a tool is physically mounted.  A
+        # previously selected tool may have been left at zero by a slicer.
+        origin_z = self.printer.lookup_object('gcode_move').get_status()[
+            'homing_origin'][2]
+        if not math.isfinite(origin_z) or origin_z < 0.5:
+            self._apply_offsets(tool)
+        # Dock motion uses physical coordinates, independent of XY offsets.
+        self._run('SET_GCODE_OFFSET X=0 Y=0 MOVE=0')
+        if raise_z:
+            self._raise_z()
+        approach_feed = self.dock_approach_speed * 60.
+        approaches = self.dock_seat_retries + 1
+        seated, mounted = self._approach_dock(gcmd, tool, x, y, clear_feed,
+                                              approach_feed, approaches)
+        if not (seated and mounted) and self.dock_rehome:
+            self._rehome_xy_for_dock(gcmd, tool, x, approaches)
+            seated, mounted = self._approach_dock(gcmd, tool, x, y, clear_feed,
+                                                  approach_feed, approaches)
+        if not (seated and mounted):
             try:
                 self._run('TURN_OFF_HEATERS')
             except Exception:
@@ -1355,7 +1400,7 @@ class Creator5Toolchanger:
                 '(heaters off). XY may have lost steps: re-home before '
                 'docking' % (tool, 'closed' if seated else 'open',
                              'closed' if mounted else 'open', x, y,
-                             approaches))
+                             approaches * (2 if self.dock_rehome else 1)))
         self._run('MOTOR_RELEASE')
         self._pause_ms(self.release_latch_wait_ms)
         self._move(x=self.approach_x,
@@ -1646,14 +1691,30 @@ class Creator5Toolchanger:
                 'T%d wheel failure: active tool state is inconsistent; '
                 'print paused' % tool)
             return
-        if not lane.extruder_obj.tool_start_state:
-            # The separate presence switch owns runout and infinite spool.
-            # Its callback may be racing this encoder event.
+        # The presence switch owns runout and infinite spool, but it is
+        # debounced (debounce_delay, 10 s on a Creator 5) while the wheel
+        # reports a stop after detection_length mm. At a runout the tail has
+        # already left the switch when the wheel stops, but the debounced state
+        # still says present, so judge by the raw switch: empty means runout,
+        # and its handler takes over once the debounce runs out.
+        if not self._tool_start_present(lane.extruder_obj):
+            return
+        # The tail may be between the wheel and the switch: look once more
+        self._pause_ms(self.clog_confirm_ms)
+        if not self._tool_start_present(lane.extruder_obj):
             return
         afc.error.AFC_error(
             'E0163: Paused. T%d clog detected: filament is present but the '
             'wheel stopped moving. Clear the filament path before resuming.'
             % tool)
+
+    def _tool_start_present(self, extruder):
+        """The presence switch's raw state, ahead of its debounce."""
+        button = getattr(extruder, 'debounce_button_start', None)
+        raw = getattr(button, 'physical_state', None)
+        if raw is not None:
+            return bool(raw)
+        return bool(extruder.tool_start_state)
 
     def cmd_runout_switch(self, gcmd):
         """Continue a print paused by TOOL's runout on tool TO."""

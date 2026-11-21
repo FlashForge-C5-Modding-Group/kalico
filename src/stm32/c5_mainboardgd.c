@@ -81,7 +81,7 @@ static const struct c5_dma_stream dma_stream_z = {
                                | DMA_INTC_FTFIFC, 1),
 };
 
-static uint32_t
+C5_FAST static uint32_t
 pwm_base(uint8_t axis)
 {
     if (axis >= 3)
@@ -123,7 +123,7 @@ disable_all_pwm_outputs(void)
         TIMER_CHCTL2(pwm_bases[axis]) &= ~channel_enable;
 }
 
-static uint8_t
+C5_FAST static uint8_t
 control_output_valid(const struct c5_mclib_output *out)
 {
     if (out->signs & ~3U)
@@ -135,7 +135,7 @@ control_output_valid(const struct c5_mclib_output *out)
     return 1;
 }
 
-static void
+C5_FAST static void
 write_control_output(uint8_t axis, const struct c5_mclib_output *out)
 {
     uint32_t base = pwm_base(axis);
@@ -150,7 +150,7 @@ write_control_output(uint8_t axis, const struct c5_mclib_output *out)
     c5_mclib_acq_polarity(&acquisitions[axis], out->signs);
 }
 
-static void
+C5_FAST static void
 process_sample(uint8_t axis, int16_t raw0, int16_t raw1)
 {
     float ia, ib;
@@ -171,7 +171,7 @@ process_sample(uint8_t axis, int16_t raw0, int16_t raw1)
     write_control_output(axis, &out);
 }
 
-static void
+C5_FAST static void
 process_dma(const struct c5_dma_stream *stream)
 {
     uint32_t status = DMA_INTF0(DMA0);
@@ -183,21 +183,21 @@ process_dma(const struct c5_dma_stream *stream)
     process_sample(stream->axis, raw0, raw1);
 }
 
-void
+C5_FAST void
 DMA0_Channel0_IRQHandler(void)
 {
     process_dma(&dma_stream_y);
 }
 DECL_ARMCM_IRQ(DMA0_Channel0_IRQHandler, DMA0_Channel0_IRQn);
 
-void
+C5_FAST void
 DMA0_Channel1_IRQHandler(void)
 {
     process_dma(&dma_stream_z);
 }
 DECL_ARMCM_IRQ(DMA0_Channel1_IRQHandler, DMA0_Channel1_IRQn);
 
-void
+C5_FAST void
 ADC_IRQHandler(void)
 {
     uint32_t stat0 = ADC_STAT(ADC0);

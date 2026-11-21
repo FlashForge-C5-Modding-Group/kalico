@@ -57,6 +57,10 @@ enum { MF_DIR=1<<0, MF_DIR_LEVEL=1<<1 };
  #define HAVE_NEXT_STEP_HOOK 0
  static inline void
  c5_mainboardgd_next_step(struct gpio_out pin, uint32_t clock, uint8_t due) {}
+ static inline void
+ c5_mainboardgd_step_clock(uint32_t clock) {}
+ static inline void
+ c5_mainboardgd_step_mode(struct gpio_out pin, uint8_t both_edges) {}
 #endif
 
 struct stepper {
@@ -221,6 +225,9 @@ static uint_fast8_t
 stepper_event_full(struct timer *t)
 {
     struct stepper *s = container_of(t, struct stepper, time);
+    if (HAVE_NEXT_STEP_HOOK)
+        // Time the step from its schedule, not from when this ran
+        c5_mainboardgd_step_clock(s->time.waketime);
     gpio_out_toggle_noirq(s->step_pin);
     uint32_t curtime = timer_read_time();
     uint32_t min_next_time = curtime + s->step_pulse_ticks;
@@ -271,6 +278,8 @@ command_config_stepper(uint32_t *args)
     s->dir_pin = gpio_out_setup(args[2], 0);
     s->position = -POSITION_BIAS;
     s->step_pulse_ticks = args[4];
+    if (HAVE_NEXT_STEP_HOOK)
+        c5_mainboardgd_step_mode(s->step_pin, invert_step < 0);
     move_queue_setup(&s->mq, sizeof(struct stepper_move));
     if (HAVE_EDGE_OPTIMIZATION) {
         if (invert_step < 0 && s->step_pulse_ticks <= EDGE_STEP_TICKS)

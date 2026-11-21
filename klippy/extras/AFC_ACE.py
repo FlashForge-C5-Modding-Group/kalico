@@ -250,6 +250,16 @@ class afcACE(afcUnit):
         # Extra mm (beyond dist_hub) to retract when ejecting a hub-staged lane,
         # so the filament clears the hub and pulls fully back into the unit.
         self.eject_buffer = config.getfloat("eject_buffer", 475.0, minval=0.0)
+        # On a fresh insert (outside a print), feed the new spool all the way to
+        # its head's filament switch and stop there, instead of parking it at
+        # dist_hub. The last stretch goes in insert_feed_step mm steps, up to
+        # insert_feed_extra mm past where the switch should be.
+        self.insert_feed_to_toolhead = config.getboolean("insert_feed_to_toolhead", False)
+        self.insert_feed_step = config.getfloat("insert_feed_step", 10.0, minval=1.0)
+        self.insert_feed_extra = config.getfloat("insert_feed_extra", 250.0, minval=0.0)
+        # Lanes fed to their head's switch on insert; kept in a file so a load
+        # after a restart still knows the filament at the switch is this spool's
+        self._staged_at_toolhead: Optional[Set[str]] = None
         self.max_dryer_temperature = config.getfloat("max_dryer_temperature", 55.0, minval=0.0)
         # AFC_ACE_DRY ROTATE=1: every dry_rotate_interval seconds, each empty
         # slot gets a slow dry_rotate_length mm rollback so the spool turns
@@ -270,6 +280,7 @@ class afcACE(afcUnit):
         self._stuck_time = config.getfloat("stuck_time", 4.0, minval=2.0)
         self.calibration_step = config.getfloat("calibration_step", 50.0)
         self.baud_rate = config.getint("baud_rate", 115200)
+        self._serial_log = config.getboolean("serial_log", False)
 
         # Uncomment below once RFID and spoolman creation support is added
         # self.auto_spoolman_create = config.getboolean("auto_spoolman_create", False)
@@ -288,6 +299,8 @@ class afcACE(afcUnit):
         self._stuck_tripped = False
         self._slot_inventory: List[Dict[str, Any]] = [{} for _ in range(self.SLOTS_PER_UNIT)]
         self._operation_active = False
+        # Slot whose unload rollback assist waits for the nozzle to heat
+        self._pending_unload_assist: Optional[int] = None
 
         self._dry_rotate_timer: Any = None
         self._dry_rotate_started = 0.0
@@ -302,6 +315,10 @@ class afcACE(afcUnit):
         self._prev_states_stale = False
         self._prev_slot_states: dict[str, bool] = {}
         self._hub_load_suppressed: set[str] = set()
+        # Lanes whose slot was seen empty while the unit was idle (a spool
+        # out), and lanes already sent to stage a spool left half-loaded
+        self._seen_empty_idle: set[str] = set()
+        self._stage_attempted: set[str] = set()
         self._last_move_error: Optional[str] = None
         self._hw_status_time: Optional[float] = None
         self._temp_info_time: Optional[float] = None
@@ -569,6 +586,9 @@ class afcACE(afcUnit):
         :return Optional[Any]: the logger, or None when no log file is configured
         """
         logger = logging.getLogger("AFC_ACE_serial_file")
+        if not self._serial_log:
+            logger.setLevel(logging.WARNING)
+            return logger
         if logger.handlers:
             return logger
         logger.setLevel(logging.DEBUG)
@@ -1034,11 +1054,36 @@ class afcACE(afcUnit):
 
             prep_done = lane._afc_prep_done
 
+            # A slot seen empty while the unit was idle and then ready again is
+            # a spool change, even when the removal fell on the first poll after
+            # an operation: drop the post-unload reload suppression so the new
+            # spool stages to the hub.
+            if not slot_transient:
+                if not slot_ready and not unit_busy:
+                    self._seen_empty_idle.add(lane.name)
+                    self._stage_attempted.discard(lane.name)
+                elif slot_ready and lane.name in self._seen_empty_idle:
+                    self._seen_empty_idle.discard(lane.name)
+                    self._hub_load_suppressed.discard(lane.name)
+
+            # A spool marked Loaded that never staged to the hub (a fresh insert
+            # taken for the unloaded spool): stage it once, as on an insert.
+            stale_loaded = (lane.status == AFCLaneState.LOADED
+                            and not lane.loaded_to_hub
+                            and not lane.tool_loaded
+                            and not self._operation_active
+                            and not unit_busy
+                            and lane.name not in self._hub_load_suppressed
+                            and lane.name not in self._stage_attempted)
+            if (slot_ready and not slot_transient and prep_done and stale_loaded):
+                self._stage_attempted.add(lane.name)
+                self.logger.info(f"ACE: {lane.name} is loaded but not staged, staging it to the hub")
+
             # Slot ready but lane stuck in NONE, restore loaded state.
             if (slot_ready
                 and not slot_transient
                 and prep_done
-                and lane.status == AFCLaneState.NONE):
+                and (lane.status == AFCLaneState.NONE or stale_loaded)):
                 if (lane.tool_loaded
                     and hasattr(lane, 'extruder_obj')
                     and lane.extruder_obj.lane_loaded == lane.name):
@@ -1149,7 +1194,8 @@ class afcACE(afcUnit):
         :return float: Full unload length when tool-loaded, else
             dist_hub + eject_buffer.
         """
-        if cur_lane.tool_loaded:
+        if (cur_lane.tool_loaded
+            or cur_lane.name in self._toolhead_staged()):
             return self._get_unload_length(cur_lane)
         return cur_lane.dist_hub + self.eject_buffer
 
@@ -1339,6 +1385,7 @@ class afcACE(afcUnit):
         if slot < self.SLOTS_PER_UNIT:
             self._clear_slot_inventory(slot)
         self._hub_load_suppressed.discard(lane.name)
+        self._set_toolhead_staged(lane.name, False)
         lane.loaded_to_hub = False
         self._set_hub_state(lane, False)
 
@@ -1634,6 +1681,100 @@ class afcACE(afcUnit):
             return False
         return True
 
+    def _staged_file(self) -> str:
+        return os.path.join(self.afc.cfgloc, f"AFC.{self.name}.staged_at_toolhead.json")
+
+    def _toolhead_staged(self) -> Set[str]:
+        """
+        Lanes whose spool was fed to the head's switch on insert.
+
+        :return Set[str]: Lane names, read from disk on first use.
+        """
+        if self._staged_at_toolhead is None:
+            try:
+                with open(self._staged_file()) as f:
+                    self._staged_at_toolhead = set(json.load(f))
+            except (OSError, ValueError):
+                self._staged_at_toolhead = set()
+        return self._staged_at_toolhead
+
+    def _set_toolhead_staged(self, lane_name: str, staged: bool) -> None:
+        names = self._toolhead_staged()
+        if (lane_name in names) == staged:
+            return
+        if staged:
+            names.add(lane_name)
+        else:
+            names.discard(lane_name)
+        try:
+            with open(self._staged_file(), "w") as f:
+                json.dump(sorted(names), f)
+        except OSError as e:
+            self.logger.warning(f"ACE: could not save the toolhead-staged lanes: {e}")
+
+    def _stage_to_toolhead(self, lane: AFCLane) -> None:
+        """
+        Feed a freshly inserted spool to its head's filament switch and stop.
+
+        Most of the way (dist_hub plus afc_bowden_length less the slow
+        approach) goes in one feed, with the RFID scan, then insert_feed_step
+        steps until the switch triggers. If it never does, the filament is wound
+        back to the dist_hub park point, as a normal staged spool.
+
+        :param lane: Lane whose slot just had a spool inserted.
+        """
+        if lane.tool_loaded or not lane.prep_state:
+            return
+        if not (self._ace and self._ace.connected):
+            return
+        if self.afc.function.is_printing():
+            # The unit feeds one slot at a time and is assisting the print
+            self.logger.info(f"ACE: {lane.name} was inserted during a print; the load will "
+                             "feed it to the head")
+            return
+        if lane.get_toolhead_pre_sensor_state():
+            self.logger.info(f"ACE: {lane.name}'s head switch already sees filament, "
+                             "not feeding the new spool to it")
+            return
+        slot = self._get_slot(lane.name)
+        hub = lane.hub_obj
+        bowden = getattr(hub, 'afc_bowden_length', 0) if hub else 0
+        approach = min(max(self.load_approach_length, 0.0), bowden)
+        with self._operation():
+            try:
+                # Wait out the unit's own insert cycle, or it rejects the feed
+                self._wait_for_ace_ready(timeout=self.prep_ready_timeout)
+                fast = lane.dist_hub + bowden - approach
+                if self._feed_to_hub_probing(lane, slot, fast) is False:
+                    lane.loaded_to_hub = False
+                    self._set_hub_state(lane, False)
+                    lane.prep_state = False
+                    self.afc.save_vars()
+                    return
+                fed, reached = 0.0, lane.get_toolhead_pre_sensor_state()
+                if not reached:
+                    fed, reached = self._feed_until_sensor(
+                        slot, lane, approach + self.insert_feed_extra,
+                        step_size=self.insert_feed_step)
+                if not reached:
+                    back = bowden - approach + fed
+                    self.logger.warning(
+                        f"ACE: {lane.name} did not reach its head switch "
+                        f"({fast + fed:.0f}mm fed); winding it back {back:.0f}mm to the park point")
+                    self._wait_for_ace_ready()
+                    self._ace.unwind_filament(slot, back, self.retract_speed)
+                    self._wait_for_feed_complete(slot, back, self.retract_speed)
+            except Exception as e:
+                self.logger.error(f"ACE: feeding {lane.name} to its head switch failed: {e}")
+                return
+            lane.loaded_to_hub = True
+            self._set_hub_state(lane, True)
+            self._set_toolhead_staged(lane.name, reached)
+            self.afc.save_vars()
+            if reached:
+                self.logger.info(f"ACE: {lane.name} fed to its head switch "
+                                 f"({fast + fed:.0f}mm), ready to load")
+
     def prep_post_load(self, lane: AFCLane) -> None:
         """
         Stage filament to hub via ACE serial feed.
@@ -1644,6 +1785,10 @@ class afcACE(afcUnit):
 
         :param lane: Lane to stage to the hub.
         """
+        if self.insert_feed_to_toolhead:
+            if not lane.loaded_to_hub:
+                self._stage_to_toolhead(lane)
+            return
         if self._unit_load_to_hub is not None:
             load_to_hub = self._unit_load_to_hub
         else:
@@ -1735,6 +1880,7 @@ class afcACE(afcUnit):
                                      f"(dist_hub={lane.dist_hub:.0f}mm)")
                     self._ace.unwind_filament(slot, dist, self.retract_speed)
                     self._wait_for_feed_complete(slot, dist, self.retract_speed)
+                    self._set_toolhead_staged(lane.name, False)
                     lane.loaded_to_hub = False
                     self._set_hub_state(lane, False)
                     # Suppress the heartbeat's auto reload-to-hub until the spool
@@ -2332,6 +2478,13 @@ class afcACE(afcUnit):
             feed_dist = max(feed_dist, 50.0)
         else:
             feed_dist = self._get_bowden_length(cur_lane)
+        # Fed to the head's switch when it was inserted: nothing left to feed
+        staged_at_switch = (cur_lane.name in self._toolhead_staged()
+                            and cur_lane.get_toolhead_pre_sensor_state())
+        if staged_at_switch:
+            feed_dist = 0.0
+            self.logger.info(f"ACE load: {cur_lane.name} is already at its head switch")
+        self._set_toolhead_staged(cur_lane.name, False)
 
         self._set_hub_state(cur_lane, True)
         self._hub_load_suppressed.discard(cur_lane.name)
@@ -2346,7 +2499,8 @@ class afcACE(afcUnit):
         # Pre-feed check: if the toolhead sensor detects filament before
         # we start feeding, there's stuck filament from a previous load.
         # Don't push more filament into an occupied toolhead.
-        if cur_lane.get_toolhead_pre_sensor_state():
+        if (not staged_at_switch
+            and cur_lane.get_toolhead_pre_sensor_state()):
             message = (f"Toolhead sensor detects filament before ACE feed for "
                        f"{cur_lane.name}.\nFilament may be stuck from a previous "
                        f"load, clear the toolhead before loading.\n"
@@ -2546,7 +2700,61 @@ class afcACE(afcUnit):
         self._operation_active = True
         slot = self._get_slot(cur_lane.name)
         self._stop_feed_assist(slot)
-        self._start_unload_assist(slot)
+        self._start_unload_assist_when_hot(slot, cur_extruder)
+
+    # The rollback assist starts once the nozzle is within this of its target
+    _UNLOAD_ASSIST_HOT_MARGIN = 10.0
+    _UNLOAD_ASSIST_POLL = 0.2
+    _UNLOAD_ASSIST_TIMEOUT = 900.0
+
+    def _nozzle_hot(self, heater: Any) -> bool:
+        """
+        Whether the nozzle has melted the filament enough to pull it back.
+
+        :param heater: The toolhead extruder's heater.
+        :return bool: True at or near a set target temperature.
+        """
+        temp, target = heater.get_temp(self.afc.reactor.monotonic())
+        return (target > 0 and heater.can_extrude
+                and temp >= target - self._UNLOAD_ASSIST_HOT_MARGIN)
+
+    def _start_unload_assist_when_hot(self, slot: int, cur_extruder: Any) -> None:
+        """
+        Start the unload's rollback assist only once the nozzle is hot.
+
+        AFC calls lane_unloading() before it heats the extruder for the
+        unload. The ACE reeling in against filament still frozen in a cold
+        nozzle snapped it at the toolhead inlet, so wait for the heat.
+
+        :param slot: 0-based ACE slot index of the lane being unloaded.
+        :param cur_extruder: AFC extruder object of the lane.
+        """
+        try:
+            heater = cur_extruder.toolhead_extruder.get_heater()
+        except Exception:
+            heater = None
+        if heater is None or self._nozzle_hot(heater):
+            self._start_unload_assist(slot)
+            return
+        self.logger.debug(f"ACE {self.name}: rollback assist on slot {slot} waits for the nozzle to heat")
+        self._pending_unload_assist = slot
+        reactor = self.afc.reactor
+        deadline = reactor.monotonic() + self._UNLOAD_ASSIST_TIMEOUT
+
+        def poll(eventtime: float) -> float:
+            if (self._pending_unload_assist != slot or not self._operation_active
+                    or eventtime > deadline):
+                if self._pending_unload_assist == slot:
+                    self._pending_unload_assist = None
+                return reactor.NEVER
+            if not self._nozzle_hot(heater):
+                return eventtime + self._UNLOAD_ASSIST_POLL
+            self._pending_unload_assist = None
+            # Start it outside the timer: it waits on the ACE's reply.
+            reactor.register_callback(lambda et: self._start_unload_assist(slot))
+            return reactor.NEVER
+
+        reactor.register_timer(poll, reactor.monotonic() + self._UNLOAD_ASSIST_POLL)
 
     def _start_unload_assist(self, slot: int) -> None:
         """
@@ -2729,6 +2937,7 @@ class afcACE(afcUnit):
 
         self._set_hub_state(cur_lane, False)
         cur_lane.loaded_to_hub = True
+        self._set_toolhead_staged(cur_lane.name, False)
         self.lane_tool_unloaded(cur_lane)
         self._hub_load_suppressed.add(cur_lane.name)
 
@@ -3844,6 +4053,9 @@ class afcACE(afcUnit):
 
         :param slot: 0-based ACE slot index.
         """
+        if self._pending_unload_assist == slot:
+            # The unwind is next: the rollback assist must not start after it
+            self._pending_unload_assist = None
         if slot not in self._feed_assist_active:
             return
         if not (self._ace and self._ace.connected):
@@ -4684,6 +4896,11 @@ class afcACE(afcUnit):
 
 _logger = logging.getLogger("AFC_ACE_serial")
 
+
+def debug_enabled(logger) -> bool:
+    is_enabled = getattr(logger, "isEnabledFor", None)
+    return is_enabled is None or is_enabled(logging.DEBUG)
+
 FRAME_HEADER = b'\xff\xaa'
 FRAME_FOOTER = b'\xfe'
 MAX_PAYLOAD_SIZE = 1024
@@ -5310,7 +5527,8 @@ class ACEConnection:
             error_str = f"ACE write failed: {e}"
             raise ACESerialError(error_str)
 
-        self._logger.debug(f"ACE TX: {request}")
+        if debug_enabled(self._logger):
+            self._logger.debug(f"ACE TX: {request}")
 
         # try/finally so the pending entry is always removed, even if wait() is
         # interrupted.
@@ -5588,7 +5806,8 @@ class ACEConnection:
                 self._logger.warning(f"ACE frame: JSON parse error: {e}")
                 continue
 
-            self._logger.debug(f"ACE RX: {response}")
+            if debug_enabled(self._logger):
+                self._logger.debug(f"ACE RX: {response}")
             self._handle_response(response)
 
     def _response_matches_pending(self, response_id: Any, response: Dict[str, Any]) -> bool:

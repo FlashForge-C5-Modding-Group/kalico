@@ -11,6 +11,9 @@
 #include "board/misc.h" // timer_from_us
 #include "command.h" // shutdown
 #include "sched.h" // sched_timer_dispatch
+#if CONFIG_C5_MAINBOARDGD
+ #include "c5_mainboardgd.h" // c5_mainboardgd_timer_irq_cycles
+#endif
 
 DECL_CONSTANT("CLOCK_FREQ", CONFIG_CLOCK_FREQ);
 
@@ -156,8 +159,14 @@ void __visible __aligned(16) // aligning helps stabilize perf benchmarks
 SysTick_Handler(void)
 {
     irq_disable();
+#if CONFIG_C5_MAINBOARDGD
+    uint32_t start = timer_read_time();
+#endif
     uint32_t diff = timer_dispatch_many();
     timer_set_diff(diff);
+#if CONFIG_C5_MAINBOARDGD
+    c5_mainboardgd_irq_cycles(C5_IRQ_TIMER, timer_read_time() - start);
+#endif
     irq_enable();
 }
 DECL_ARMCM_IRQ(SysTick_Handler, SysTick_IRQn);

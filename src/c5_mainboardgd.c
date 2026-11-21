@@ -5,6 +5,7 @@
 // This file may be distributed under the terms of the GNU GPLv3 license.
 
 #include <stdint.h>
+#include <string.h> // memset
 #include "autoconf.h" // CONFIG_CLOCK_FREQ
 #include "basecmd.h" // oid_alloc
 #include "board/internal.h" // DWT
@@ -52,17 +53,63 @@ c5_mainboardgd_direction(uint8_t axis, uint8_t value)
     irq_restore(flag);
 }
 
+#define CLOCKS_PER_MOTOR_TICK (CONFIG_CLOCK_FREQ / C5_MOTOR_TIME_FREQ)
+_Static_assert(CONFIG_CLOCK_FREQ % C5_MOTOR_TIME_FREQ == 0,
+               "mclib motor time must divide the MCU clock");
+
+// Scheduled MCU clock of the step event being run, set by the step queue
+// just before it toggles the step pin
+static uint32_t step_clock;
+static uint8_t step_clock_valid;
+
+void
+c5_mainboardgd_step_clock(uint32_t clock)
+{
+    step_clock = clock;
+    step_clock_valid = 1;
+}
+
+// Motor time of an MCU clock at most a second in the past
+static uint32_t
+motor_time_of(uint32_t clock)
+{
+    uint32_t late = timer_read_time() - clock;
+    if (late > CONFIG_CLOCK_FREQ)
+        late = 0;
+    return c5_mainboardgd_motor_time() - late / CLOCKS_PER_MOTOR_TICK;
+}
+
 void
 c5_mainboardgd_step(uint8_t axis)
 {
     irqstatus_t flag = irq_save();
-    c5_mclib_step(get_motor(axis), c5_mainboardgd_motor_time());
+    uint32_t when = step_clock_valid ? motor_time_of(step_clock)
+        : c5_mainboardgd_motor_time();
+    step_clock_valid = 0;
+    c5_mclib_step(get_motor(axis), when);
     irq_restore(flag);
 }
 
-#define CLOCKS_PER_MOTOR_TICK (CONFIG_CLOCK_FREQ / C5_MOTOR_TIME_FREQ)
-_Static_assert(CONFIG_CLOCK_FREQ % C5_MOTOR_TIME_FREQ == 0,
-               "mclib motor time must divide the MCU clock");
+// Cycles run by each preempting interrupt (running totals), and the longest
+// single Klipper timer dispatch since the last timing query (it masks every
+// interrupt, the motor control included)
+static volatile uint32_t irq_cycles[C5_IRQ_SOURCES];
+static uint32_t timer_irq_max;
+
+void
+c5_mainboardgd_irq_cycles(uint8_t source, uint32_t cycles)
+{
+    irq_cycles[source] += cycles;
+    if (source == C5_IRQ_TIMER && cycles > timer_irq_max)
+        timer_irq_max = cycles;
+}
+
+// Per axis since the last timing query: the longest update counting only
+// its own cycles, and the most each interrupt took out of a single update
+struct preempt_stats {
+    uint32_t own_max, stolen_max[C5_IRQ_SOURCES];
+};
+static struct preempt_stats preempt[C5_MOTOR_COUNT];
 
 // The step queue's next step for an axis, in MCU clock ticks
 void
@@ -110,14 +157,32 @@ c5_mainboardgd_stalled(uint8_t axis)
     return c5_mclib_stalled(get_motor(axis));
 }
 
-uint8_t
+C5_FAST uint8_t
 c5_mainboardgd_control(uint8_t axis, uint32_t now, float ia, float ib,
                        struct c5_mclib_output *out)
 {
-    struct c5_mclib_motor *motor = get_motor(axis);
+    // axis comes from the board's own sample routing, always 0..2
+    struct c5_mclib_motor *motor = &motors[axis];
+    uint32_t before[C5_IRQ_SOURCES];
+    uint_fast8_t i;
+    for (i = 0; i < C5_IRQ_SOURCES; i++)
+        before[i] = irq_cycles[i];
     uint32_t start = DWT->CYCCNT;
     uint8_t status = c5_mclib_update(motor, now, ia, ib, out);
-    c5_mclib_note_timing(motor, DWT->CYCCNT - start);
+    uint32_t cycles = DWT->CYCCNT - start;
+    c5_mclib_note_timing(motor, cycles, now);
+    struct preempt_stats *p = &preempt[axis];
+    uint32_t stolen_total = 0;
+    for (i = 0; i < C5_IRQ_SOURCES; i++) {
+        uint32_t stolen = irq_cycles[i] - before[i];
+        stolen_total += stolen;
+        if (stolen > p->stolen_max[i])
+            p->stolen_max[i] = stolen;
+    }
+    // Nested interrupts can count twice; never report less than zero
+    uint32_t own = cycles > stolen_total ? cycles - stolen_total : 0;
+    if (own > p->own_max)
+        p->own_max = own;
     return status;
 }
 
@@ -300,13 +365,29 @@ command_mclib_clear_slip_log(uint32_t *args)
 DECL_COMMAND(command_mclib_clear_slip_log, "mclib_clear_slip_log oid=%c");
 
 void
+command_mclib_set_interpolation(uint32_t *args)
+{
+    struct c5_mclib_motor *motor = lookup_motor(args[0]);
+    irqstatus_t flag = irq_save();
+    c5_mclib_interpolation(motor, args[1]);
+    irq_restore(flag);
+}
+DECL_COMMAND(command_mclib_set_interpolation,
+             "mclib_set_interpolation oid=%c mode=%c");
+
+void
 command_mclib_query_timing(uint32_t *args)
 {
     uint8_t oid = args[0];
     struct c5_mclib_motor *motor = lookup_motor(oid);
     struct c5_mclib_timing t;
+    uint8_t axis = motor - motors;
     irqstatus_t flag = irq_save();
     c5_mclib_take_timing(motor, &t);
+    uint32_t timer_max = timer_irq_max;
+    timer_irq_max = 0;
+    struct preempt_stats p = preempt[axis];
+    memset(&preempt[axis], 0, sizeof(preempt[axis]));
     irq_restore(flag);
     uint32_t d_integral = t.d_integral_samples
         ? (uint32_t)(t.d_integral_sum * 1000.0f
@@ -320,6 +401,21 @@ command_mclib_query_timing(uint32_t *args)
           " d_integral=%u d_samples=%u hold_noise=%u hold_samples=%u",
           oid, t.max, t.total, t.samples, d_integral, t.d_integral_samples,
           hold_noise, t.hold_noise_samples);
+    // A second message: one with every field can pass the 64 byte limit
+    sendf("mclib_timing_run oid=%c run_max=%u run_avg=%u run_samples=%u"
+          " gap_max=%u missed=%u timer_max=%u own_max=%u serial_max=%u"
+          " timer_steal=%u tick_steal=%u",
+          oid, t.run_max,
+          t.run_samples ? (uint32_t)(t.run_total / t.run_samples) : 0u,
+          t.run_samples, t.gap_max, t.missed, timer_max, p.own_max,
+          p.stolen_max[C5_IRQ_SERIAL], p.stolen_max[C5_IRQ_TIMER],
+          p.stolen_max[C5_IRQ_TICK]);
+    // Current tracking ripple RMS in microamps
+    uint32_t ripple = t.ripple_samples
+        ? (uint32_t)(__builtin_sqrt(t.ripple_sum / t.ripple_samples)
+                     * 1000000.0) : 0u;
+    sendf("mclib_quality oid=%c ripple=%u ripple_samples=%u",
+          oid, ripple, t.ripple_samples);
 }
 DECL_COMMAND(command_mclib_query_timing, "mclib_query_timing oid=%c");
 

@@ -31,4 +31,8 @@ Plug the ACE in and restart Klipper (`RESTART` or `FIRMWARE_RESTART`) to use it 
 [AFC_ACE2 ACE_1]
 fallback_without_ace: True    # False: always use the ACE config (errors when it's missing)
 missing_ace_wait: 20          # seconds to wait for it after a boot
+serial_log: False             # True: log every ACE request and reply to AFC_ACE_serial.log
 ```
+
+`serial_log` is off by default: the ACE is polled several times a second, so the log grows by about 10 MB every
+few hours and costs Klipper CPU time. Turn it on only to debug ACE communication.

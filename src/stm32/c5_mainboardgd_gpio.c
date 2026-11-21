@@ -28,6 +28,12 @@ static GPIO_TypeDef * const digital_regs[] = {
 static uint8_t virtual_ph_bank, virtual_pj_bank;
 static uint16_t pj_shadow;
 static uint8_t ph_shadow, master_inhibit;
+// Axes whose stepper steps on every edge of its step pin (bit per axis)
+static uint8_t both_edge_axes;
+
+// The host asks for step-on-both-edges when the firmware declares this, so a
+// step is one timer event instead of a step and an unstep
+DECL_CONSTANT("C5_MAINBOARD_STEP_BOTH_EDGE", 1);
 
 static uint8_t
 is_digital_pin(uint32_t pin)
@@ -178,16 +184,34 @@ virtual_out_toggle_noirq(struct gpio_out g)
     pj_shadow ^= g.bit;
     uint8_t value = !!(pj_shadow & g.bit);
     switch (index & 3U) {
-    case 0:
-        if (value && !master_inhibit)
-            c5_mainboardgd_step(pj_axis(index));
+    case 0: {
+        uint8_t axis = pj_axis(index);
+        if ((value || both_edge_axes & (1U << axis)) && !master_inhibit)
+            c5_mainboardgd_step(axis);
         break;
+    }
     case 1:
         c5_mainboardgd_direction(pj_axis(index), value);
         break;
     default:
         break;
     }
+}
+
+// Stepper config hook: whether this step pin steps on both edges
+void
+c5_mainboardgd_step_mode(struct gpio_out g, uint8_t both_edges)
+{
+    if (g.regs != &virtual_pj_bank)
+        return;
+    uint8_t index = virtual_bit_index(g.bit);
+    if (index >= 12 || (index & 3U))
+        return;
+    uint8_t mask = 1U << pj_axis(index);
+    if (both_edges)
+        both_edge_axes |= mask;
+    else
+        both_edge_axes &= ~mask;
 }
 
 // Step queue hook: pass the next step time on to the motor it drives

@@ -9,6 +9,9 @@
 #include "compiler.h" // DIV_ROUND_CLOSEST
 #include "internal.h" // USART0
 #include "sched.h" // DECL_INIT
+#if CONFIG_C5_MAINBOARDGD
+ #include "c5_mainboardgd.h" // c5_mainboardgd_irq_cycles
+#endif
 
 DECL_CONSTANT_STR("RESERVE_PINS_serial", "PA10,PA9");
 
@@ -20,6 +23,9 @@ void c5_fault_note_host(void);
 void __visible
 usart0_irq_body(uint32_t *frame)
 {
+#if CONFIG_C5_MAINBOARDGD
+    uint32_t start = DWT->CYCCNT;
+#endif
     uint32_t stat = USART0->STAT;
     if (stat & USART_STAT_RBNE) {
         serial_rx_byte(USART0->RDATA);
@@ -39,6 +45,7 @@ usart0_irq_body(uint32_t *frame)
 #if CONFIG_C5_MAINBOARDGD
     // Runs at priority 0, so it preempts a stuck motor interrupt.
     c5_fault_stall_check(frame);
+    c5_mainboardgd_irq_cycles(C5_IRQ_SERIAL, DWT->CYCCNT - start);
 #else
     (void)frame;
 #endif

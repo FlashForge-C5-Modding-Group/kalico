@@ -53,6 +53,7 @@ class MCU_stepper:
         self._dir_pin = dir_pin_params["pin"]
         self._invert_dir = self._orig_invert_dir = dir_pin_params["invert"]
         self._step_both_edge = self._req_step_both_edge = False
+        self._max_step_error = MAX_STEPCOMPRESS_ERROR
         self._mcu_position_offset = 0.0
         self._reset_cmd_tag = self._get_position_cmd = None
         self._active_callbacks = []
@@ -92,6 +93,10 @@ class MCU_stepper:
 
     def get_pulse_duration(self):
         return self._step_pulse_duration, self._step_both_edge
+
+    def set_max_step_error(self, seconds):
+        # How early a compressed step may come (before the config is sent)
+        self._max_step_error = seconds
 
     def setup_default_pulse_duration(self, pulse_duration, step_both_edge):
         if self._step_pulse_duration is None:
@@ -169,7 +174,7 @@ class MCU_stepper:
             "stepper_position oid=%c pos=%i",
             oid=self._oid,
         )
-        max_error_ticks = self._mcu.seconds_to_clock(MAX_STEPCOMPRESS_ERROR)
+        max_error_ticks = self._mcu.seconds_to_clock(self._max_step_error)
         ffi_main, ffi_lib = chelper.get_ffi()
         ffi_lib.stepcompress_fill(
             self._stepqueue,
