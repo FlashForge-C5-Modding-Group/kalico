@@ -33,6 +33,34 @@ if TYPE_CHECKING:
     from extras.AFC_stepper import AFCExtruderStepper
     from extras.AFC_unit import afcUnit
 
+# Nozzle temperatures (C) by filament type, for spools with no temperature of
+# their own when default_material_temps has nothing as specific. Keys are
+# matched against the lane's material ignoring case, spaces and separators;
+# the longest matching key wins, so PLA-CF finds placf before pla.
+MATERIAL_TEMPS = {
+    "pla": 215, "pla+": 220, "plapro": 220, "silk": 225, "plasilk": 225,
+    "plamatte": 215, "matte": 215, "placf": 225, "plagf": 225, "wood": 210,
+    "plawood": 210, "plametal": 220, "glow": 215,
+    "petg": 240, "petg+": 245, "petgcf": 250, "petggf": 250, "petghf": 245,
+    "pctg": 255, "pet": 250, "petcf": 270, "cpe": 250,
+    "abs": 255, "abs+": 255, "abscf": 260, "absgf": 260,
+    "asa": 260, "asacf": 265, "asagf": 265,
+    "hips": 235,
+    "pc": 270, "pccf": 275, "pcgf": 275, "pcabs": 260, "pcpbt": 265,
+    "pa": 270, "nylon": 260, "pa6": 270, "pa12": 260, "pacf": 280,
+    "pagf": 280, "pa6cf": 285, "pa6gf": 285, "pa12cf": 270, "paht": 290,
+    "pahtcf": 295, "ppa": 295, "ppacf": 300,
+    "pp": 230, "ppcf": 240, "ppgf": 240,
+    "tpu": 225, "tpe": 225, "flex": 225, "peba": 230,
+    "pva": 210, "bvoh": 210, "pvb": 210,
+}
+
+
+def _material_key(name: str) -> str:
+    """Lowercase, keeping letters, digits and '+' (PLA-CF and pla cf both become placf)."""
+    return ''.join(ch for ch in str(name).lower() if ch.isalnum() or ch == '+')
+
+
 ERROR_STR = "Error trying to import {import_lib}, please rerun install-afc.sh script in your AFC-Klipper-Add-On directory then restart klipper\n\n{trace}"
 
 try: from extras.AFC_lane import (
@@ -816,16 +844,25 @@ class afc:
             and cur_lane.extruder_temp > self.heater.min_extrude_temp):
             temp_value = cur_lane.extruder_temp
             using_min_value = False
-        elif self.default_material_temps is not None and cur_lane.material is not None:
-            lane_material = str(cur_lane.material).strip().lower()
-            for mat in self.default_material_temps:
-                m = mat.split(":")
-                mat_key = m[0].strip().lower()
-                # Use substring match for material name (case-insensitive, ignore whitespace)
-                if mat_key in lane_material:
-                    temp_value = m[1]
-                    using_min_value = False
-                    break
+        elif cur_lane.material:
+            # The most specific match wins: default_material_temps first, then
+            # the built-in MATERIAL_TEMPS (so PLA-CF does not take PLA's temp)
+            lane_material = _material_key(cur_lane.material)
+            best_len, best_temp = 0, None
+            for mat in self.default_material_temps or []:
+                key, _, value = mat.partition(":")
+                key = _material_key(key)
+                if key and key != 'default' and key in lane_material and len(key) > best_len:
+                    try:
+                        best_len, best_temp = len(key), float(value)
+                    except ValueError:
+                        continue
+            for key, value in MATERIAL_TEMPS.items():
+                if key in lane_material and len(key) > best_len:
+                    best_len, best_temp = len(key), value
+            if best_temp is not None:
+                temp_value = best_temp
+                using_min_value = False
         return float(temp_value), using_min_value
 
     def lane_load_temp(self, cur_lane: AFCLane) -> float:
