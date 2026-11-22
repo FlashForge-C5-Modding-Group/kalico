@@ -2797,12 +2797,83 @@ class afc:
         else:
             self.error.AFC_error(f"Error trying to lookup lane for {Tcmd}")
 
+    def _creator5_multiplex_swap_needed(self, cur_lane: AFCLane) -> bool:
+        """
+        A Creator 5 head fed by several lanes through a multiplexing adapter
+        needs its filament swapped, not just the head: only when the lane's
+        unit has multiplexing on and the head holds (or should hold) another
+        lane.
+
+        :param cur_lane: Lane being changed to
+        :return bool: True to swap filament at the purge bucket
+        """
+        if not getattr(cur_lane.unit_obj, 'multiplex', False):
+            return False
+        loaded = cur_lane.extruder_obj.lane_loaded
+        if loaded == cur_lane.name:
+            return False
+        if loaded is not None:
+            return loaded in self.lanes
+        # An empty head: load this lane if it is ready to go
+        return bool(cur_lane.load_state)
+
+    def _creator5_multiplex_change(self, cur_lane: AFCLane, purge_length: Optional[float],
+                                   restore_pos: bool, gcmd: Optional[GCodeCommand]) -> None:
+        """
+        Change to a lane that shares its Creator 5 head with others: take the
+        head to the purge bucket, unload the lane in it (parked just past the
+        head's switch), load the new one, purge the flush and go back to the
+        print.
+
+        :param cur_lane: Lane being changed to
+        :param purge_length: Flush to purge in mm (the slicer's PURGE_LENGTH),
+            else the unit's multiplex_purge_length, else the toolchanger's
+        :param restore_pos: Return to the saved print position afterwards
+        :param gcmd: command context to run macros through, if any
+        """
+        self.afcDeltaTime.set_start_time()
+        was_saved = self.position_saved
+        self.save_pos()
+        saved_here = self.position_saved and not was_saved
+        was_changing = self.in_toolchange
+        self.in_toolchange = True
+        try:
+            loaded = cur_lane.extruder_obj.lane_loaded
+            self.logger.info(f"Multiplex change on {cur_lane.extruder_obj.name}: "
+                             f"{loaded} -> {cur_lane.name}")
+            # The head itself first (nothing happens when it is already mounted)
+            cur_lane.tool_swap(gcmd=gcmd)
+            # Ooze from the unload and the new filament lands in the bucket
+            self.run_script('C5_MOVE_TO_PURGE_BUCKET', gcmd)
+            # TOOL_LOAD unloads the lane the head holds before loading this one.
+            # next_lane_load keeps TOOL_UNLOAD on this head (a stale one could
+            # send it to swap heads).
+            self.next_lane_load = cur_lane.name
+            if not self.TOOL_LOAD(cur_lane, set_start_time=False, gcmd=gcmd):
+                return
+            if purge_length is None:
+                purge_length = getattr(cur_lane.unit_obj, 'multiplex_purge_length', None)
+            # At the current height: a swap between multiplexed lanes never lowers Z
+            purge = 'C5_TOOL_PURGE KEEP_Z=1'
+            if purge_length:
+                purge += ' LENGTH=%.1f' % purge_length
+            self.run_script(purge, gcmd)
+            if restore_pos and saved_here:
+                self.restore_pos(move_z_first=False, keep_offsets=True)
+        finally:
+            self.in_toolchange = was_changing
+            self.afcDeltaTime.log_total_time("Total multiplex change time:")
+
     def CHANGE_TOOL(self, cur_lane: AFCLane, purge_length: Optional[float]=None,
                     restore_pos: bool=True, new_extruder_temp: Optional[float]=None,
                     gcmd: Optional[GCodeCommand]=None) -> None:
         """
         Perform a tool change, or only the physical head swap on a Creator 5.
         """
+        if (cur_lane.extruder_obj.creator5_tool_index is not None
+            and self._creator5_multiplex_swap_needed(cur_lane)):
+            self._creator5_multiplex_change(cur_lane, purge_length, restore_pos, gcmd)
+            return
         if cur_lane.extruder_obj.creator5_tool_index is not None:
             # Creator 5 swaps complete heads. AFC's usual CHANGE_TOOL path
             # unloads and reloads filament, which drives the shared extruder

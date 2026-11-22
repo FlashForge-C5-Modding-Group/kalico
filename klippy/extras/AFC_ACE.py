@@ -167,6 +167,9 @@ class afcACE(afcUnit):
     assist reconciled to the active lane.
     """
     SLOTS_PER_UNIT = 4
+    # A load feeds from the slot until the head's switch triggers, so a lane
+    # whose spool is only in the slot (ejected, never staged) can still load
+    loads_from_slot = True
     _LOGO_TITLE = "ACE PRO"   # AFC_ACE2 overrides this for the Pro 2 prep logo
     _CONNECT_MAX_RETRIES = 5
     _CONNECT_RETRY_DELAYS = [2.0, 3.0, 5.0, 8.0, 10.0]
@@ -223,6 +226,9 @@ class afcACE(afcUnit):
         self.max_feed_speed = config.getfloat("max_feed_speed", FEED_SPEED_CEILING, minval=1.0)
         self.feed_speed = min(config.getfloat("feed_speed", 100.0), self.max_feed_speed)
         self.retract_speed = min(config.getfloat("retract_speed", 100.0), self.max_feed_speed)
+        # The head retracts at least this much on its own before the ACE pulls
+        # at all (rollback assist or unwind)
+        self.unload_head_first = config.getfloat("unload_head_first", 50.0, minval=0.0)
         # Max seconds to wait for the unit's own load-to-toolhead-and-back
         # cycle; scales with PTFE / hub distance.
         self.prep_ready_timeout = config.getfloat("prep_ready_timeout", 90.0, minval=1.0)
@@ -257,9 +263,27 @@ class afcACE(afcUnit):
         self.insert_feed_to_toolhead = config.getboolean("insert_feed_to_toolhead", False)
         self.insert_feed_step = config.getfloat("insert_feed_step", 10.0, minval=1.0)
         self.insert_feed_extra = config.getfloat("insert_feed_extra", 250.0, minval=0.0)
-        # Lanes fed to their head's switch on insert; kept in a file so a load
-        # after a restart still knows the filament at the switch is this spool's
-        self._staged_at_toolhead: Optional[Set[str]] = None
+        # Multiplexing: several lanes (from one or more ACEs) feed the same head
+        # through an adapter. With it on, an unload winds the filament back only
+        # until the head's switch clears plus multiplex_park_distance mm, clear of
+        # the adapter, and a Creator 5 tool change between lanes of one head
+        # swaps the filament at the purge bucket.
+        self.multiplex = config.getboolean("multiplex", False)
+        self.multiplex_park_distance = config.getfloat("multiplex_park_distance", 100.0,
+                                                       minval=10.0)
+        # Flush purged after a multiplex swap when the slicer gives no PURGE_LENGTH
+        # (None: the toolchanger's own purge length)
+        self.multiplex_purge_length = config.getfloat("multiplex_purge_length", None,
+                                                      minval=0.0)
+        # Per-lane flags kept in files, so a load after a restart still knows where
+        # the filament is: fed to the head's switch on insert, or parked just past
+        # it by a multiplex unload
+        self._lane_flags: Dict[str, Set[str]] = {}
+        # heads: the head (tool 0-3) each slot feeds, '-' for an unused slot. The
+        # unit makes a lane and hub for every slot that has no lane in the config.
+        heads = config.getlist("heads", None)
+        if heads is not None:
+            self._make_slot_lanes(config, list(heads))
         self.max_dryer_temperature = config.getfloat("max_dryer_temperature", 55.0, minval=0.0)
         # AFC_ACE_DRY ROTATE=1: every dry_rotate_interval seconds, each empty
         # slot gets a slow dry_rotate_length mm rollback so the spool turns
@@ -1068,7 +1092,10 @@ class afcACE(afcUnit):
 
             # A spool marked Loaded that never staged to the hub (a fresh insert
             # taken for the unloaded spool): stage it once, as on an insert.
-            stale_loaded = (lane.status == AFCLaneState.LOADED
+            # Never in multiplex mode: the ACE must not feed a shared head's
+            # lanes by itself, and they load from the slot anyway
+            stale_loaded = (not self.multiplex
+                            and lane.status == AFCLaneState.LOADED
                             and not lane.loaded_to_hub
                             and not lane.tool_loaded
                             and not self._operation_active
@@ -1195,7 +1222,8 @@ class afcACE(afcUnit):
             dist_hub + eject_buffer.
         """
         if (cur_lane.tool_loaded
-            or cur_lane.name in self._toolhead_staged()):
+            or cur_lane.name in self._toolhead_staged()
+            or cur_lane.name in self._parked_near_switch()):
             return self._get_unload_length(cur_lane)
         return cur_lane.dist_hub + self.eject_buffer
 
@@ -1386,6 +1414,7 @@ class afcACE(afcUnit):
             self._clear_slot_inventory(slot)
         self._hub_load_suppressed.discard(lane.name)
         self._set_toolhead_staged(lane.name, False)
+        self._set_parked_near_switch(lane.name, False)
         lane.loaded_to_hub = False
         self._set_hub_state(lane, False)
 
@@ -1681,36 +1710,233 @@ class afcACE(afcUnit):
             return False
         return True
 
-    def _staged_file(self) -> str:
-        return os.path.join(self.afc.cfgloc, f"AFC.{self.name}.staged_at_toolhead.json")
-
-    def _toolhead_staged(self) -> Set[str]:
+    @staticmethod
+    def _multiplex_tool_numbers(config: ConfigWrapper) -> Dict[Tuple[int, int], int]:
         """
-        Lanes whose spool was fed to the head's switch on insert.
+        T number per (ace_index, slot) across every multiplexed ACE unit's
+        `heads`: the first slot into a head takes the head's number, the rest
+        count up from T4 in ace_index then slot order.
 
-        :return Set[str]: Lane names, read from disk on first use.
+        :param config: Any config section (for the whole file's sections).
+        :return dict: (ace_index, slot) -> tool number.
         """
-        if self._staged_at_toolhead is None:
+        fileconfig = config.fileconfig
+        feeds = []
+        for section in fileconfig.sections():
+            if (not section.split()[0] in ("AFC_ACE", "AFC_ACE2")
+                    or not fileconfig.has_option(section, "heads")
+                    or fileconfig.get(section, "multiplex", fallback="False").strip().lower()
+                    not in ("true", "1", "yes", "on")):
+                continue
+            index = int(fileconfig.get(section, "ace_index", fallback="1"))
+            for slot, head in enumerate(fileconfig.get(section, "heads").split(","), 1):
+                head = head.strip()
+                if head.isdigit():
+                    feeds.append((index, slot, int(head)))
+        numbers, heads_taken, next_tool = {}, set(), 4
+        for index, slot, head in sorted(feeds):
+            if head not in heads_taken:
+                heads_taken.add(head)
+                numbers[(index, slot)] = head
+            else:
+                numbers[(index, slot)] = next_tool
+                next_tool += 1
+        return numbers
+
+    def _make_slot_lanes(self, config: ConfigWrapper, heads: List[str]) -> None:
+        """
+        Make an AFC_lane and AFC_hub for each slot in `heads` that the config
+        has no lane for, named <unit>_lane<slot> and <unit>_hub<slot>.
+
+        A lane feeds extruder<head>. Without multiplexing a lane takes its
+        head's number and a head takes one lane. With multiplexing the first
+        lane into a head (by ace_index, then slot) takes the head's number and
+        every other lane counts up from T4, so heads keep T0-T3.
+
+        :param config: This unit's config section.
+        :param heads: Head (0-3) per slot, or '-' for an unused slot.
+        """
+        fileconfig = config.fileconfig
+        if len(heads) > self.SLOTS_PER_UNIT:
+            raise error(f"[{config.get_name()}] heads has {len(heads)} entries; "
+                        f"the unit has {self.SLOTS_PER_UNIT} slots")
+        taken = set()
+        for section in fileconfig.sections():
+            if (section.startswith("AFC_lane ")
+                    and fileconfig.has_option(section, "unit")):
+                unit, _, slot = fileconfig.get(section, "unit").partition(":")
+                if unit.strip() == self.name:
+                    taken.add(slot.strip())
+        dist_hub = config.getfloat("lane_dist_hub", 60.0, above=0.0)
+        bowden = config.getfloat("hub_bowden_length", 900.0, above=0.0)
+        used_heads = set()
+        for index, head in enumerate(heads):
+            slot = index + 1
+            head = head.strip().lower()
+            if head in ("", "-", "none"):
+                continue
             try:
-                with open(self._staged_file()) as f:
-                    self._staged_at_toolhead = set(json.load(f))
-            except (OSError, ValueError):
-                self._staged_at_toolhead = set()
-        return self._staged_at_toolhead
+                head_index = int(head)
+            except ValueError:
+                head_index = -1
+            if not 0 <= head_index <= 3:
+                raise error(f"[{config.get_name()}] heads: slot {slot} must feed a head "
+                            f"0-3 or '-', not '{head}'")
+            if not self.multiplex and head_index in used_heads:
+                raise error(f"[{config.get_name()}] heads: head {head_index} is fed by more "
+                            f"than one slot; turn multiplex on to share a head")
+            used_heads.add(head_index)
+            if str(slot) in taken:
+                continue
+            tool = (self._multiplex_tool_numbers(config)[(self.ace_index, slot)]
+                    if self.multiplex else head_index)
+            hub = f"AFC_hub {self.name}_hub{slot}"
+            lane = f"AFC_lane {self.name}_lane{slot}"
+            options = (
+                (hub, (("switch_pin", "virtual"),
+                       ("afc_bowden_length", "%g" % bowden),
+                       ("afc_unload_bowden_length", "%g" % bowden))),
+                (lane, (("unit", f"{self.name}:{slot}"),
+                        ("extruder", f"extruder{head_index}"),
+                        ("hub", f"{self.name}_hub{slot}"),
+                        ("map", f"T{tool}"),
+                        ("dist_hub", "%g" % dist_hub))),
+            )
+            for section, values in options:
+                # A section can already exist with only part of this (a
+                # calibration written to AFC_auto_vars.cfg): fill in the rest
+                if not fileconfig.has_section(section):
+                    fileconfig.add_section(section)
+                for option, value in values:
+                    if not fileconfig.has_option(section, option):
+                        fileconfig.set(section, option, value)
+                self.printer.load_object(config, section)
+            self.logger.info(f"ACE {self.name}: slot {slot} feeds head {head_index} as T{tool} "
+                             f"({lane.split()[-1]})")
 
-    def _set_toolhead_staged(self, lane_name: str, staged: bool) -> None:
-        names = self._toolhead_staged()
-        if (lane_name in names) == staged:
+    def _flag_file(self, kind: str) -> str:
+        return os.path.join(self.afc.cfgloc, f"AFC.{self.name}.{kind}.json")
+
+    def _lanes_flagged(self, kind: str) -> Set[str]:
+        """
+        Lane names carrying a persisted flag, read from disk on first use.
+
+        :param kind: Flag name (staged_at_toolhead, parked_near_switch).
+        :return Set[str]: Lane names.
+        """
+        if kind not in self._lane_flags:
+            try:
+                with open(self._flag_file(kind)) as f:
+                    self._lane_flags[kind] = set(json.load(f))
+            except (OSError, ValueError):
+                self._lane_flags[kind] = set()
+        return self._lane_flags[kind]
+
+    def _set_lane_flag(self, kind: str, lane_name: str, on: bool) -> None:
+        names = self._lanes_flagged(kind)
+        if (lane_name in names) == on:
             return
-        if staged:
+        if on:
             names.add(lane_name)
         else:
             names.discard(lane_name)
         try:
-            with open(self._staged_file(), "w") as f:
+            with open(self._flag_file(kind), "w") as f:
                 json.dump(sorted(names), f)
         except OSError as e:
-            self.logger.warning(f"ACE: could not save the toolhead-staged lanes: {e}")
+            self.logger.warning(f"ACE: could not save the {kind} lanes: {e}")
+
+    def _toolhead_staged(self) -> Set[str]:
+        """Lanes whose spool was fed to the head's switch on insert."""
+        return self._lanes_flagged("staged_at_toolhead")
+
+    def _set_toolhead_staged(self, lane_name: str, staged: bool) -> None:
+        self._set_lane_flag("staged_at_toolhead", lane_name, staged)
+
+    def _parked_near_switch(self) -> Set[str]:
+        """Lanes a multiplex unload parked multiplex_park_distance past the head's switch."""
+        return self._lanes_flagged("parked_near_switch")
+
+    def _set_parked_near_switch(self, lane_name: str, parked: bool) -> None:
+        self._set_lane_flag("parked_near_switch", lane_name, parked)
+
+    @staticmethod
+    def _head_switch_now(cur_lane: AFCLane) -> bool:
+        """
+        The head's filament switch as it reads right now. AFC's own reading
+        waits out debounce_delay (10 s on a Creator 5), which at full unwind
+        speed is about a metre; the raw state changes the moment it does.
+
+        :param cur_lane: Lane whose head switch to read.
+        :return bool: True while the switch sees filament.
+        """
+        button = getattr(cur_lane.extruder_obj, 'debounce_button_start', None)
+        raw = getattr(button, 'physical_state', None)
+        if raw is not None:
+            return bool(raw)
+        return bool(cur_lane.get_toolhead_pre_sensor_state())
+
+    def _unwind_past_switch(self, cur_lane: AFCLane, slot: int, max_dist: float) -> bool:
+        """
+        Wind the filament back in one move at retract_speed until the head's
+        switch clears, stop there, then wind multiplex_park_distance mm more, so
+        the tip waits clear of the multiplexing adapter but close to the head.
+
+        :param cur_lane: Lane being unloaded.
+        :param slot: Its ACE slot.
+        :param max_dist: The most to wind back before giving up on the switch.
+        :return bool: True once parked past the switch.
+        """
+        reactor = self.afc.reactor
+        if self._head_switch_now(cur_lane):
+            self._wait_for_ace_ready()
+            started = reactor.monotonic()
+            self._ace.unwind_filament(slot, max_dist, self.retract_speed)
+            speed = min(max(self.retract_speed, 1.0), FEED_SPEED_CEILING)
+            deadline = started + max_dist / speed * 1.5 + 15.0
+            last_status = started
+            cleared = False
+            seen_moving = False
+            while reactor.monotonic() < deadline:
+                reactor.pause(reactor.monotonic() + 0.05)
+                if not self._head_switch_now(cur_lane):
+                    cleared = True
+                    break
+                now = reactor.monotonic()
+                if now - last_status > 0.5:
+                    last_status = now
+                    try:
+                        moving = self._slot_is_moving(self._ace.get_status(timeout=2.0), slot)
+                    except Exception:
+                        continue
+                    if moving:
+                        seen_moving = True
+                    elif seen_moving:
+                        break               # the whole move ran without clearing
+                    elif now - started > self.feed_departure_timeout:
+                        break               # it never started
+            if not cleared:
+                self.logger.info(f"ACE {self.name}: {cur_lane.name} unwind "
+                                 f"{'ran' if seen_moving else 'never started'} "
+                                 f"({reactor.monotonic() - started:.1f}s) without clearing the switch")
+                return False
+            for _ in range(STOP_CONFIRM_TRIES):
+                try:
+                    self._ace.stop_unwind_filament(slot)
+                    reactor.pause(reactor.monotonic() + 0.3)
+                    if not self._slot_is_moving(self._ace.get_status(timeout=2.0), slot):
+                        break
+                except Exception as e:
+                    self.logger.debug(f"ACE {self.name}: stopping the unwind on slot {slot}: {e}")
+            wound = (reactor.monotonic() - started) * speed
+        else:
+            wound = 0.0
+        self._wait_for_ace_ready()
+        self._ace.unwind_filament(slot, self.multiplex_park_distance, self.retract_speed)
+        self._wait_for_feed_complete(slot, self.multiplex_park_distance, self.retract_speed)
+        self._log_delta(f"ACE unload: {cur_lane.name} parked {self.multiplex_park_distance:.0f}mm "
+                        f"past the head switch (about {wound:.0f}mm to clear it)")
+        return True
 
     def _stage_to_toolhead(self, lane: AFCLane) -> None:
         """
@@ -1785,6 +2011,10 @@ class afcACE(afcUnit):
 
         :param lane: Lane to stage to the hub.
         """
+        if self.multiplex:
+            # A shared head's lanes are never fed on their own: only one can sit
+            # at its switch, and they load straight from the slot when asked
+            return
         if self.insert_feed_to_toolhead:
             if not lane.loaded_to_hub:
                 self._stage_to_toolhead(lane)
@@ -1881,6 +2111,7 @@ class afcACE(afcUnit):
                     self._ace.unwind_filament(slot, dist, self.retract_speed)
                     self._wait_for_feed_complete(slot, dist, self.retract_speed)
                     self._set_toolhead_staged(lane.name, False)
+                    self._set_parked_near_switch(lane.name, False)
                     lane.loaded_to_hub = False
                     self._set_hub_state(lane, False)
                     # Suppress the heartbeat's auto reload-to-hub until the spool
@@ -2484,7 +2715,14 @@ class afcACE(afcUnit):
         if staged_at_switch:
             feed_dist = 0.0
             self.logger.info(f"ACE load: {cur_lane.name} is already at its head switch")
+        elif cur_lane.name in self._parked_near_switch():
+            # A multiplex unload left it this far before the switch; the slow
+            # approach and the retry pulses take it the rest of the way
+            feed_dist = self.multiplex_park_distance
+            self.logger.info(f"ACE load: {cur_lane.name} is parked "
+                             f"{feed_dist:.0f}mm before its head switch")
         self._set_toolhead_staged(cur_lane.name, False)
+        self._set_parked_near_switch(cur_lane.name, False)
 
         self._set_hub_state(cur_lane, True)
         self._hub_load_suppressed.discard(cur_lane.name)
@@ -2700,7 +2938,7 @@ class afcACE(afcUnit):
         self._operation_active = True
         slot = self._get_slot(cur_lane.name)
         self._stop_feed_assist(slot)
-        self._start_unload_assist_when_hot(slot, cur_extruder)
+        # The rollback assist waits for _ace_unload_inner's head-only retract
 
     # The rollback assist starts once the nozzle is within this of its target
     _UNLOAD_ASSIST_HOT_MARGIN = 10.0
@@ -2911,20 +3149,40 @@ class afcACE(afcUnit):
             if (cur_extruder.tool_start == "buffer"
                 and not self._collapse_buffer(cur_lane, slot)):
                 return False
+            head_first = max(self.unload_head_first, cur_extruder.tool_stn_unload * 0.5)
+            if head_first > 0:
+                self._log_delta(f'ACE unload: head retracts {head_first:.0f}mm before the ACE pulls')
+                afc.move_e_pos(-head_first, cur_extruder.tool_unload_speed,
+                               "ACE head-first unload", wait_tool=True)
+            self._start_unload_assist_when_hot(slot, cur_extruder)
             if cur_extruder.tool_stn_unload > 0:
-                self._log_delta('ACE unload: retracting tool_stn_unload/2 (pre-unwind)')
-                afc.move_e_pos(cur_extruder.tool_stn_unload * -0.5, cur_extruder.tool_unload_speed,
-                               "ACE STN unload", wait_tool=True)
                 self._log_delta('ACE unload: retracting tool_stn_unload (overlaps unwind)')
                 afc.move_e_pos(cur_extruder.tool_stn_unload * -1, cur_extruder.tool_unload_speed,
                                "ACE STN unload", wait_tool=False)
-            self._wait_for_ace_ready()
-            self._ace.unwind_filament(slot, retract_dist, self.retract_speed)
-            self._wait_for_feed_complete(slot, retract_dist, self.retract_speed)
+            parked_near_switch = False
+            if (self.multiplex
+                and cur_extruder.tool_start != "buffer"):
+                # Only out of the shared part of the path, not back into the unit
+                if not self._unwind_past_switch(cur_lane, slot, retract_dist):
+                    message = (f"{cur_lane.name} did not clear {cur_extruder.name}'s switch "
+                               f"after winding back {retract_dist:.0f}mm.\n"
+                               f"Clear the filament path, then run TOOL_UNLOAD "
+                               f"LANE={cur_lane.name} again.")
+                    if afc.function.in_print():
+                        message += "\nOnce cleared, click resume to continue printing"
+                    afc.error.handle_lane_failure(cur_lane, message,
+                                                  pause=afc.function.in_print())
+                    return False
+                parked_near_switch = True
+            else:
+                self._wait_for_ace_ready()
+                self._ace.unwind_filament(slot, retract_dist, self.retract_speed)
+                self._wait_for_feed_complete(slot, retract_dist, self.retract_speed)
             if cur_extruder.tool_stn_unload > 0:
                 afc.function.log_toolhead_pos("ACE STN unload after ")
 
-            if (cur_extruder.tool_start != "buffer"
+            if (not parked_near_switch
+                and cur_extruder.tool_start != "buffer"
                 and not self._clear_toolhead_sensor(cur_lane, cur_extruder, slot,
                                                     retract_dist)):
                 return False
@@ -2938,6 +3196,7 @@ class afcACE(afcUnit):
         self._set_hub_state(cur_lane, False)
         cur_lane.loaded_to_hub = True
         self._set_toolhead_staged(cur_lane.name, False)
+        self._set_parked_near_switch(cur_lane.name, parked_near_switch)
         self.lane_tool_unloaded(cur_lane)
         self._hub_load_suppressed.add(cur_lane.name)
 
@@ -4121,6 +4380,12 @@ class afcACE(afcUnit):
         name = self._active_assist_lane()
         lane = self.afc.lanes.get(name) if name is not None else None
         if lane is None or not self._use_feed_assist(lane):
+            self._stop_idle_assist()
+            return
+        if (self.multiplex
+                and (getattr(self.afc, 'error_state', False)
+                     or getattr(self.afc, 'in_toolchange', False))):
+            # Never push a shared head's filament mid-swap or after a failed one
             self._stop_idle_assist()
             return
         slot = self._slot_map.get(name)

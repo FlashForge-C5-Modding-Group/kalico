@@ -1365,7 +1365,10 @@ class AFCLane:
         if (self.hub_obj is not None
             and hasattr(self.hub_obj, 'is_virtual_pin')
             and self.hub_obj.is_virtual_pin()):
-            return self.loaded_to_hub
+            # A unit that feeds straight from its slot (the ACE) can load a lane
+            # whose spool is only in the slot, not staged yet
+            return self.loaded_to_hub or bool(
+                self.prep_state and getattr(self.unit_obj, 'loads_from_slot', False))
         else:
             return bool(self._load_state)
 

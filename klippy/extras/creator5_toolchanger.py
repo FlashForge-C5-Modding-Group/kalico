@@ -2539,10 +2539,14 @@ class Creator5Toolchanger:
         if not math.isfinite(length) or length <= 0.:
             raise gcmd.error('LENGTH must be finite and positive')
         speed = gcmd.get_float('SPEED', self.purge_speed, above=0., maxval=50.)
+        # KEEP_Z=1: purge at the current height (never lower Z), as a filament
+        # swap between multiplexed lanes does mid-print
+        keep_z = gcmd.get_int('KEEP_Z', 0, minval=0, maxval=1)
         dock, grab, attached = self._preflight(gcmd)
         if attached is None:
             raise gcmd.error('No attached tool for purge')
-        self._verify_purge_z(gcmd)
+        if not keep_z:
+            self._verify_purge_z(gcmd)
         extruder = 'extruder' if attached == 0 else 'extruder%d' % attached
         heater = self.printer.lookup_object(extruder)
         if not heater.get_status(self.printer.get_reactor().monotonic()).get(
@@ -2557,7 +2561,8 @@ class Creator5Toolchanger:
             try:
                 self._run('G90')
                 self._move_to_prep_bucket()
-                self._move(z=self.purge_z, feed=600, machine=False)
+                if not keep_z:
+                    self._move(z=self.purge_z, feed=600, machine=False)
                 self._run('M83')
                 # One extrude-only move may not exceed
                 # max_extrude_only_distance; queued back to back they run as one
