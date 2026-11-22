@@ -565,6 +565,62 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board.cmd_lower_bed(GCmd())
         self.board._move.assert_not_called()
 
+    def _park_fixture(self, position):
+        self.board.park_x, self.board.park_y = 5., 250.
+        self.board.approach_x = 250.
+        toolhead = mock.Mock()
+        toolhead.get_status.return_value = {
+            'axis_minimum': mock.Mock(x=-2., y=-5.),
+            'axis_maximum': mock.Mock(x=310., y=260.)}
+        toolhead.get_position.return_value = position
+        self.board.printer.lookup_object.return_value = toolhead
+        self.board._preflight = mock.Mock(return_value=([], [], None))
+        self.board._with_motion = lambda command, operation: operation()
+        self.board._move = mock.Mock()
+
+    def test_park_clears_the_docks_in_x_before_moving_in_y(self):
+        # Where the print-end dock leaves the carriage: pre_dock_x, by a lane.
+        self._park_fixture([286., 107.1, 20., 0.])
+
+        self.board.cmd_park_carriage(GCmd())
+
+        self.board._preflight.assert_called_once_with(mock.ANY, axes='xy')
+        self.assertEqual(self.board._move.call_args_list, [
+            mock.call(x=250., feed=36000.),
+            mock.call(x=5., y=250., feed=36000.)])
+
+    def test_park_goes_straight_there_from_inboard_of_the_docks(self):
+        self._park_fixture([120., 80., 20., 0.])
+
+        self.board.cmd_park_carriage(GCmd())
+
+        self.board._move.assert_called_once_with(x=5., y=250., feed=36000.)
+
+    def test_park_refuses_a_spot_outside_the_axis_limits(self):
+        self._park_fixture([120., 80., 20., 0.])
+        self.board.park_y = 300.
+
+        with self.assertRaisesRegex(RuntimeError, 'outside the axis limits'):
+            self.board.cmd_park_carriage(GCmd())
+        self.board._move.assert_not_called()
+
+    def test_park_does_not_move_when_preflight_refuses(self):
+        self._park_fixture([286., 107.1, 20., 0.])
+        self.board._preflight.side_effect = RuntimeError(
+            'Home XY before Creator 5 motion')
+
+        with self.assertRaisesRegex(RuntimeError, 'Home XY'):
+            self.board.cmd_park_carriage(GCmd())
+        self.board._move.assert_not_called()
+
+    def test_park_carriage_on_end_misc_switch_starts_disabled(self):
+        printer, gcode = mock.Mock(), mock.Mock()
+        switch = MODULE.Creator5MiscSwitch(
+            printer, gcode, 'park_carriage_on_end', False)
+        printer.add_object.assert_called_once_with(
+            'output_pin park_carriage_on_end', switch)
+        self.assertEqual(switch.get_status(0.), {'value': 0.})
+
     def test_open_door_blocks_only_with_chamber_heater_active(self):
         heater = mock.Mock()
         heaters = mock.Mock()

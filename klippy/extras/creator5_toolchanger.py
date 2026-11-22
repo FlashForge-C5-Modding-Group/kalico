@@ -214,6 +214,10 @@ class Creator5Toolchanger:
             'post_select_accel', None, above=0.)
         self.approach_x = config.getfloat('approach_x', 250.)
         self.pre_dock_x = config.getfloat('pre_dock_x', 280.)
+        # Where C5_PARK_CARRIAGE leaves the carriage, back left by default.
+        # Inboard of approach_x, so nothing sits between it and the docks.
+        self.park_x = config.getfloat('park_x', 5., maxval=self.approach_x)
+        self.park_y = config.getfloat('park_y', 250.)
         self.pullback = config.getfloat('pullback', 20., above=0.)
         self.pickup_latch_wait_ms = config.getint('pickup_latch_wait_ms',
                                                   1800, minval=0)
@@ -339,6 +343,11 @@ class Creator5Toolchanger:
         self.lower_bed_on_end_switch = Creator5MiscSwitch(
             self.printer, self.gcode, 'lower_bed_on_end',
             config.getboolean('lower_bed_on_end_default', False))
+        # Park the carriage after the print-end dock (C5_PRINT_STOP runs
+        # C5_PARK_CARRIAGE when this is on).
+        self.park_carriage_on_end_switch = Creator5MiscSwitch(
+            self.printer, self.gcode, 'park_carriage_on_end',
+            config.getboolean('park_carriage_on_end_default', False))
         self.quiet_mode_switch = Creator5MiscSwitch(
             self.printer, self.gcode, 'quiet_mode',
             config.getboolean('quiet_mode_default', False))
@@ -367,6 +376,7 @@ class Creator5Toolchanger:
             ('C5_OFFSET_WIZARD', self.cmd_offset_wizard),
             ('C5_BED_SOAK', self.cmd_bed_soak),
             ('C5_LOWER_BED', self.cmd_lower_bed),
+            ('C5_PARK_CARRIAGE', self.cmd_park_carriage),
             ('C5_FLOW_STROKES', self.cmd_flow_strokes),
             ('C5_EXTRUDER_ROTATION_CALIBRATE',
              self.cmd_extruder_rotation_calibrate),
@@ -487,6 +497,26 @@ class Creator5Toolchanger:
         # Never raises the bed: a bed already lower than that stays put.
         if current_z < self.lower_bed_z - .001:
             self._move(z=self.lower_bed_z, feed=self.lower_bed_speed * 60.)
+
+    def cmd_park_carriage(self, gcmd):
+        """Move the carriage inboard of the docks, then to park_x/park_y."""
+        self._preflight(gcmd, axes='xy')
+        toolhead = self.printer.lookup_object('toolhead')
+        status = toolhead.get_status(self.printer.get_reactor().monotonic())
+        low, high = status['axis_minimum'], status['axis_maximum']
+        if not (low.x <= self.park_x <= high.x
+                and low.y <= self.park_y <= high.y):
+            raise gcmd.error('Park position X%.1f Y%.1f is outside the axis '
+                             'limits' % (self.park_x, self.park_y))
+        feed = self.clear_travel_speed * 60.
+
+        def move():
+            # Beside the docks, clear them in X before moving in Y, the way
+            # a dock lane is left.
+            if toolhead.get_position()[0] > self.approach_x + .001:
+                self._move(x=self.approach_x, feed=feed)
+            self._move(x=self.park_x, y=self.park_y, feed=feed)
+        self._with_motion(gcmd, move)
 
     def _home_off_docked_head(self, gcmd):
         # Every G28 first releases the carrier latch. A carrier resting
