@@ -87,11 +87,11 @@ class EStopEndstopWrapper:
     #         self.last_move_error = (
     #             "The estop is unqualified %d retries" % max_retries)
     #     return None
-    def e_stop_move(self, pos, speed):
+    def e_stop_move(self, pos, speed, gcmd):
         phoming = self.printer.lookup_object('homing')
         # Keep the vendor-compatible no-movement sentinel path.  This fork's
         # probing_move() maps rase=False to check_movement=False.
-        epos = phoming.probing_move(self, pos, speed, rase=False,
+        epos = phoming.probing_move(self, pos, speed, gcmd, rase=False,
                                     safe_mode=False)
         return epos
     def get_position_endstop(self):
@@ -244,7 +244,7 @@ class EStopFunc:
     #                         spread_retries, max_retries)
 
     #     return sum(positions) / len(positions)
-    def _probe(self, speed):
+    def _probe(self, speed, gcmd):
         toolhead = self.printer.lookup_object('toolhead')
         pos = toolhead.get_position()
         back_v = 2
@@ -273,7 +273,8 @@ class EStopFunc:
                 if pin_state == "triggered":
                     toolhead.wait_moves()
                     toolhead.dwell(0.500)
-                    self.gcode.run_script_from_command("GET_BASIC_PARAM_LEVELBOARD")
+                    self.gcode.run_script_from_command(
+                        "GET_BASIC_PARAM_LEVELBOARD", gcmd)
                     toolhead.dwell(1)
                     # reactor.pause(reactor.monotonic() + 1)
                     if i == 5:
@@ -282,7 +283,7 @@ class EStopFunc:
                     continue
                 else:
                     break
-            epos = self.mcu_probe.e_stop_move(pos, speed)
+            epos = self.mcu_probe.e_stop_move(pos, speed, gcmd)
             if epos[0] == 9999:
                 return epos[0]
             ppos = toolhead.get_position()
@@ -347,7 +348,7 @@ class EStopFunc:
             if attempts > max_attempts:
                 raise gcmd.error('ESTOP %s did not produce stable samples'
                                  % self.stepper_name)
-            pos = self._probe(self.speed)
+            pos = self._probe(self.speed, gcmd)
             if pos == 9999:
                 continue
             positions.append(pos)

@@ -58,8 +58,7 @@ class MCU_stepper:
         self._reset_cmd_tag = self._get_position_cmd = None
         self._active_callbacks = []
         motion_queuing = printer.load_object(config, "motion_queuing")
-        sname = self._name.split()[-1]
-        self._syncemitter = motion_queuing.allocate_syncemitter(mcu, sname)
+        self._syncemitter = motion_queuing.allocate_syncemitter(mcu, self._name)
         ffi_main, ffi_lib = chelper.get_ffi()
         self._stepqueue = ffi_lib.syncemitter_get_stepcompress(
             self._syncemitter
@@ -242,6 +241,8 @@ class MCU_stepper:
         mcu_pos_dist = mcu_pos * self._step_dist
         self._mcu_position_offset = mcu_pos_dist - self.get_commanded_position()
 
+    # Retrieve position at time in the past. This accesses the step compress queue,
+    # and must only be called from the main reactor thread.
     def get_past_mcu_position(self, print_time):
         clock = self._mcu.print_time_to_clock(print_time)
         ffi_main, ffi_lib = chelper.get_ffi()

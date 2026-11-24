@@ -40,9 +40,13 @@ class HdHomeEndstopWrapper:
                 self.add_stepper(stepper)
             if stepper.is_active_axis('y') and self.stepper_name == "Y":
                 self.add_stepper(stepper)
-    def hd_home_move(self, pos, speed):
+    def hd_home_move(self, pos, speed, gcmd=None):
         phoming = self.printer.lookup_object('homing')
-        return phoming.probing_move(self, pos, speed)
+        if gcmd is None:
+            # No command to probe for (e.g. measure_axis): the legacy context
+            gcmd = self.printer.lookup_object('gcode').create_gcode_command(
+                "", "", {})
+        return phoming.probing_move(self, pos, speed, gcmd)
     def get_position_endstop(self):
         return self.position_endstop
 
@@ -60,7 +64,7 @@ class HdlmtHome:
 
         self.speed = config.getfloat('speed', 5.0, above=0.)
         self.position_offset = config.getfloat('offset', 0.)
-    def _probe(self, speed):
+    def _probe(self, speed, gcmd=None):
         toolhead = self.printer.lookup_object('toolhead')
         pos = toolhead.get_position()
         #X移动100mm
@@ -74,7 +78,7 @@ class HdlmtHome:
             return
 
         try:
-            epos = self.mcu_probe.hd_home_move(pos, speed)
+            epos = self.mcu_probe.hd_home_move(pos, speed, gcmd)
         except self.printer.command_error as e:
             reason = str(e)
             if "Timeout during endstop homing" in reason:
@@ -91,7 +95,7 @@ class HdlmtHome:
         #probexy = toolhead.get_position()[:2]
         positions = []
         # Probe position
-        pos = self._probe(self.speed)
+        pos = self._probe(self.speed, gcmd)
         positions.append(pos)
         return pos
     def measure_axis(self, target):

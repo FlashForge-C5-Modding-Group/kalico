@@ -30,7 +30,9 @@ class ControlMPC:
         self.last_temp_time = 0.0
 
         self.printer = heater.printer
+        self.reactor = self.printer.get_reactor()
         self.toolhead = None
+        self.extrude_speed = 0.0
 
         if not register:
             return
@@ -54,6 +56,7 @@ class ControlMPC:
     cmd_MPC_SET_help = "Set MPC parameter"
 
     def cmd_MPC_SET(self, gcmd):
+        self.heater.check_not_calibrating()
         self.const_filament_diameter = gcmd.get_float(
             "FILAMENT_DIAMETER", self.const_filament_diameter
         )
@@ -164,6 +167,23 @@ class ControlMPC:
             * self.const_filament_heat_capacity  # J/g/K
         )
 
+    # Extruder speed over the period after read_time. This reads the step
+    # history, so it must run on the reactor thread.
+    def _update_extrude_speed(self, read_time, dt):
+        if self.toolhead is None:
+            self.toolhead = self.printer.lookup_object("toolhead")
+        extruder = self.toolhead.get_extruder()
+        if (
+            not hasattr(extruder, "find_past_position")
+            or extruder.get_heater() != self.heater
+        ):
+            self.extrude_speed = 0.0
+            return
+        pos = extruder.find_past_position(read_time)
+        pos_next = extruder.find_past_position(read_time + dt)
+        pos_moved = max(-self.const_maximum_retract, pos_next - pos)
+        self.extrude_speed = pos_moved / dt
+
     # Control interface
 
     def temperature_update(self, read_time, temp, target_temp):
@@ -175,27 +195,17 @@ class ControlMPC:
         if self.last_temp_time == 0.0 or dt < 0.0 or dt > 1.0:
             dt = 0.1
 
-        # Extruder position
+        # Extruder speed. This runs on the serial thread, so use the speed
+        # looked up on the reactor thread after the previous sample.
         extrude_speed_prev = 0.0
         extrude_speed_next = 0.0
         if target_temp != 0.0:
-            if self.toolhead is None:
-                self.toolhead = self.printer.lookup_object("toolhead")
-            if self.toolhead is not None:
-                extruder = self.toolhead.get_extruder()
-                if (
-                    hasattr(extruder, "find_past_position")
-                    and extruder.get_heater() == self.heater
-                ):
-                    pos = extruder.find_past_position(read_time)
-
-                    pos_prev = extruder.find_past_position(read_time - dt)
-                    pos_moved = max(-self.const_maximum_retract, pos - pos_prev)
-                    extrude_speed_prev = pos_moved / dt
-
-                    pos_next = extruder.find_past_position(read_time + dt)
-                    pos_move = max(-self.const_maximum_retract, pos_next - pos)
-                    extrude_speed_next = pos_move / dt
+            extrude_speed_prev = extrude_speed_next = self.extrude_speed
+            self.reactor.register_async_callback(
+                lambda e: self._update_extrude_speed(read_time, dt)
+            )
+        else:
+            self.extrude_speed = 0.0
 
         # Modulate ambient transfer coefficient with fan speed
         ambient_transfer = self.const_ambient_transfer
@@ -374,6 +384,10 @@ class MpcCalibrate:
         self.orig_control = orig_control
 
     def run(self, gcmd):
+        with self.heater.calibration() as calibration:
+            self._run(gcmd, calibration)
+
+    def _run(self, gcmd, calibration):
         use_analytic = gcmd.get("USE_DELTA", None) is not None
         ambient_max_measure_time = gcmd.get_float(
             "AMBIENT_MAX_MEASURE_TIME", 20.0, above=0.0
@@ -391,7 +405,7 @@ class MpcCalibrate:
         )
 
         control = TuningControl(self.heater)
-        old_control = self.heater.set_control(control)
+        old_control = calibration.set_control(control)
         try:
             ambient_temp = self.await_ambient(gcmd, control, threshold_temp)
             samples = self.heatup_test(gcmd, target_temp, control)
@@ -415,7 +429,7 @@ class MpcCalibrate:
             new_control.state_block_temp = first_res["post_block_temp"]
             new_control.state_sensor_temp = first_res["post_sensor_temp"]
             new_control.state_ambient_temp = ambient_temp
-            self.heater.set_control(new_control)
+            calibration.set_control(new_control)
 
             transfer_res = self.transfer_test(
                 gcmd,
@@ -479,10 +493,10 @@ class MpcCalibrate:
         except self.printer.command_error as e:
             raise gcmd.error("%s failed: %s" % (gcmd.get_command(), e))
         finally:
-            self.heater.set_control(old_control)
+            calibration.set_control(old_control)
             self.heater.alter_target(0.0)
 
-    def wait_stable(self, cycles=5):
+    def wait_stable(self, gcmd, cycles=5):
         """
         We wait for the extruder to cycle x amount of times above and below the target
         doing this should ensure the temperature is stable enough to give a good result
@@ -515,9 +529,9 @@ class MpcCalibrate:
                 return False
             return True
 
-        self.printer.wait_while(process, True, 0.2)
+        gcmd.wait_while(process, True, 0.2)
 
-    def wait_settle(self, max_rate):
+    def wait_settle(self, max_rate, gcmd):
         last_temp = None
         next_check = None
         samples = []
@@ -534,7 +548,7 @@ class MpcCalibrate:
             rate = abs(dT / dt)
             return not rate < max_rate
 
-        self.printer.wait_while(process)
+        gcmd.wait_while(process)
         return samples[-1][1]
 
     def await_ambient(self, gcmd, control, minimum_temp):
@@ -555,14 +569,14 @@ class MpcCalibrate:
                     reported[0] = True
                 return ret
 
-            self.printer.wait_while(process)
+            gcmd.wait_while(process)
             self.heater.alter_target(0.0)
             return self.orig_control.ambient_sensor.get_temp(
                 self.heater.reactor.monotonic()
             )[0]
 
         gcmd.respond_info("Waiting for heater to settle at ambient temperature")
-        ambient_temp = self.wait_settle(0.01)
+        ambient_temp = self.wait_settle(0.01, gcmd)
         self.heater.alter_target(0.0)
         return ambient_temp
 
@@ -578,7 +592,7 @@ class MpcCalibrate:
             temp, _ = self.heater.get_temp(eventtime)
             return temp < target_temp
 
-        self.printer.wait_while(process)
+        gcmd.wait_while(process)
         control.logging = False
         self.heater.alter_target(0.0)
 
@@ -601,35 +615,38 @@ class MpcCalibrate:
             % (target_temp,)
         )
 
-        self.wait_stable(5)
+        self.wait_stable(gcmd, 5)
 
         fan = self.orig_control.cooling_fan
 
         fan_powers = []
         if fan is None:
             power_base = self.measure_power(
-                ambient_max_measure_time, ambient_measure_sample_time
+                ambient_max_measure_time, ambient_measure_sample_time, gcmd
             )
             gcmd.respond_info(f"Average stable power: {power_base} W")
         else:
-            for idx in range(0, fan_breakpoints):
-                speed = idx / (fan_breakpoints - 1)
-                curtime = self.heater.reactor.monotonic()
-                fan.set_speed(speed)
-                gcmd.respond_info("Waiting for temperature to stabilize")
-                self.wait_stable(3)
-                gcmd.respond_info(
-                    f"Temperature stable, measuring power usage with {speed * 100.0:.0f}% fan speed"
-                )
-                power = self.measure_power(
-                    ambient_max_measure_time, ambient_measure_sample_time
-                )
-                gcmd.respond_info(
-                    f"{speed * 100.0:.0f}% fan average power: {power:.2f} W"
-                )
-                fan_powers.append((speed, power))
-            curtime = self.heater.reactor.monotonic()
-            fan.set_speed(0.0)
+            try:
+                for idx in range(0, fan_breakpoints):
+                    speed = idx / (fan_breakpoints - 1)
+                    curtime = self.heater.reactor.monotonic()
+                    fan.set_speed(speed)
+                    gcmd.respond_info("Waiting for temperature to stabilize")
+                    self.wait_stable(gcmd, 3)
+                    gcmd.respond_info(
+                        f"Temperature stable, measuring power usage with {speed * 100.0:.0f}% fan speed"
+                    )
+                    power = self.measure_power(
+                        ambient_max_measure_time,
+                        ambient_measure_sample_time,
+                        gcmd,
+                    )
+                    gcmd.respond_info(
+                        f"{speed * 100.0:.0f}% fan average power: {power:.2f} W"
+                    )
+                    fan_powers.append((speed, power))
+            finally:
+                fan.set_speed(0.0)
             power_base = fan_powers[0][1]
 
         return {
@@ -638,7 +655,7 @@ class MpcCalibrate:
             "fan_powers": fan_powers,
         }
 
-    def measure_power(self, max_time, sample_time):
+    def measure_power(self, max_time, sample_time, gcmd):
         samples = []
         time = [0]
         last_time = [None]
@@ -653,7 +670,7 @@ class MpcCalibrate:
             time[0] += dt
             return time[0] < max_time
 
-        self.printer.wait_while(process)
+        gcmd.wait_while(process)
 
         total_energy = 0
         total_time = 0

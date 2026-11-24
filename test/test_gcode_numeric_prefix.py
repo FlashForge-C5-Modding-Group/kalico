@@ -17,6 +17,20 @@ with mock.patch.dict(sys.modules, {
     spec.loader.exec_module(gcode)
 
 
+class _Mutex:
+    def __init__(self):
+        self.held = False
+
+    def test(self):
+        return self.held
+
+    def __enter__(self):
+        self.held = True
+
+    def __exit__(self, *exc):
+        self.held = False
+
+
 class GCodeNumericPrefixTests(unittest.TestCase):
     def setUp(self):
         dispatch = gcode.GCodeDispatch.__new__(gcode.GCodeDispatch)
@@ -31,7 +45,9 @@ class GCodeNumericPrefixTests(unittest.TestCase):
         dispatch.output_callbacks = []
         dispatch.is_printer_ready = True
         dispatch.is_fileinput = False
-        dispatch._script_context = 0
+        dispatch.mutex = _Mutex()
+        dispatch.gcode_lockfree = set()
+        dispatch._interrupt_token = mock.Mock()
         self.dispatch = dispatch
         self.calls = []
 
@@ -40,7 +56,7 @@ class GCodeNumericPrefixTests(unittest.TestCase):
                                        lambda cmd: self.calls.append(
                                            (cmd.get_command(), cmd.get('TOOL'),
                                             cmd.get('TEMP'))))
-        self.dispatch.run_script_from_command(
+        self.dispatch.run_script(
             'C5_PREPARE_FILAMENT_LOAD TOOL=2 TEMP=220')
         self.assertEqual(self.calls,
                          [('C5_PREPARE_FILAMENT_LOAD', '2', '220')])
@@ -49,7 +65,7 @@ class GCodeNumericPrefixTests(unittest.TestCase):
         self.dispatch.register_command(
             'G1', lambda cmd: self.calls.append(
                 (cmd.get_command(), cmd.get('X'))))
-        self.dispatch.run_script_from_command('G1 X10')
+        self.dispatch.run_script('G1 X10')
         self.assertEqual(self.calls, [('G1', '10')])
         self.dispatch.printer.get_reactor.assert_not_called()
         with self.assertRaisesRegex(ValueError, 'invalid name'):
@@ -61,7 +77,7 @@ class GCodeNumericPrefixTests(unittest.TestCase):
         reactor.monotonic.side_effect = lambda: next(clock)
         self.dispatch.register_command(
             'G1', lambda cmd: self.calls.append(cmd.get('X')))
-        self.dispatch.run_script_from_command(
+        self.dispatch.run_script(
             'G1 X1\nG1 X2\nG1 X3\nG1 X4')
         self.assertEqual(self.calls, ['1', '2', '3', '4'])
         self.assertEqual(reactor.pause.call_count, 2)

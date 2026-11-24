@@ -1182,10 +1182,9 @@ max_temp:
 #   heater and sensor hardware failures. Set this range just wide
 #   enough so that reasonable temperatures do not result in an error.
 #   These parameters must be provided.
-per_move_pressure_advance: False
-#   If true, uses pressure advance constant from trapq when processing moves
-#   This causes changes to pressure advance be taken into account immediately,
-#   for all moves in the current queue, rather than ~250ms later once the queue gets flushed
+#per_move_pressure_advance: False
+#   Deprecated. Pressure advance changes are always applied at the time
+#   they are requested, so this option no longer has any effect.
 #
 #   If: control: dual_loop_pid
 #inner_sensor_name:
@@ -2945,78 +2944,60 @@ sensor_type: ldc1612
 
 ### [axis_twist_compensation]
 
-A tool to compensate for inaccurate probe readings due to twist in X or Y
-gantry. See the [Axis Twist Compensation Guide](Axis_Twist_Compensation.md)
-for more detailed information regarding symptoms, configuration and setup.
+Compensates position-dependent probe errors using a two-dimensional mesh.
+See the [Axis Twist Compensation Guide](Axis_Twist_Compensation.md).
 
 ```
 [axis_twist_compensation]
+#   Shared calibration settings. A named section may override these settings.
+#reference_probe: manual
+#   Default reference probe, overridable with REFERENCE_PROBE on the command.
+mesh_min: 20, 20
+mesh_max: 180, 180
+#   Physical bed coordinates to measure with both probes.
+#   Both probes must be able to reach the entire calibration area.
+#probe_count: 3, 3
+#   Number of samples on each axis; at least 3 per axis.
+#mesh_radius:
+#mesh_origin: 0, 0
+#round_probe_count: 5
+#   For circular meshes, specify mesh_radius instead of mesh_min/mesh_max.
+#   round_probe_count replaces probe_count and must be odd and at least 3.
+#mesh_pps: 2, 2
+#algorithm: lagrange
+#bicubic_tension: 0.2
+#   Interpolation settings follow bed_mesh rules. Algorithms are lagrange
+#   or bicubic. mesh_pps: 0 disables interpolation between measured samples.
 #speed: 50
-#   The speed (in mm/s) of non-probing moves during the calibration.
-#   The default is 50.
 #horizontal_move_z: 5
-#   The height (in mm) that the head should be commanded to move to
-#   just prior to starting a probe operation. The default is 5.
-calibrate_start_x: 20
-#   Defines the minimum X coordinate of the calibration
-#   This should be the X coordinate that positions the nozzle at the starting
-#   calibration position.
-calibrate_end_x: 200
-#   Defines the maximum X coordinate of the calibration
-#   This should be the X coordinate that positions the nozzle at the ending
-#   calibration position.
-calibrate_y: 112.5
-#   Defines the Y coordinate of the calibration
-#   This should be the Y coordinate that positions the nozzle during the
-#   calibration process. This parameter is recommended to
-#   be near the center of the bed
+#   Non-probing movement speed (mm/s) and clearance height (mm).
+#horizontal_z_clearance:
+#   Optional lift distance relative to the previous measured position.
 
-# For Y-axis twist compensation, specify the following parameters:
-calibrate_start_y: ...
-#   Defines the minimum Y coordinate of the calibration
-#   This should be the Y coordinate that positions the nozzle at the starting
-#   calibration position for the Y axis. This parameter must be provided if
-#   compensating for Y axis twist.
-calibrate_end_y: ...
-#   Defines the maximum Y coordinate of the calibration
-#   This should be the Y coordinate that positions the nozzle at the ending
-#   calibration position for the Y axis. This parameter must be provided if
-#   compensating for Y axis twist.
-calibrate_x: ...
-#   Defines the X coordinate of the calibration for Y axis twist compensation
-#   This should be the X coordinate that positions the nozzle during the
-#   calibration process for Y axis twist compensation. This parameter must be
-#   provided and is recommended to be near the center of the bed.
-
-# The following parameters are automatically saved by SAVE_CONFIG after
-# running AXIS_TWIST_COMPENSATION_CALIBRATE and typically should not be
-# manually modified. Note: if z_compensations is set, compensation_start_x
-# and compensation_end_x must also be set. Similarly, zy_compensations
-# requires compensation_start_y and compensation_end_y.
-#z_compensations:
-#   A comma-separated list of Z offset compensation values for X-axis twist.
-#   These represent Z adjustments at evenly-spaced points from
-#   compensation_start_x to compensation_end_x. Generated automatically
-#   during X-axis calibration. Requires compensation_start_x and
-#   compensation_end_x to be set. The default is an empty list.
-#compensation_start_x:
-#   The starting X coordinate for X-axis twist compensation.
-#   Set automatically during calibration. The default is unset.
-#compensation_end_x:
-#   The ending X coordinate for X-axis twist compensation.
-#   Set automatically during calibration. The default is unset.
-#zy_compensations:
-#   A comma-separated list of Z offset compensation values for Y-axis twist.
-#   Similar to z_compensations but for the Y axis. Generated automatically
-#   during Y-axis calibration (AXIS=Y). Requires compensation_start_y and
-#   compensation_end_y to be set. The default is an empty list.
-#compensation_start_y:
-#   The starting Y coordinate for Y-axis twist compensation.
-#   Set automatically during Y-axis calibration. The default is unset.
-#compensation_end_y:
-#   The ending Y coordinate for Y-axis twist compensation.
-#   Set automatically during Y-axis calibration. The default is unset.
+#[axis_twist_compensation probe_name]
+#reference_probe: another_probe
+#   Optional per-target overrides. Use a name from LIST_PROBES.
 ```
+
+Calibration creates or updates `[axis_twist_compensation <target>]` with its
+layout settings, selected `reference_probe`, `version`, `points`, and saved
+mesh geometry (`min_x`, `max_x`, `min_y`, `max_y`, `x_count`, `y_count`,
+`mesh_x_pps`, `mesh_y_pps`, `algo`, and `tension`). Saved mesh data should not
+be edited manually. Its geometry is independent of settings for the next
+calibration. A `[bed_mesh]` section is not required.
+
+Existing `z_compensations` / `zy_compensations` arrays and their
+`compensation_start_x`, `compensation_end_x`, `compensation_start_y`, and
+`compensation_end_y` bounds remain accepted in the base section. They are
+converted to a mesh covering the machine's XY work area for the default
+probe, only if that probe has no existing calibration. Values outside the
+old sample range are generated using the original linear formula. This
+conversion requires no movement and does not write new configuration.
+
+Old `calibrate_start_x`, `calibrate_end_x`, `calibrate_y`,
+`calibrate_start_y`, `calibrate_end_y`, and `calibrate_x` settings are
+obsolete. They do not select a calibration area. Configure mesh settings
+before running a new calibration; only full-mesh calibration is supported.
 
 ### ⚠️ [z_calibration]
 
@@ -6326,7 +6307,10 @@ sensor_type:
 #drift_filter_cutoff_frequency: 0.8
 #   Enable optional continuous taring while homing & probing to reject drift.
 #   The value is a frequency, in Hz, below which drift will be ignored. This
-#   option requires the SciPy library. Default: None
+#   option requires the SciPy library. Can be automatically calibrated using 
+#   `LOAD_CELL_PROBE_CALIBRATE CALIBRATION=DRIFT_FILTER`. 
+#   See [Drift Filter Calibration](Load_Cell.md#drift-filter-calibration).
+#   Default: None
 #drift_filter_delay: 2
 #   The delay, or 'order', of the drift filter. This controls the number of
 #   samples required to make a trigger detection. Can be 1 or 2, the default
@@ -6360,8 +6344,10 @@ sensor_type:
 #   The distance in mm to slowly raise the probe to perform precise Z=0
 #   measurments. This move occurs immediately after the probe detects contact.
 #   The distance needs to be approximatly 2x the distance required for the probe
-#   to break contact with the bed. Valid range is 0.01 to 2.0 mm.
-#   The default is 0.2 mm.
+#   to break contact with the bed. Can be automatically calibrated using
+#   `LOAD_CELL_PROBE_CALIBRATE CALIBRATION=TAP_PERFORMANCE`.
+#   See [Tap Performance Calibration](Load_Cell.md#tap-performance-calibration).
+#   Valid range is 0.01 to 2.0 mm. The default is 0.2 mm.
 #pullback_speed:
 #   The speed in mm/s for the pullback move after probe trigger. Valid range is
 #   0.1 to 1.0 mm/s. The default is set to 1 micron (0.001mm) per sensor sample.
@@ -6375,7 +6361,9 @@ sensor_type:
 #   The average angle of the decompression line for clean taps. The further the
 #   measured decompression angle is from this angle, the worse its tap quality score.
 #   There is no default, this must be measured. It is a number in degrees
-#   between 0 and 90.
+#   between 0 and 90. This will be automatically calibrated using
+#   `LOAD_CELL_PROBE_CALIBRATE CALIBRATION=TAP_PERFORMANCE`.
+#   See [Decompression Angle Calibration](Load_Cell.md#decompression-angle-calibration).
 #max_approach_force: 50
 #max_departure_force: 25
 #max_baseline_force_delta: 25
@@ -6482,8 +6470,9 @@ mcu:
 #ir_sensor_obj_gain:
 #ir_sensor_bracket_gain:
 #   Override the IR sensor tuning parameters stored in the sensor
-#   EEPROM. All three must be provided if any is given. These should
-#   not normally be set.
+#   EEPROM. All three must be provided if any is given, and
+#   ir_sensor_exponent must be above 0. These should not normally be
+#   set.
 ```
 
 ### [sx1509]

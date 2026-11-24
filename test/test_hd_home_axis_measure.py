@@ -1,15 +1,7 @@
-import pathlib
-import sys
-import types
 import unittest
 from unittest import mock
 
-
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / 'klippy'))
-with mock.patch.dict(sys.modules, {
-        'klippy': types.ModuleType('klippy'),
-        'klippy.pins': types.ModuleType('klippy.pins')}):
-    from extras import hd_home
+from klippy.extras import hd_home
 
 
 class HdHomeAxisMeasureTest(unittest.TestCase):

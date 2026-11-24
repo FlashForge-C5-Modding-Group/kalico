@@ -21,12 +21,13 @@ class EStopHostTest(unittest.TestCase):
         homing.probing_move.return_value = [9999., 0., 0.]
         probe.printer.lookup_object.return_value = homing
         pos = [10., 20., 30.]
+        gcmd = mock.Mock()
 
-        result = probe.e_stop_move(pos, 5.)
+        result = probe.e_stop_move(pos, 5., gcmd)
 
         self.assertEqual(result, [9999., 0., 0.])
         homing.probing_move.assert_called_once_with(
-            probe, pos, 5., rase=False, safe_mode=False)
+            probe, pos, 5., gcmd, rase=False, safe_mode=False)
 
 
 if __name__ == '__main__':
