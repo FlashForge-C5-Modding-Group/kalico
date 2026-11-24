@@ -86,6 +86,11 @@ class Creator5Toolchanger:
     # Overridden from the config in __init__ (persist_babystep defaults on)
     persist_babystep = False
     _applied_z = None
+    # (label, host time) at each point a toolchange waits on motion
+    _tc_marks = None
+    # The toolhead start delay to put back once AFC's return move after a
+    # change has started (see _with_motion)
+    _pending_start_delay = None
 
     def __init__(self, config):
         self.printer = config.get_printer()
@@ -196,8 +201,9 @@ class Creator5Toolchanger:
                                                maxval=256.)
         self.dock_approach_speed = config.getfloat(
             'dock_approach_speed', 20., above=0.)
+        # The last dock_predock_offset mm into a dock run at dock_approach_speed
         self.dock_predock_offset = config.getfloat(
-            'dock_predock_offset', 20., above=10.)
+            'dock_predock_offset', 20., above=0.)
         self.pickup_predock_speed = config.getfloat(
             'pickup_predock_speed', 40., above=0.)
         self.pickup_latch_speed = config.getfloat(
@@ -223,6 +229,12 @@ class Creator5Toolchanger:
                                               minval=0)
         self.toolchange_sensor_settle_ms = config.getint(
             'toolchange_sensor_settle_ms', 150, minval=0)
+        # Lead time for the first move after each stop-and-check in a
+        # toolchange (the toolhead default is 0.25 s); a change has about six.
+        self.toolchange_start_delay = config.getfloat(
+            'toolchange_start_delay', 0.1, above=0., maxval=0.25)
+        self.printer.register_event_handler('toolhead:sync_print_time',
+                                            self._handle_sync_print_time)
         # A head braking into its holder can bounce, or reach the dock and
         # mount switches a little after the move ends. Stock polls for about
         # a second and approaches up to three times before giving up; the
@@ -1001,6 +1013,11 @@ class Creator5Toolchanger:
             raise self._sensor_error(gcmd, 'Missing gcode_button %s' % name)
         return obj.get_status().get('state') == 'PRESSED'
 
+    def _mark(self, label):
+        if self._tc_marks is not None:
+            self._tc_marks.append(
+                (label, self.printer.get_reactor().monotonic()))
+
     def _sensor_error(self, gcmd, message):
         if gcmd is not None:
             return gcmd.error(message)
@@ -1243,6 +1260,7 @@ class Creator5Toolchanger:
         # can grab again, and fails with heaters off on the last one.
         try:
             self._run('M400')
+            self._mark('m400')
             self._pause_ms(self.toolchange_sensor_settle_ms)
             dock, _, attached = self._sensor_state(gcmd)
             # Must come first: a head neither docked nor attached fails here,
@@ -1309,7 +1327,6 @@ class Creator5Toolchanger:
         # Returns the (dock, mount) switch states after the last approach.
         self._travel_to_lane(y, clear_feed)
         self._move(x=x - self.dock_predock_offset, feed=clear_feed)
-        self._move(x=x - 10., feed=approach_feed)
         # Release only with the head seated in its holder and the carriage at
         # the mount. After lost steps the dock position is wrong, and an
         # unchecked release dropped the head; keep it locked on instead.
@@ -1323,6 +1340,7 @@ class Creator5Toolchanger:
             self._run('M400')
             self._pause_ms(self.toolchange_sensor_settle_ms)
             seated, mounted, polls = self._wait_dock_seated(gcmd, tool)
+            self._mark('dock seated')
             if seated and mounted:
                 # Near misses are the evidence for a late-seating head; a
                 # first-read dock stays silent.
@@ -1396,10 +1414,12 @@ class Creator5Toolchanger:
                              'closed' if mounted else 'open', x, y,
                              approaches * (2 if self.dock_rehome else 1)))
         self._run('MOTOR_RELEASE')
+        self._mark('unlocked')
         self._pause_ms(self.release_latch_wait_ms)
         self._move(x=self.approach_x,
                    feed=self.departure_speed * 60.)
         self._verify(gcmd, None, parked=tool)
+        self._mark('dock verified')
         # _dock() is AFC's custom_unselect command (bypassing its own
         # unload flow entirely), so lane_loaded/status never got cleared
         # here -- AFC kept reporting the lane as loaded indefinitely after
@@ -1485,6 +1505,7 @@ class Creator5Toolchanger:
             self._pause_ms(self.toolchange_sensor_settle_ms)
             (mounted,), polls = self._poll_switches(
                 gcmd, [self.grab_buttons[tool]], self.pickup_mount_timeout_ms)
+            self._mark('at mount')
             if not mounted:
                 raise gcmd.error(
                     'T%d grab sensor did not engage at mount' % tool)
@@ -1502,6 +1523,7 @@ class Creator5Toolchanger:
             # Verify the physical sensors at the clear pullback point before
             # activation. The final departure can flow into AFC's return move.
             if self._verify(gcmd, tool, grab=(attempt + 1, grabs)) is not None:
+                self._mark('grab verified')
                 break
         extruder = 'extruder' if tool == 0 else 'extruder%d' % tool
         self._run('ACTIVATE_EXTRUDER EXTRUDER=%s' % extruder)
@@ -1513,6 +1535,14 @@ class Creator5Toolchanger:
             self._move(x=self.approach_x,
                        feed=self.pickup_departure_speed * 60.)
 
+    def _handle_sync_print_time(self, curtime, est_print_time, print_time):
+        # The first restart after a change is AFC's return move: let it use
+        # the short start delay too, then put the toolhead default back.
+        if self._pending_start_delay is not None and not self.busy:
+            self.printer.lookup_object('toolhead').buffer_time_start = (
+                self._pending_start_delay)
+            self._pending_start_delay = None
+
     def _with_motion(self, gcmd, operation, final_accel=None):
         toolhead = self.printer.lookup_object('toolhead')
         old_accel = toolhead.get_max_velocity()[1]
@@ -1520,6 +1550,10 @@ class Creator5Toolchanger:
             self.printer.get_reactor().monotonic()).get('minimum_cruise_ratio')
         gcode_move = self.printer.lookup_object('gcode_move')
         was_absolute = gcode_move.get_status().get('absolute_coordinates')
+        if self._pending_start_delay is None:
+            self._pending_start_delay = toolhead.buffer_time_start
+        toolhead.buffer_time_start = min(toolhead.buffer_time_start,
+                                         self.toolchange_start_delay)
         self._ui_sensor_cache = None
         self.busy = True
         completed = False
@@ -1544,6 +1578,10 @@ class Creator5Toolchanger:
                 if not was_absolute:
                     self._run('G91')
             finally:
+                if not completed:
+                    # A failed change: nothing follows, restore it now
+                    toolhead.buffer_time_start = self._pending_start_delay
+                    self._pending_start_delay = None
                 self.busy = False
                 self._ui_sensor_cache = None
 
@@ -1789,8 +1827,18 @@ class Creator5Toolchanger:
             if attached is not None:
                 self._dock(gcmd, attached, raise_z=z_homed)
             self._pickup(gcmd, tool, raise_z=z_homed)
-        self._with_motion(gcmd, change,
-                          final_accel=self.post_select_accel)
+        self._tc_marks = [('start', self.printer.get_reactor().monotonic())]
+        try:
+            self._with_motion(gcmd, change,
+                              final_accel=self.post_select_accel)
+            self._mark('done')
+            marks = self._tc_marks
+            logging.info('Creator 5 toolchange T%s->T%d: %.3fs (%s)' % (
+                attached, tool, marks[-1][1] - marks[0][1], ', '.join(
+                    '%s +%.3f' % (label, t - prev) for (label, t), (_, prev)
+                    in zip(marks[1:], marks))))
+        finally:
+            self._tc_marks = None
         self._count_toolchange(tool)
         self._sync_clog_sensors(tool)
 

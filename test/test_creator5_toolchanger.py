@@ -789,9 +789,9 @@ class Creator5OffsetTests(unittest.TestCase):
             'T0 not seated after approach 1 of 3 (dock sensor open, mount '
             'sensor closed); backing out to retry',
             'T0 dock seated after 0 ms (approach 2 of 3)'])
-        # Pre-dock, approach, then back out 10 mm and push in again before
-        # the release and the departure to approach_x.
-        self.assertEqual(moves, [278., 288., 298., 288., 298., 250.])
+        # Pre-dock, slow in to the dock, then back out 10 mm and push in
+        # again before the release and the departure to approach_x.
+        self.assertEqual(moves, [278., 298., 288., 298., 250.])
 
     def test_dock_retries_slower_and_gives_up_after_configured_retries(self):
         board = self._dock_board(seated=False, at_mount=True)

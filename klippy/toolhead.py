@@ -249,6 +249,10 @@ class ToolHead:
         self.reactor = self.printer.get_reactor()
         self.mcu = self.printer.lookup_object("mcu")
 
+        # Lead time for the first move after the toolhead goes idle. Short
+        # stop-and-check sequences (a toolchange) may lower it; calc_step_gen_
+        # restart still enforces the kinematic minimum.
+        self.buffer_time_start = BUFFER_TIME_START
         self.lookahead = LookAheadQueue()
         self.lookahead.set_flush_time(BUFFER_TIME_HIGH)
         self.commanded_pos = [0.0, 0.0, 0.0, 0.0]
@@ -350,7 +354,7 @@ class ToolHead:
         curtime = self.reactor.monotonic()
         est_print_time = self.mcu.estimated_print_time(curtime)
         kin_time = self.motion_queuing.calc_step_gen_restart(est_print_time)
-        min_print_time = max(est_print_time + BUFFER_TIME_START, kin_time)
+        min_print_time = max(est_print_time + self.buffer_time_start, kin_time)
         if min_print_time > self.print_time:
             self.print_time = min_print_time
             self.printer.send_event(
@@ -543,7 +547,12 @@ class ToolHead:
                 # are deterministic after a wait_moves() (eg, M400)
                 self.motion_queuing.flush_all_steps()
                 break
-            eventtime = self.reactor.pause(eventtime + 0.100)
+            # Wake when the queued motion should be done, not on a fixed
+            # 100 ms poll that overshoots every M400 by up to that much
+            remaining = self.print_time - self.mcu.estimated_print_time(
+                eventtime)
+            eventtime = self.reactor.pause(
+                eventtime + min(0.100, max(0.001, remaining + 0.001)))
 
     def set_extruder(self, extruder, extrude_pos):
         # XXX - should use add_extra_axis
