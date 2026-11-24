@@ -153,6 +153,22 @@ def _derive_buffer_state(slot_sensor: Optional[Dict[str, Any]]) -> str:
     return 'neutral'
 
 
+class AceDryerRow:
+    """The ACE dryer as Klipper's "temperature_fan <unit>" status object, so the
+    UI thermals page shows it with a settable target. The unit's
+    SET_TEMPERATURE_FAN_TARGET handler does the setting."""
+
+    def __init__(self, unit: "afcACE") -> None:
+        self.unit = unit
+
+    def get_status(self, eventtime: Optional[float] = None) -> Dict[str, Any]:
+        """
+        :param eventtime: Reactor event time (unused).
+        :return dict: temperature, target, speed and, on the ACE 2, humidity.
+        """
+        return self.unit._dryer_row_status()
+
+
 class afcACE(afcUnit):
     """
     AFC unit driver for Anycubic ACE PRO filament changers.
@@ -184,6 +200,10 @@ class afcACE(afcUnit):
     # this False since it reads them host-side (AFC_ACE2_rfid).
     _uses_firmware_rfid = True
     stage_initial_dist = 0.0
+    # Dryer set-point ceiling when max_dryer_temperature is not set (AFC_ACE2: 70).
+    _DEFAULT_MAX_DRYER_C = 55.0
+    # The V1 ACE has no humidity sensor; AFC_ACE2 sets this True.
+    _has_humidity_sensor = False
 
     def __init__(self, config: ConfigWrapper) -> None:
         """
@@ -284,7 +304,12 @@ class afcACE(afcUnit):
         heads = config.getlist("heads", None)
         if heads is not None:
             self._make_slot_lanes(config, list(heads))
-        self.max_dryer_temperature = config.getfloat("max_dryer_temperature", 55.0, minval=0.0)
+        self.max_dryer_temperature = config.getfloat("max_dryer_temperature",
+                                                     self._DEFAULT_MAX_DRYER_C, minval=0.0)
+        # Minutes a drying cycle runs when started from the UI thermals row
+        # (SET_TEMPERATURE_FAN_TARGET), which has no duration of its own.
+        self.dryer_default_duration = config.getfloat("dryer_default_duration", 120.0,
+                                                      minval=1.0)
         # AFC_ACE_DRY ROTATE=1: every dry_rotate_interval seconds, each empty
         # slot gets a slow dry_rotate_length mm rollback so the spool turns
         # without feeding filament (spool and gears share the slot's motor).
@@ -412,6 +437,25 @@ class afcACE(afcUnit):
                                                self.name, self.cmd_AFC_ACE_DRY_STOP,
                                                self.cmd_AFC_ACE_DRY_STOP_help,
                                                self.cmd_AFC_ACE_DRY_STOP_options)
+        # The dryer target lives on the ACE's thermals row: Fluidd and Mainsail
+        # give a temperature_fan a settable target (and show its humidity), and
+        # TURN_OFF_HEATERS leaves it alone, so a print ending does not stop a
+        # drying cycle. A [temperature_sensor] with sensor_type temperature_ace
+        # on this unit keeps its name and row; it just becomes settable, so the
+        # ACE stays one row. Setting the target starts or stops drying.
+        self._climate_sensor = self._linked_climate_sensor(config)
+        row_name = self._climate_sensor or self.name
+        self._dryer_row = f"temperature_fan {row_name}"
+        self.printer.add_object(self._dryer_row, AceDryerRow(self))
+        # The UIs check a target against the section's min_temp/max_temp in
+        # configfile.settings, built from access_tracking; with no entries
+        # Fluidd rejects every target but 0.
+        config.access_tracking[(self._dryer_row.lower(), "min_temp")] = 0.0
+        config.access_tracking[(self._dryer_row.lower(), "max_temp")] = self.max_dryer_temperature
+        self.gcode.register_mux_command('SET_TEMPERATURE_FAN_TARGET', "TEMPERATURE_FAN",
+                                        row_name, self.cmd_SET_TEMPERATURE_FAN_TARGET,
+                                        desc=self.cmd_SET_TEMPERATURE_FAN_TARGET_help)
+        self.printer.register_event_handler("klippy:connect", self._list_dryer_row)
 
         try:
             from extras.temperature_ace import TemperatureACE
@@ -922,7 +966,7 @@ class afcACE(afcUnit):
 
         Adds (on top of the base lanes/extruders/hubs/buffers):
           ace_connected, ace_status (ready/busy), ace_action (the derived
-          current action), ace_temp, ace_humidity (ACE2 only), ace_dryer, and a
+          current action), ace_temp, ace_humidity (ACE 2 only), ace_dryer, and a
           compact per-slot inventory (status, rfid, sku, material, uid, color).
 
         :param eventtime: Reactor event time (unused; Klipper status interface).
@@ -934,16 +978,9 @@ class afcACE(afcUnit):
         response["ace_connected"] = bool(self._ace and self._ace.connected)
         response["ace_status"] = hw.get("status", "")
         response["ace_action"] = self._current_action
-        # V1 carries temp/humidity in the status payload; the ACE 2 falls back to
-        # the GET_TEMP cache (env channel).
-        response["ace_temp"] = hw.get("temp")
-        if (response["ace_temp"] is None
-            and temp_info.get("env_temp")):
-            response["ace_temp"] = temp_info.get("env_temp")
-        if "humidity" in hw:
-            response["ace_humidity"] = hw.get("humidity")
-        elif temp_info.get("env_humidity"):
-            response["ace_humidity"] = temp_info.get("env_humidity")
+        response["ace_temp"], humidity = self._box_climate()
+        if humidity is not None:
+            response["ace_humidity"] = humidity
         dryer = hw.get("dryer_status") or {}
         response["ace_dryer"] = dryer.get("status", "")
         response["ace_dryer_target"] = dryer.get("target_temp")
@@ -3875,19 +3912,7 @@ class afcACE(afcUnit):
         duration = gcmd.get_float('DURATION', 90.0)
         fan = gcmd.get_int('FAN', 7000)
         rotate = gcmd.get_int('ROTATE', 0, minval=0, maxval=1)
-        if temp > self.max_dryer_temperature:
-            gcmd.respond_info(f"ACE dryer: TEMP {temp:.0f}°C capped to "
-                              f"max_dryer_temperature {self.max_dryer_temperature:.0f}°C")
-            temp = self.max_dryer_temperature
-        if (not self._ace
-            or not self._ace.connected):
-            gcmd.respond_info("ACE not connected")
-            return
-        try:
-            self._ace.start_drying(temp, fan, duration)
-            gcmd.respond_info(f"ACE dryer started: {temp}°C for {duration} min")
-        except Exception as e:
-            gcmd.respond_info(f"Error starting dryer: {e}")
+        if not self._start_dryer(gcmd, temp, duration, fan):
             return
 
         self._stop_dry_rotate()
@@ -3901,6 +3926,133 @@ class afcACE(afcUnit):
                                   f"dry with rotation. Drying without it.")
             else:
                 self._start_dry_rotate(gcmd)
+
+    def _start_dryer(self, gcmd: GCodeCommand, temp: float, duration: float,
+                     fan: int = 7000) -> bool:
+        """
+        Start a drying cycle, TEMP capped to max_dryer_temperature, and reply.
+
+        :param gcmd: the command, for the replies.
+        :param temp: requested dryer temperature in C.
+        :param duration: cycle length in minutes.
+        :param fan: fan speed (ignored by the firmware).
+        :return bool: True when the unit accepted the cycle.
+        """
+        if temp > self.max_dryer_temperature:
+            gcmd.respond_info(f"ACE dryer: TEMP {temp:.0f}°C capped to "
+                              f"max_dryer_temperature {self.max_dryer_temperature:.0f}°C")
+            temp = self.max_dryer_temperature
+        if (not self._ace
+            or not self._ace.connected):
+            gcmd.respond_info("ACE not connected")
+            return False
+        try:
+            self._ace.start_drying(temp, fan, duration)
+            gcmd.respond_info(f"ACE dryer started: {temp:g}°C for {duration:g} min")
+        except Exception as e:
+            gcmd.respond_info(f"Error starting dryer: {e}")
+            return False
+        return True
+
+    cmd_SET_TEMPERATURE_FAN_TARGET_help = "Set the ACE dryer target (0 stops drying)"
+    def cmd_SET_TEMPERATURE_FAN_TARGET(self, gcmd: GCodeCommand) -> None:
+        """
+        The UI thermals row's target: above 0 starts drying at that temperature
+        for dryer_default_duration minutes (or DURATION=), 0 stops drying.
+
+        Usage
+        -------
+        `SET_TEMPERATURE_FAN_TARGET TEMPERATURE_FAN=<unit> TARGET=<C> [DURATION=<minutes>]`
+
+        Example
+        -------
+        ```
+        SET_TEMPERATURE_FAN_TARGET TEMPERATURE_FAN=Ace_1 TARGET=50
+        ```
+        """
+        target = gcmd.get_float('TARGET', 0.0, minval=0.0)
+        if target <= 0.0:
+            self.cmd_AFC_ACE_DRY_STOP(gcmd)
+            return
+        duration = gcmd.get_float('DURATION', self.dryer_default_duration, minval=1.0)
+        self._start_dryer(gcmd, target, duration)
+
+    def _linked_climate_sensor(self, config: ConfigWrapper) -> Optional[str]:
+        """
+        Name of the [temperature_sensor] that shows this unit's box climate
+        (sensor_type temperature_ace, or the aht2x alias with ace_unit, on the
+        default channel), whose row the dryer target joins. Read without access
+        tracking, so the sensor still owns and validates its options.
+
+        :param config: this unit's config section.
+        :return Optional[str]: the sensor's short name, or None if there is none.
+        """
+        for section in config.get_prefix_sections("temperature_sensor "):
+            sensor_type = section.get("sensor_type", "", note_valid=False)
+            if sensor_type == "temperature_ace":
+                unit = section.get("ace_unit", "Ace1", note_valid=False)
+            elif (sensor_type == "aht2x"
+                  and section.get("afc_type", "ACE", note_valid=False) in ("ACE", "ACE2")):
+                unit = section.get("ace_unit", None, note_valid=False)
+            else:
+                continue
+            if (unit == self.name
+                and section.get("channel", "default", note_valid=False) == "default"):
+                return section.get_name().split()[-1]
+        return None
+
+    def _list_dryer_row(self) -> None:
+        """
+        `klippy:connect`: put the dryer row on the UI thermals page in place of
+        the linked climate sensor's row, so the ACE is one row. Fluidd lists
+        every "temperature_sensor <name>" printer object, so the sensor's
+        object leaves the published object list too; it keeps sampling and
+        enforcing its min_temp/max_temp, and the row carries its readings.
+        """
+        sensors = self.printer.lookup_object("heaters").available_sensors
+        plain = f"temperature_sensor {self._climate_sensor}"
+        if (self._climate_sensor
+            and plain in sensors):
+            sensors[sensors.index(plain)] = self._dryer_row
+            self.printer.objects.pop(plain, None)
+        else:
+            sensors.append(self._dryer_row)
+
+    def _box_climate(self) -> Tuple[Optional[float], Optional[float]]:
+        """
+        Box temperature and humidity: from the status payload, else the ACE 2's
+        GET_TEMP cache (env channel). Humidity is None on a unit without a
+        humidity sensor (the V1 ACE).
+
+        :return tuple: (temperature or None, humidity or None)
+        """
+        hw = self._cached_hw_status or {}
+        temp_info = self._cached_temp_info or {}
+        temp = hw.get("temp")
+        if temp is None:
+            temp = temp_info.get("env_temp")
+        humidity = None
+        if self._has_humidity_sensor:
+            humidity = hw.get("humidity", temp_info.get("env_humidity"))
+        return temp, humidity
+
+    def _dryer_row_status(self) -> Dict[str, Any]:
+        """
+        Status of the "temperature_fan <unit>" dryer row: the box temperature,
+        the running cycle's target (0 when idle), and humidity on a unit with
+        a humidity sensor (ACE 2 only).
+
+        :return dict: temperature, target, speed and, on the ACE 2, humidity.
+        """
+        temp, humidity = self._box_climate()
+        dryer = (self._cached_hw_status or {}).get("dryer_status") or {}
+        drying = str(dryer.get("status") or "").strip().lower() not in self._DRYER_IDLE
+        target = float(dryer.get("target_temp") or 0.0) if drying else 0.0
+        status: Dict[str, Any] = {"temperature": round(float(temp or 0.0), 1),
+                                  "target": target, "speed": 1.0 if drying else 0.0}
+        if humidity is not None:
+            status["humidity"] = round(float(humidity), 1)
+        return status
 
     cmd_AFC_ACE_DRY_STOP_help = "Stop ACE filament dryer"
     cmd_AFC_ACE_DRY_STOP_options = {
@@ -5215,11 +5367,58 @@ ACE_BYID_GLOB = "/dev/serial/by-id/*ANYCUBIC*-if00"
 _ACE_CLAIMED_PORTS: Set[str] = set()
 
 
+def _sysfs_usb_ttys(matches: Callable[[str], bool]) -> List[str]:
+    """
+    USB serial ttys found through sysfs, for systems without udev (no
+    /dev/serial). Only interface 0, as the by-id globs' -if00.
+
+    :param matches: called with the USB device's sysfs directory; True keeps it
+    :return List[str]: matching /dev tty paths, sorted by name
+    """
+    out: List[str] = []
+    for tty in sorted(glob.glob("/sys/class/tty/ttyACM*") + glob.glob("/sys/class/tty/ttyUSB*")):
+        with contextlib.suppress(Exception):
+            iface = os.path.realpath(os.path.join(tty, "device"))
+            with open(os.path.join(iface, "bInterfaceNumber")) as f:
+                if int(f.read().strip(), 16) != 0:
+                    continue
+            if matches(os.path.join(iface, "..")):
+                out.append("/dev/" + os.path.basename(tty))
+    return out
+
+
+def _usb_attr(usb_dev: str, name: str) -> str:
+    """
+    One USB device attribute from sysfs, or '' when it is missing.
+
+    :param usb_dev: the device's sysfs directory
+    :param name: attribute file name, e.g. idVendor
+    :return str: its stripped contents
+    """
+    try:
+        with open(os.path.join(usb_dev, name)) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def _is_anycubic_usb(usb_dev: str) -> bool:
+    """
+    True for an Anycubic ACE, matched on the same manufacturer/product
+    strings udev builds the by-id name (ACE_BYID_GLOB) from.
+
+    :param usb_dev: the device's sysfs directory
+    :return bool: True when either string names ANYCUBIC
+    """
+    return any("ANYCUBIC" in _usb_attr(usb_dev, n).upper() for n in ("manufacturer", "product"))
+
+
 def _ace_scan_candidates() -> List[str]:
     """
     Anycubic ACE serial devices currently present, as real tty paths.
 
-    :return List[str]: resolved tty paths, sorted by their by-id link
+    :return List[str]: resolved tty paths, sorted by their by-id link, or by
+                       tty name from sysfs when there is no /dev/serial/by-id
     """
     out: List[str] = []
     for p in sorted(glob.glob(ACE_BYID_GLOB)):
@@ -5227,7 +5426,7 @@ def _ace_scan_candidates() -> List[str]:
             out.append(os.path.realpath(p))
         except Exception:
             out.append(p)
-    return out
+    return out or _sysfs_usb_ttys(_is_anycubic_usb)
 
 
 def _ace_extract_get_info_id(buf: bytes) -> Optional[int]:

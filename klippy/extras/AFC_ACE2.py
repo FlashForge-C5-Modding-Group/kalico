@@ -36,7 +36,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union, TYPE_CHECKING
 
 from extras.AFC_ACE import (
     afcACE, ACEConnection, ACESerialError, ACETimeoutError, REQUEST_TIMEOUT,
-    _ACE_CLAIMED_PORTS, debug_enabled,
+    _ACE_CLAIMED_PORTS, _sysfs_usb_ttys, _usb_attr, debug_enabled,
 )
 
 if TYPE_CHECKING:
@@ -771,17 +771,8 @@ def _ace2_scan_candidates() -> List[str]:
             out.append(os.path.realpath(p))
         except Exception:
             out.append(p)
-    if out:
-        return out
     # No udev (no /dev/serial): find CH34x ttys (USB vendor 1a86) through sysfs
-    for tty in sorted(glob.glob("/sys/class/tty/ttyACM*") + glob.glob("/sys/class/tty/ttyUSB*")):
-        with contextlib.suppress(Exception):
-            iface = os.path.realpath(os.path.join(tty, "device"))
-            with open(os.path.join(iface, "..", "idVendor")) as f:
-                vendor = f.read().strip()
-            if vendor == "1a86":
-                out.append("/dev/" + os.path.basename(tty))
-    return out
+    return out or _sysfs_usb_ttys(lambda usb_dev: _usb_attr(usb_dev, "idVendor") == "1a86")
 
 def _ace2_topology_key(real_tty: str) -> str:
     """
@@ -1184,6 +1175,8 @@ class afcACE2(afcACE):
     # (AFC_ACE2_rfid), not through the firmware's get_filament_info, so it must
     # not do the V1 firmware inventory sweep at startup prep.
     _uses_firmware_rfid = False
+    _DEFAULT_MAX_DRYER_C = 70.0
+    _has_humidity_sensor = True
 
     def __init__(self, config: ConfigWrapper) -> None:
         """
@@ -1214,7 +1207,6 @@ class afcACE2(afcACE):
             self.ace_uid = (uid1, uid2, uid3)
         # ACE 2 Pro V2 serial runs at 230400 baud (the V1 ACE default is 115200)
         self.baud_rate = config.getint("baud_rate", 230400)
-        self.max_dryer_temperature = config.getfloat("max_dryer_temperature", 70.0, minval=0.0)
         # Encoder feed-check (V2 SET_FEED_CHECK): at feed_error_length mm the
         # encoder must read at least feed_check_length, giving a slip tolerance of
         # ~feed_error_length - feed_check_length / 1.2342 (~23mm at 200/185).

@@ -33,6 +33,12 @@
 #
 # channel defaults to 'default' (the single box/env temp from get_status,
 # unchanged from before). The other channels are ACE2-only.
+#
+# The default-channel sensor for a unit is also its dryer control: the unit
+# shows it on the UI thermals page as one settable "temperature_fan <name>" row
+# (temperature, plus humidity on the ACE 2). Setting a target there starts a
+# drying cycle of dryer_default_duration minutes (AFC_ACE option, default
+# 120); 0 stops it. The V1 ACE has no humidity sensor.
 
 import contextlib
 import logging
@@ -130,8 +136,8 @@ class TemperatureACE:
         with contextlib.suppress(Exception):
             absent = self.ace_unit_name in self.printer.lookup_object("AFC").absent_units
         if self._ace_unit:
-            if getattr(self._ace_unit, "type", "") == "ACE2":
-                self._has_humidity = True
+            # Only the ACE 2 has a humidity sensor; the V1 reports temperature only.
+            self._has_humidity = bool(getattr(self._ace_unit, "_has_humidity_sensor", False))
             self._log().info(f"temperature_ace: linked to AFC_ACE unit '{self.ace_unit_name}'")
         elif absent:
             # AFC_ACE fallback_without_ace: the ACE isn't plugged in, not a config mistake
@@ -206,6 +212,7 @@ class TemperatureACE:
         try:
             if not self._ace_unit:
                 self._ace_unit = self._resolve_unit()
+                self._has_humidity = bool(getattr(self._ace_unit, "_has_humidity_sensor", False))
 
             if self._ace_unit:
                 now = self.reactor.monotonic()
@@ -215,8 +222,7 @@ class TemperatureACE:
                     if not stale:
                         hw_status = getattr(self._ace_unit, "_cached_hw_status", {})
                         self.temp = float(hw_status.get("temp", 0.0) or 0.0)
-                        if "humidity" in hw_status:
-                            self._has_humidity = True
+                        if self._has_humidity:
                             self.humidity = float(hw_status.get("humidity", 0.0) or 0.0)
                 else:
                     cache_time = getattr(self._ace_unit, "_temp_info_time", None)
@@ -224,8 +230,7 @@ class TemperatureACE:
                     if not stale:
                         temp_info = getattr(self._ace_unit, "_cached_temp_info", {})
                         self.temp = float(temp_info.get(self.channel + "_temp", 0.0) or 0.0)
-                        if "env_humidity" in temp_info:
-                            self._has_humidity = True
+                        if self._has_humidity:
                             self.humidity = float(temp_info.get("env_humidity", 0.0) or 0.0)
 
                 if stale:
