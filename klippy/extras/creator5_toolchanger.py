@@ -213,10 +213,6 @@ class Creator5Toolchanger:
         self.post_select_accel = config.getfloat(
             'post_select_accel', None, above=0.)
         self.approach_x = config.getfloat('approach_x', 250.)
-        # Line up on a dock's Y this far inboard of approach_x, so the run in
-        # to the dock is straight along X instead of a fast diagonal that
-        # corners right at approach_x
-        self.dock_lane_lead = config.getfloat('dock_lane_lead', 15., minval=0.)
         self.pre_dock_x = config.getfloat('pre_dock_x', 280.)
         self.pullback = config.getfloat('pullback', 20., above=0.)
         self.pickup_latch_wait_ms = config.getint('pickup_latch_wait_ms',
@@ -1190,15 +1186,13 @@ class Creator5Toolchanger:
 
     def _travel_to_lane(self, y, feed):
         # Inboard of approach_x nothing sits between the head and the dock
-        # lane. Line up on the lane dock_lane_lead inboard of approach_x and
-        # come in along X from there.
-        entry_x = self.approach_x - self.dock_lane_lead
+        # lane, so go there in one diagonal move instead of X then Y.
         toolhead = self.printer.lookup_object('toolhead')
-        if toolhead.get_position()[0] > entry_x + .001:
-            self._move(x=entry_x, feed=feed)
-        self._move(x=entry_x, y=y, feed=feed)
-        if self.dock_lane_lead:
+        if toolhead.get_position()[0] <= self.approach_x + .001:
+            self._move(x=self.approach_x, y=y, feed=feed)
+        else:
             self._move(x=self.approach_x, feed=feed)
+            self._move(y=y, feed=feed)
 
     def _raise_z(self):
         toolhead = self.printer.lookup_object('toolhead')
