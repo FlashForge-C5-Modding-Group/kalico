@@ -98,20 +98,20 @@ class Creator5AfcSensorTest(unittest.TestCase):
         # stopped after the current line, then a fresh position saved
         self.assertEqual(calls, ['pause', 'save False'])
         source.gcode.run_script.assert_called_once_with(
-            'PAUSE\nC5_FILAMENT_RUNOUT TOOL=0 TO=2')
+            'PAUSE REASON=runout\nC5_FILAMENT_RUNOUT TOOL=0 TO=2')
         source.set_tool_unloaded.assert_called_once_with()
 
     def test_runout_without_backup_asks(self):
         runout, source, calls = self._runout_lane(None)
         runout(source)
         source.gcode.run_script.assert_called_once_with(
-            'PAUSE\nC5_FILAMENT_RUNOUT TOOL=0')
+            'PAUSE REASON=runout\nC5_FILAMENT_RUNOUT TOOL=0')
 
     def test_runout_with_empty_backup_asks(self):
         runout, source, calls = self._runout_lane('extruder2', backup_loaded=False)
         runout(source)
         source.gcode.run_script.assert_called_once_with(
-            'PAUSE\nC5_FILAMENT_RUNOUT TOOL=0')
+            'PAUSE REASON=runout\nC5_FILAMENT_RUNOUT TOOL=0')
 
     def test_eject_tells_operator_to_use_the_cutter(self):
         load_unload_sequence = load_method('AFC_extruder.py', 'AFCExtruder',

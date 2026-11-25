@@ -31,6 +31,8 @@ class VirtualSDEOFTests(unittest.TestCase):
         sd.creator5_stop_done = False
         sd.cancelled_work = False
         sd.creator5_preloaded_definitions = set()
+        sd.creator5_by_object = False
+        sd.creator5_max_z = 0.
         sd.must_pause_work = sd.cmd_from_sd = False
         sd.work_timer = object()
         sd._in_worker_script = False
@@ -660,6 +662,65 @@ class VirtualSDEOFTests(unittest.TestCase):
             self.orca_single_tool('T0\nM109 S215 T0\n'), '')
         self.assertTrue(command.startswith(
             'C5_PRINT_START TOOL=0 HOTEND=215 BED=60 '))
+
+
+class VirtualSDByObjectTests(unittest.TestCase):
+    """Print by object: PAUSE needs the tallest finished object's height."""
+
+    make_sd = VirtualSDEOFTests.make_sd
+
+    def run_print(self, text):
+        sd = self.make_sd(text)
+        sd.auto_creator5_start = True
+        # Tool offset 1.5: G-code Z = toolhead Z - 1.5
+        gcode_move = SimpleNamespace(last_position=[0., 0., 0., 0.],
+                                     base_position=[0., 0., 1.5, 0.])
+        sd.printer = mock.Mock()
+        sd.printer.lookup_object.return_value = gcode_move
+
+        def dispatch(line):
+            match = MODULE.re.search(r'\bZ([0-9.]+)', line)
+            if line.startswith('G1') and match:
+                gcode_move.last_position[2] = float(match.group(1)) + 1.5
+            elif line.startswith('T'):
+                # A tool change ends with the bed lowered to safe_z
+                gcode_move.last_position[2] = 50.
+        sd.gcode.run_script.side_effect = dispatch
+        sd.work_handler(0.)
+        return sd
+
+    def test_orca_setting_is_read_for_every_print(self):
+        self.assertTrue(MODULE.creator5_by_object(
+            '; print_sequence = by object\n'))
+        self.assertFalse(MODULE.creator5_by_object(
+            '; print_sequence = by layer\n'))
+        self.assertFalse(MODULE.creator5_by_object('G1 X10\n'))
+        # The footer (Orca's config block) wins over the header
+        self.assertTrue(MODULE.creator5_by_object(
+            '; print_sequence = by object\n', '; print_sequence = by layer\n'))
+
+    def test_tracks_the_highest_z_of_the_file_moves_only(self):
+        sd = self.run_print(
+            'M109 S220\nG1 Z0.2 F600\nG1 X10 Z12.4\nT1\nG1 Z0.4\n'
+            '; print_sequence = by object\n')
+        status = sd.get_status(0.)
+        self.assertTrue(status['print_by_object'])
+        # Not the tool change's 50 - 1.5
+        self.assertAlmostEqual(status['print_max_z'], 12.4)
+
+    def test_own_start_line_is_still_detected(self):
+        sd = self.run_print('C5_PRINT_START TOOL=1 HOTEND=210 BED=50\n'
+                            'G1 Z3.0\n; print_sequence = by object\n')
+        self.assertTrue(sd.creator5_by_object)
+        self.assertAlmostEqual(sd.creator5_max_z, 3.)
+
+    def test_by_layer_print_does_not_track(self):
+        sd = self.run_print('M109 S220\nG1 Z5.0\n'
+                            '; print_sequence = by layer\n')
+        status = sd.get_status(0.)
+        self.assertFalse(status['print_by_object'])
+        self.assertEqual(status['print_max_z'], 0.)
+        sd.printer.lookup_object.assert_not_called()
 
 
 if __name__ == '__main__':

@@ -179,7 +179,9 @@ class C5MotionGuard:
     def _pause(self, reason):
         self.gcode.respond_raw("!! Motion guard: %s, pausing" % (reason,))
         try:
-            self.gcode.run_script("PAUSE")
+            # REASON=motion: XY can't be trusted, so PAUSE doesn't park and
+            # RESUME homes X/Y before moving
+            self.gcode.run_script("PAUSE REASON=motion")
         except self.gcode.error as e:
             self.gcode.respond_raw("!! Motion guard: pause failed: %s" % (e,))
 

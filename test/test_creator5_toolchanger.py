@@ -111,6 +111,13 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board.offset_calibration_lift = 3.
         self.board.offset_calibration_lift_speed = 10.
         self.board.safe_z = 10.
+        self.board.purge_x = 276.5
+        self.board.purge_y = 257.
+        self.board.prep_approach_x = 250.
+        self.board.prep_approach_y = 250.
+        self.board.purge_z = 8.
+        self.board.purge_length = 50.
+        self.board.purge_speed = 3.
         self.board.scan_spans = {
             ('X', 1): 7., ('Y', 1): 7.,
             ('X', -1): 7., ('Y', -1): 7.}
@@ -1634,6 +1641,14 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board._load_extruder_json()
         self.assertEqual(self.board.docks[0], [299., 51.])
 
+    @staticmethod
+    def _gcode_move_away():
+        # Head over the bed, away from the purge spot
+        gcode_move = mock.Mock()
+        gcode_move.get_status.return_value = {
+            'gcode_position': (120., 80., 8., 0.)}
+        return gcode_move
+
     def test_purge_flow_envelope_stops_at_x279(self):
         board = self.board
         board.purge_x, board.purge_y = 276.5, 260.
@@ -1668,7 +1683,8 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board.printer.lookup_object.side_effect = (
             lambda name, *args: {
                 'extruder': heater, 'pa_adjust': pa,
-                'stepper_enable': self.stepper_enable}[name])
+                'stepper_enable': self.stepper_enable,
+                'gcode_move': self._gcode_move_away()}[name])
         self.board.printer.lookup_objects.return_value = []
         command = GCmd()
         self.board.cmd_flow_strokes(command)
@@ -1701,7 +1717,8 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board.printer.lookup_object.side_effect = (
             lambda name, *args: {
                 'extruder': heater, 'pa_adjust': pa,
-                'stepper_enable': self.stepper_enable}[name])
+                'stepper_enable': self.stepper_enable,
+                'gcode_move': self._gcode_move_away()}[name])
         self.board.printer.lookup_objects.return_value = []
         command = GCmd()
         self.board.cmd_flow_strokes(command)
@@ -1744,7 +1761,8 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board.printer.lookup_object.side_effect = (
             lambda name, *args: {
                 'extruder': heater, 'pa_adjust': pa,
-                'stepper_enable': self.stepper_enable}[name])
+                'stepper_enable': self.stepper_enable,
+                'gcode_move': self._gcode_move_away()}[name])
         self.board.printer.lookup_objects.return_value = drivers
         self.board.cmd_flow_strokes(GCmd())
         calls = [c[0] for c in order.mock_calls]
@@ -1780,7 +1798,8 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board.printer.lookup_object.side_effect = (
             lambda name, *args: {
                 'extruder': heater, 'pa_adjust': pa,
-                'stepper_enable': self.stepper_enable}[name])
+                'stepper_enable': self.stepper_enable,
+                'gcode_move': self._gcode_move_away()}[name])
         self.board.printer.lookup_objects.return_value = []
         self.board.cmd_flow_strokes(GCmd())
         calls = order.mock_calls
@@ -2236,6 +2255,144 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board._move = mock.Mock()
         self.board._offset_wizard_step(GCmd(), 'plate', '2')
         self.board._move.assert_not_called()
+
+
+class Creator5PausedPurgeTests(unittest.TestCase):
+    """While a print is paused nothing may move Z: the part is on the bed."""
+
+    setUp = Creator5OffsetTests.setUp
+
+    def _fixture(self, state, position=(276.5, 257., 1.4)):
+        board = self.board
+        stats = mock.Mock()
+        stats.get_status.return_value = {'state': state}
+        heater = mock.Mock()
+        heater.get_status.return_value = {'can_extrude': True}
+        gcode_move = mock.Mock()
+        gcode_move.get_status.return_value = {
+            'homing_origin': (0., 0., 1., 0.),
+            'gcode_position': list(position) + [0.]}
+        toolhead = mock.Mock()
+        toolhead.get_status.return_value = {'homed_axes': 'xyz'}
+        objects = {'print_stats': stats, 'extruder1': heater,
+                   'gcode_move': gcode_move, 'toolhead': toolhead}
+        board.printer.lookup_object.side_effect = (
+            lambda name, default=None: objects.get(name, default))
+        board._preflight = mock.Mock(return_value=([], [], 1))
+        board._with_motion = lambda gcmd, operation: operation()
+        board.cmd_verify_nozzle_z = mock.Mock()
+        board._raise_z = mock.Mock()
+        board._run = mock.Mock()
+        board.gcode = mock.Mock()
+        board.gcode.create_gcode_command = (
+            lambda cmd, raw, params: dict(params))
+        return board
+
+    def _moves(self):
+        return [c.args[0] for c in self.board._run.call_args_list
+                if c.args[0].startswith('G1')]
+
+    # Paused trips run at clear_travel_speed (600 mm/s), like tool changes,
+    # except the short hop into the purge spot
+    FAST_TO_BUCKET = ['G1 X250.0000 F36000', 'G1 Y250.0000 F36000',
+                      'G1 X276.5000 Y257.0000 F3000']
+    SLOW_TO_BUCKET = ['G1 X250.0000 F6000', 'G1 Y250.0000 F6000',
+                      'G1 X276.5000 Y257.0000 F3000']
+
+    def test_paused_purge_never_moves_z(self):
+        board = self._fixture('paused', position=(120., 80., 1.4))
+        board.cmd_purge(GCmd(LENGTH=20.))
+        moves = self._moves()
+        self.assertEqual(moves[:3], self.FAST_TO_BUCKET)
+        self.assertFalse([m for m in moves if 'Z' in m])
+        board._raise_z.assert_not_called()
+        # The paused print keeps its Z offset: no auto nozzle Z
+        board.cmd_verify_nozzle_z.assert_not_called()
+        self.assertIn('G1 E20.000 F180', moves)
+        self.assertEqual(moves[-1], 'G1 E-5 F1200')
+
+    def test_idle_purge_still_lifts_and_goes_to_purge_z(self):
+        for state in ('standby', 'printing'):
+            with self.subTest(state=state):
+                board = self._fixture(state, position=(120., 80., 1.4))
+                board.cmd_purge(GCmd(LENGTH=20.))
+                self.assertIn('G1 Z8.0000 F600', self._moves())
+                self.assertEqual(self._moves()[:3], self.SLOW_TO_BUCKET)
+                self.assertEqual(board._raise_z.call_count, 3)
+                board.cmd_verify_nozzle_z.assert_called_once()
+
+    def test_paused_move_to_purge_bucket_never_moves_z(self):
+        board = self._fixture('paused', position=(120., 80., 1.4))
+        board.cmd_move_to_purge_bucket(GCmd())
+        board._raise_z.assert_not_called()
+        self.assertEqual(self._moves(), self.FAST_TO_BUCKET)
+
+    def test_idle_move_to_purge_bucket_still_lifts(self):
+        board = self._fixture('standby', position=(120., 80., 1.4))
+        board.cmd_move_to_purge_bucket(GCmd())
+        self.assertEqual(board._raise_z.call_count, 2)
+        self.assertEqual(self._moves(), self.SLOW_TO_BUCKET)
+
+    def _xy_moves(self):
+        return [m for m in self._moves() if 'X' in m or 'Y' in m]
+
+    def test_paused_purge_at_the_purge_spot_skips_the_trip(self):
+        # RESUME after a parked pause: no jerk out to prep_approach and back
+        board = self._fixture('paused')
+        board.cmd_purge(GCmd(LENGTH=20.))
+        self.assertEqual(self._xy_moves(), [])
+        self.assertFalse([m for m in self._moves() if 'Z' in m])
+        board._raise_z.assert_not_called()
+        self.assertIn('G1 E20.000 F180', self._moves())
+        self.assertEqual(self._moves()[-1], 'G1 E-5 F1200')
+
+    def test_idle_purge_at_the_purge_spot_skips_the_trip(self):
+        # Heated at the purge spot (C5_MOVE_TO_PURGE_BUCKET), then purged
+        board = self._fixture('standby')
+        board.cmd_purge(GCmd(LENGTH=20.))
+        self.assertEqual(self._xy_moves(), [])
+        self.assertIn('G1 Z8.0000 F600', self._moves())
+        self.assertEqual(board._raise_z.call_count, 3)
+
+    def test_move_to_purge_bucket_at_the_purge_spot_stays(self):
+        for state in ('paused', 'standby'):
+            with self.subTest(state=state):
+                board = self._fixture(state)
+                board.cmd_move_to_purge_bucket(GCmd())
+                self.assertEqual(self._moves(), [])
+
+    def test_near_but_not_at_the_purge_spot_takes_the_full_path(self):
+        board = self._fixture('paused', position=(276., 257., 1.4))
+        board.cmd_purge(GCmd(LENGTH=20.))
+        self.assertEqual(self._moves()[:3], self.FAST_TO_BUCKET)
+
+    def test_leave_purge_bucket_goes_to_the_approach_point(self):
+        board = self._fixture('paused')
+        board.cmd_leave_purge_bucket(GCmd())
+        self.assertEqual(self._moves(), ['G1 X250.0000 Y250.0000 F36000'])
+        board._raise_z.assert_not_called()
+
+    def test_idle_leave_purge_bucket_stays_slow(self):
+        board = self._fixture('standby')
+        board.cmd_leave_purge_bucket(GCmd())
+        self.assertEqual(self._moves(), ['G1 X250.0000 Y250.0000 F6000'])
+
+    def test_leave_purge_bucket_refuses_beside_the_docks(self):
+        board = self._fixture('paused', position=(290., 100., 1.4))
+        with self.assertRaisesRegex(RuntimeError, 'beside the docks'):
+            board.cmd_leave_purge_bucket(GCmd())
+        board._run.assert_not_called()
+
+    def test_status_exposes_the_purge_spot_for_macros(self):
+        self.board.attached_tool_from_pins = lambda: 1
+        status = self.board.get_status()
+        self.assertEqual(
+            {k: status[k] for k in ('purge_x', 'purge_y', 'prep_approach_x',
+                                    'prep_approach_y', 'purge_retract',
+                                    'travel_speed')},
+            {'purge_x': 276.5, 'purge_y': 257., 'prep_approach_x': 250.,
+             'prep_approach_y': 250., 'purge_retract': 5.,
+             'travel_speed': 600.})
 
 
 if __name__ == '__main__':
