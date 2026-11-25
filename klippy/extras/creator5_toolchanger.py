@@ -32,6 +32,8 @@ HOLDER_REFERENCE_Y_PITCH = 50.
 SWITCH_POLL_MS = 50
 # Longest single extrude of a purge (max_extrude_only_distance is 500)
 PURGE_CHUNK_MM = 100.
+# Every purge ends with this retract; RESUME primes it back before printing
+PURGE_RETRACT_MM = 5.
 
 
 class Creator5MiscSwitch:
@@ -372,6 +374,7 @@ class Creator5Toolchanger:
             ('C5_RUNOUT_SWITCH', self.cmd_runout_switch),
             ('C5_TOOL_PURGE', self.cmd_purge),
             ('C5_MOVE_TO_PURGE_BUCKET', self.cmd_move_to_purge_bucket),
+            ('C5_LEAVE_PURGE_BUCKET', self.cmd_leave_purge_bucket),
             ('C5_CHECK_BUILD_PLATE', self.cmd_check_build_plate),
             ('C5_OFFSET_WIZARD', self.cmd_offset_wizard),
             ('C5_BED_SOAK', self.cmd_bed_soak),
@@ -1247,13 +1250,41 @@ class Creator5Toolchanger:
                        feed=self.offset_calibration_lift_speed * 60.)
             self._run('M400')
 
-    def _move_to_prep_bucket(self):
+    # The only two paths between the print area and the purge spot, both via
+    # prep_approach_x/y in G-code (tool offset) coordinates. fast: travel at
+    # clear_travel_speed, as tool changes do through the same area (pause).
+    # The short hop into the purge spot always stays slow.
+    def _move_to_prep_bucket(self, raise_z=True, fast=False):
         # Travel inboard before entering the rear-right preparation area.
-        self._raise_z()
-        self._move(x=self.prep_approach_x, feed=6000, machine=False)
-        self._move(y=self.prep_approach_y, feed=6000, machine=False)
+        if raise_z:
+            self._raise_z()
+        if self._at_purge_spot():
+            # Already parked there (paused, or heating before this purge):
+            # going out to prep_approach and back in is only a jerk.
+            return
+        travel = self.clear_travel_speed * 60. if fast else 6000
+        self._move(x=self.prep_approach_x, feed=travel, machine=False)
+        self._move(y=self.prep_approach_y, feed=travel, machine=False)
         self._move(x=self.purge_x, y=self.purge_y,
                    feed=3000, machine=False)
+
+    def _at_purge_spot(self):
+        # G-code position, the same coordinates the bucket moves use
+        pos = self.printer.lookup_object('gcode_move').get_status()[
+            'gcode_position']
+        return (abs(pos[0] - self.purge_x) < .01
+                and abs(pos[1] - self.purge_y) < .01)
+
+    def _leave_prep_bucket(self, fast=False):
+        self._move(x=self.prep_approach_x, y=self.prep_approach_y,
+                   feed=self.clear_travel_speed * 60. if fast else 6000,
+                   machine=False)
+
+    def _print_paused(self):
+        # Paused with a part on the bed: Z must stay where the print left it.
+        stats = self.printer.lookup_object('print_stats', None)
+        return stats is not None and stats.get_status(
+            self.printer.get_reactor().monotonic())['state'] == 'paused'
 
     def _validate_purge_envelope(self, error):
         if (not all(math.isfinite(value) for value in (
@@ -2498,18 +2529,37 @@ class Creator5Toolchanger:
         dock, grab, attached = self._preflight(gcmd)
         if attached is None:
             raise gcmd.error('No attached tool to move to the purge bucket')
+        # Paused: stay at the paused height, the bed must not move.
+        paused = self._print_paused()
+
         def move():
-            self._raise_z()
+            if not paused:
+                self._raise_z()
             self._run('G90')
-            self._move_to_prep_bucket()
+            self._move_to_prep_bucket(raise_z=not paused, fast=paused)
+        self._with_motion(gcmd, move)
+
+    def cmd_leave_purge_bucket(self, gcmd):
+        # From the purge spot to prep_approach_x/y, at the current Z.
+        self._preflight(gcmd, axes='xy')
+        pos = self.printer.lookup_object('gcode_move').get_status()[
+            'gcode_position']
+        if (pos[0] > self.prep_approach_x + .001
+                and pos[1] < self.prep_approach_y - .001):
+            raise gcmd.error('Toolhead is beside the docks at X%.1f Y%.1f, '
+                             'not at the purge spot' % (pos[0], pos[1]))
+
+        paused = self._print_paused()
+
+        def move():
+            self._run('G90')
+            self._leave_prep_bucket(fast=paused)
         self._with_motion(gcmd, move)
 
     def _verify_purge_z(self, gcmd):
         # A paused print keeps the offset it was printing with. C5_AUTO_NOZZLE_Z
         # here would count the difference as baby stepping once RESUME restores it.
-        stats = self.printer.lookup_object('print_stats', None)
-        if stats is None or stats.get_status(
-                self.printer.get_reactor().monotonic())['state'] != 'paused':
+        if not self._print_paused():
             self.cmd_verify_nozzle_z(gcmd)
             return
         origin = self.printer.lookup_object('gcode_move').get_status()[
@@ -2533,16 +2583,22 @@ class Creator5Toolchanger:
         if not heater.get_status(self.printer.get_reactor().monotonic()).get(
                 'can_extrude'):
             raise gcmd.error('T%d is not hot enough to purge' % attached)
+        # Paused with a part on the bed: no Z moves at all. Lifting to safe_z
+        # and then going to purge_z would raise the bed toward the nozzle.
+        move_z = not self._print_paused()
+
         def purge():
             # The carriage has one physical drive. These logical extruder
             # objects select the attached hotend's temperature/flow context.
             self._run('ACTIVATE_EXTRUDER EXTRUDER=%s' % extruder)
             self._run('SAVE_GCODE_STATE NAME=C5_PURGE_PREP')
-            self._raise_z()
+            if move_z:
+                self._raise_z()
             try:
                 self._run('G90')
-                self._move_to_prep_bucket()
-                self._move(z=self.purge_z, feed=600, machine=False)
+                self._move_to_prep_bucket(raise_z=move_z, fast=not move_z)
+                if move_z:
+                    self._move(z=self.purge_z, feed=600, machine=False)
                 self._run('M83')
                 # One extrude-only move may not exceed
                 # max_extrude_only_distance; queued back to back they run as one
@@ -2551,11 +2607,14 @@ class Creator5Toolchanger:
                     step = min(PURGE_CHUNK_MM, left)
                     self._run('G1 E%.3f F%.0f' % (step, speed * 60.))
                     left -= step
-                self._run('G1 E-5 F1200')
+                self._run('G1 E-%.0f F1200' % PURGE_RETRACT_MM)
                 self._run('M400')
+                # Still at the purge spot, retracted: anything that must run
+                # before the head leaves the spot (e.g. a wipe) goes here.
             finally:
                 try:
-                    self._raise_z()
+                    if move_z:
+                        self._raise_z()
                 finally:
                     self._run('RESTORE_GCODE_STATE NAME=C5_PURGE_PREP')
         gcmd.respond_info('T%d purging %.1f mm at X%.1f Y%.1f before cooldown'
@@ -2983,7 +3042,15 @@ class Creator5Toolchanger:
                 'busy': self.busy,
                 'build_plate_detected': self.build_plate_detected,
                 'dock_positions': [list(p) for p in self.docks],
-                'tool_measurements': [list(p) for p in self.measurements]}
+                'tool_measurements': [list(p) for p in self.measurements],
+                # Purge spot and its approach waypoint (G-code coordinates),
+                # so macros never hard-code them
+                'purge_x': self.purge_x, 'purge_y': self.purge_y,
+                'prep_approach_x': self.prep_approach_x,
+                'prep_approach_y': self.prep_approach_y,
+                'purge_retract': PURGE_RETRACT_MM,
+                # mm/s, for RESUME's return to the print
+                'travel_speed': self.clear_travel_speed}
 
 
 def load_config(config):

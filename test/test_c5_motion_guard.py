@@ -157,11 +157,11 @@ class MotionGuardTest(unittest.TestCase):
         self.motors['stepper_x'].answer(slips=1)
         g._poll(0.)
         g._poll(0.)
-        self.gcode.run_script.assert_called_once_with('PAUSE')
+        self.gcode.run_script.assert_called_once_with('PAUSE REASON=motion')
         self.motors['stepper_x'].answer(slips=1)
         g._poll(0.)
         g._poll(0.)
-        self.gcode.run_script.assert_called_once_with('PAUSE')
+        self.gcode.run_script.assert_called_once_with('PAUSE REASON=motion')
 
     def test_toolchange_windows_are_ignored(self):
         g = self.guard()

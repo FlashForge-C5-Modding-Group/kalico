@@ -136,6 +136,20 @@ def creator5_slot_list(key, *sources):
     return []
 
 
+def creator5_by_object(*sources):
+    """Orca's '; print_sequence = by object': one object at a time, so the
+    head must clear the finished objects when it leaves the print."""
+    for source in sources:
+        meta = None
+        for candidate in re.finditer(
+                r"^[ \t]*;[ \t]*print_sequence[ \t]*=[ \t]*([^\r\n]*)",
+                source, re.M):
+            meta = candidate
+        if meta:
+            return meta.group(1).strip().lower() == "by object"
+    return False
+
+
 def creator5_slicer_z_offset(line):
     command = line.lstrip()
     if not command:
@@ -182,6 +196,10 @@ class VirtualSD:
         self.creator5_start_done = False
         self.creator5_stop_done = False
         self.creator5_preloaded_definitions = set()
+        # Print by object: the highest G-code Z printed so far (the tallest
+        # finished object), for PAUSE to clear before the head travels
+        self.creator5_by_object = False
+        self.creator5_max_z = 0.
         # Print Stat Tracking
         self.print_stats = self.printer.load_object(config, "print_stats")
         # Work timer
@@ -276,6 +294,8 @@ class VirtualSD:
             "is_active": self.is_active(),
             "file_position": self.file_position,
             "file_size": self.file_size,
+            "print_by_object": self.creator5_by_object,
+            "print_max_z": self.creator5_max_z,
         }
 
     def file_path(self):
@@ -330,6 +350,8 @@ class VirtualSD:
         self.creator5_stop_done = False
         self.cancelled_work = False
         self.creator5_preloaded_definitions = set()
+        self.creator5_by_object = False
+        self.creator5_max_z = 0.
         self.print_stats.reset()
         self.printer.send_event("virtual_sdcard:reset_file")
 
@@ -404,6 +426,8 @@ class VirtualSD:
         self.creator5_stop_done = False
         self.cancelled_work = False
         self.creator5_preloaded_definitions = set()
+        self.creator5_by_object = False
+        self.creator5_max_z = 0.
         self.print_stats.set_current_file(filename)
         self.printer.send_event("virtual_sdcard:load_file")
 
@@ -489,6 +513,9 @@ class VirtualSD:
                 if not at_line_start:
                     footer = footer.partition("\n")[2]
                 self.current_file.seek(0)
+                # Every print, even one with its own C5_PRINT_START line
+                self.creator5_by_object = creator5_by_object(footer, header)
+                self.creator5_max_z = 0.
                 definitions = creator5_object_definitions(header)
                 if (definitions and self._run_worker_script(
                         "EXCLUDE_OBJECT_DEFINE RESET=1")):
@@ -516,6 +543,8 @@ class VirtualSD:
                 except:
                     logging.exception("virtual_sdcard on_error")
                 self.must_pause_work = True
+        gcode_move = (self.printer.lookup_object("gcode_move")
+                      if self.creator5_by_object else None)
         while not self.must_pause_work:
             # Include reads and EOF scripts in the dispatcher availability
             # check, so external cancellation can stop the worker first.
@@ -591,6 +620,14 @@ class VirtualSD:
                 else:
                     self.gcode.run_script(line)
                     stripped = line.lstrip()
+                    if (gcode_move is not None and stripped[:3].upper()
+                            in ("G0 ", "G1 ", "G2 ", "G3 ")):
+                        # Only the file's own moves: tool changes and the
+                        # purge bucket trips are macros, not G0-G3 lines
+                        z = (gcode_move.last_position[2]
+                             - gcode_move.base_position[2])
+                        if z > self.creator5_max_z:
+                            self.creator5_max_z = z
                     if (stripped[:1] in ("C", "c")
                             and re.match(r"^C5_PRINT_STOP(?:\s|$)",
                                          stripped.split(";", 1)[0], re.I)):

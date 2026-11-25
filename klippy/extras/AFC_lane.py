@@ -1236,7 +1236,8 @@ class AFCLane:
         else:
             self.logger.info("Infinite Spool: T%d ran out, switching to T%d" % (tool, to))
         try:
-            self.gcode.run_script("PAUSE\nC5_FILAMENT_RUNOUT TOOL=%d%s"
+            # REASON=runout: PAUSE leaves the move and heaters to C5_FILAMENT_RUNOUT
+            self.gcode.run_script("PAUSE REASON=runout\nC5_FILAMENT_RUNOUT TOOL=%d%s"
                                   % (tool, "" if to is None else " TO=%d" % to))
         except Exception as exc:
             self.afc.error.AFC_error("Creator 5 runout handling failed: %s" % (exc,))
