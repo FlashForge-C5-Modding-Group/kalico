@@ -7,6 +7,7 @@ import math
 import os
 import shutil
 import tempfile
+from .probe import ProbingContext
 from contextlib import contextmanager
 from datetime import datetime
 
@@ -1956,7 +1957,8 @@ class Creator5Toolchanger:
         lift_speed = probe.get_lift_speed(gcmd)
         self._raise_z()
         self._move(x=x, y=y, feed=self.plate_check_travel_speed * 60.)
-        probe.multi_probe_begin(always_restore_toolhead=True)
+        context = ProbingContext(always_restore_toolhead=True, gcmd=gcmd)
+        probe.multi_probe_begin(context)
         try:
             values = []
             for i in range(runs):
@@ -1975,7 +1977,7 @@ class Creator5Toolchanger:
                     lift_z = toolhead.get_position()[2] + sample_retract_dist
                     self._move(z=lift_z, feed=lift_speed * 60)
         finally:
-            probe.multi_probe_end()
+            probe.multi_probe_end(context)
             self._raise_z()
         if (len(values) != runs or not all(math.isfinite(z) for z in values)
                 or max(values) - min(values) >= .1):
