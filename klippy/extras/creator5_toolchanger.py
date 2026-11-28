@@ -272,6 +272,10 @@ class Creator5Toolchanger:
         # The bucket sweep must stop short of the usable X280 edge. This
         # limit applies only to purge/flow, not to the docks beyond X280.
         self.purge_max_x = config.getfloat('purge_max_x', 279., maxval=279.)
+        # Leave the bucket straight along -X this far (mm) before any other
+        # move: a diagonal straight from it can catch a docked toolhead.
+        self.purge_exit_x = config.getfloat('purge_exit_x', 5., minval=0.,
+                                            maxval=20.)
         self.cooldown_x = config.getfloat('cooldown_x', 266.5)
         self.cooldown_y = config.getfloat('cooldown_y', 13.8)
         self.cooldown_wipe_z = config.getfloat('cooldown_wipe_z', 1.8,
@@ -379,6 +383,7 @@ class Creator5Toolchanger:
             ('C5_RUNOUT_SWITCH', self.cmd_runout_switch),
             ('C5_TOOL_PURGE', self.cmd_purge),
             ('C5_MOVE_TO_PURGE_BUCKET', self.cmd_move_to_purge_bucket),
+            ('C5_LEAVE_PURGE_BUCKET', self.cmd_leave_purge_bucket),
             ('C5_CHECK_BUILD_PLATE', self.cmd_check_build_plate),
             ('C5_OFFSET_WIZARD', self.cmd_offset_wizard),
             ('C5_BED_SOAK', self.cmd_bed_soak),
@@ -1274,6 +1279,23 @@ class Creator5Toolchanger:
         self._move(x=self.purge_x, y=self.purge_y,
                    feed=feed or 3000, machine=False)
 
+    def _leave_bucket(self):
+        # Only from the bucket corner, outboard of both approach coordinates;
+        # anywhere else this does nothing.
+        toolhead = self.printer.lookup_object('toolhead')
+        x, y = toolhead.get_position()[:2]
+        if (self.purge_exit_x > 0. and x > self.prep_approach_x + .001
+                and y > self.prep_approach_y + .001):
+            self._move(x=x - self.purge_exit_x, feed=3000)
+
+    def cmd_leave_purge_bucket(self, gcmd):
+        # Runs mid-print after a notower purge: no door or sensor checks.
+        toolhead = self.printer.lookup_object('toolhead')
+        homed = toolhead.get_status(
+            self.printer.get_reactor().monotonic()).get('homed_axes', '')
+        if 'x' in homed and 'y' in homed:
+            self._leave_bucket()
+
     def _validate_purge_envelope(self, error):
         if (not all(math.isfinite(value) for value in (
                 self.purge_x, self.purge_y, self.flow_sweep_x,
@@ -1353,6 +1375,7 @@ class Creator5Toolchanger:
         clear_feed = self.clear_travel_speed * 60.
         if self.persist_babystep and self._printing():
             self._persist_babystep(gcmd, tool)
+        self._leave_bucket()
         # Do not clear nozzle Z while a tool is physically mounted.  A
         # previously selected tool may have been left at zero by a slicer.
         origin_z = self.printer.lookup_object('gcode_move').get_status()[
@@ -1992,6 +2015,7 @@ class Creator5Toolchanger:
 
     def _probe_fixture_z(self, gcmd, x, y, target=None):
         self._move(z=self.safe_z, feed=1200)
+        self._leave_bucket()
         self._move(x=x, y=y, feed=self.fixture_travel_speed * 60.)
         if target is None:
             target = self.z_probe_target
@@ -2948,6 +2972,7 @@ class Creator5Toolchanger:
         try:
             self._run('G90')
             self._raise_z()
+            self._leave_bucket()
             self._move(x=self.prep_approach_x,
                        y=self.prep_approach_y, feed=6000, machine=False)
             self._move(y=self.cooldown_y, feed=6000, machine=False)
