@@ -113,7 +113,28 @@ def creator5_start_command(header, footer=""):
                        and (index >= len(active) or active[index] > 0)] or [0.])
     if chamber > 0:
         command += " CHAMBER=%g" % chamber
+    # notower: a 'poop=<grams>' line asks for a bucket purge after every tool
+    # change; grams become a length with each used filament's density
+    poop = creator5_poop(header, footer)
+    if poop is not None:
+        density = creator5_slot_list(r"filament_density", footer, material_header)
+        for index in tools or [tool]:
+            if index < len(density) and density[index] > 0:
+                command += " DENSITY%d=%g" % (index, density[index])
+        command += " POOP=%g" % poop
     return command
+
+
+def creator5_poop(*sources):
+    """Grams from the first 'poop=<grams>' line (';' optional), 2 without a
+    number; None without the line or for 0."""
+    for source in sources:
+        match = re.search(r"^[ \t]*;?[ \t]*poop[ \t]*=[ \t]*([0-9]*\.?[0-9]+)?[ \t]*$",
+                          source, re.I | re.M)
+        if match:
+            grams = float(match.group(1)) if match.group(1) else 2.
+            return grams if grams > 0 else None
+    return None
 
 
 def creator5_slot_list(key, *sources):

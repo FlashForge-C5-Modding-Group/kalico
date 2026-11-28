@@ -1247,13 +1247,13 @@ class Creator5Toolchanger:
                        feed=self.offset_calibration_lift_speed * 60.)
             self._run('M400')
 
-    def _move_to_prep_bucket(self):
+    def _move_to_prep_bucket(self, feed=None):
         # Travel inboard before entering the rear-right preparation area.
         self._raise_z()
-        self._move(x=self.prep_approach_x, feed=6000, machine=False)
-        self._move(y=self.prep_approach_y, feed=6000, machine=False)
+        self._move(x=self.prep_approach_x, feed=feed or 6000, machine=False)
+        self._move(y=self.prep_approach_y, feed=feed or 6000, machine=False)
         self._move(x=self.purge_x, y=self.purge_y,
-                   feed=3000, machine=False)
+                   feed=feed or 3000, machine=False)
 
     def _validate_purge_envelope(self, error):
         if (not all(math.isfinite(value) for value in (
@@ -1504,7 +1504,7 @@ class Creator5Toolchanger:
             self._move(x=self.approach_x,
                        feed=self.pickup_departure_speed * 60.)
 
-    def _with_motion(self, gcmd, operation, final_accel=None):
+    def _with_motion(self, gcmd, operation, final_accel=None, accel=None):
         toolhead = self.printer.lookup_object('toolhead')
         old_accel = toolhead.get_max_velocity()[1]
         old_mcr = toolhead.get_status(
@@ -1516,7 +1516,7 @@ class Creator5Toolchanger:
         completed = False
         try:
             self._run('G90')
-            self._run('SET_VELOCITY_LIMIT ACCEL=%.0f' % self.pickup_accel)
+            self._run('SET_VELOCITY_LIMIT ACCEL=%.0f' % (accel or self.pickup_accel))
             if self.pickup_minimum_cruise_ratio is not None and old_mcr is not None:
                 self._run('SET_VELOCITY_LIMIT MINIMUM_CRUISE_RATIO=%.3f'
                           % self.pickup_minimum_cruise_ratio)
@@ -2498,11 +2498,14 @@ class Creator5Toolchanger:
         dock, grab, attached = self._preflight(gcmd)
         if attached is None:
             raise gcmd.error('No attached tool to move to the purge bucket')
+        # SPEED (mm/s) and ACCEL: notower's faster trip during a print
+        speed = gcmd.get_float('SPEED', None, above=0.)
+        accel = gcmd.get_float('ACCEL', None, above=0.)
         def move():
             self._raise_z()
             self._run('G90')
-            self._move_to_prep_bucket()
-        self._with_motion(gcmd, move)
+            self._move_to_prep_bucket(speed * 60. if speed else None)
+        self._with_motion(gcmd, move, accel=accel)
 
     def _verify_purge_z(self, gcmd):
         # A paused print keeps the offset it was printing with. C5_AUTO_NOZZLE_Z
