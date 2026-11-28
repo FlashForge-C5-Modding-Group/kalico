@@ -54,8 +54,7 @@ def creator5_start_command(header, footer=""):
     material_header = header
     if len(header) >= 65536 and not header.endswith(("\n", "\r")):
         material_header = header.rpartition("\n")[0]
-    used = creator5_slot_list(r"filament used \[mm\]", footer, material_header)
-    tools = [index for index, value in enumerate(used[:4]) if value > 0]
+    tools, slots = creator5_tool_slots(footer, material_header)
     if not tool_seen and tools:
         tool = tools[0]
     # Orca's per-filament first-layer nozzle temperatures
@@ -63,9 +62,9 @@ def creator5_start_command(header, footer=""):
                                footer, material_header)
     if hotend is None:
         hotend = preheat
-    if hotend is None and tool < len(temps) and temps[tool] > 0:
+    if hotend is None and creator5_tool_value(temps, slots, tool) > 0:
         # Single-tool Orca jobs can heat inside the start G-code only
-        hotend = temps[tool]
+        hotend = creator5_tool_value(temps, slots, tool)
     if hotend is None:
         raise ValueError("No hotend temperature found in G-code header; "
                          "add C5_PRINT_START TOOL=n HOTEND=n BED=n")
@@ -77,15 +76,16 @@ def creator5_start_command(header, footer=""):
                 source, re.M):
             meta = candidate
         if meta:
-            materials = meta.group(1).split(";", 4)
+            materials = meta.group(1).split(";")
             break
     command = "C5_PRINT_START TOOL=%d HOTEND=%g BED=%g" % (tool, hotend, bed or 0.)
     if first_layer is not None:
         command += " FIRST_LAYER_HEIGHT=%g" % first_layer
     for index in range(4):
         material = "UNKNOWN"
-        if index < len(materials):
-            value = materials[index].strip()
+        slot = slots.get(index)
+        if slot is not None and slot < len(materials):
+            value = materials[slot].strip()
             if (len(value) >= 2 and value[0] in "\"'"
                     and value[-1] == value[0]):
                 value = value[1:-1].strip()
@@ -96,21 +96,25 @@ def creator5_start_command(header, footer=""):
         command += " USED_TOOLS=%s" % ",".join(map(str, tools))
     # The other tools' own first-layer temperatures, for their purge lines
     for index in tools:
-        if index != tool and index < len(temps) and temps[index] > 0:
-            command += " HOTEND%d=%g" % (index, temps[index])
+        if index != tool and creator5_tool_value(temps, slots, index) > 0:
+            command += " HOTEND%d=%g" % (
+                index, creator5_tool_value(temps, slots, index))
     idle = creator5_slot_list(r"idle_temperature", footer, material_header)
-    for index, value in enumerate(idle[:4]):
-        if value > 0:
-            command += " IDLE%d=%g" % (index, value)
+    for index in range(4):
+        if creator5_tool_value(idle, slots, index) > 0:
+            command += " IDLE%d=%g" % (
+                index, creator5_tool_value(idle, slots, index))
     if chamber is None:
         # Orca's per-filament chamber temperature, for the slots this print
         # uses that have chamber control on
         temps = creator5_slot_list(r"chamber_temperature", footer, material_header)
         active = creator5_slot_list(r"activate_chamber_temp_control",
                                     footer, material_header)
-        chamber = max([temps[index] for index in (tools or [tool])
-                       if index < len(temps)
-                       and (index >= len(active) or active[index] > 0)] or [0.])
+        chamber = max([temps[slots[index]] for index in (tools or [tool])
+                       if slots.get(index) is not None
+                       and slots[index] < len(temps)
+                       and (slots[index] >= len(active)
+                            or active[slots[index]] > 0)] or [0.])
     if chamber > 0:
         command += " CHAMBER=%g" % chamber
     # notower: a 'poop=<grams>' line asks for a bucket purge after every tool
@@ -119,8 +123,9 @@ def creator5_start_command(header, footer=""):
     if poop is not None:
         density = creator5_slot_list(r"filament_density", footer, material_header)
         for index in tools or [tool]:
-            if index < len(density) and density[index] > 0:
-                command += " DENSITY%d=%g" % (index, density[index])
+            if creator5_tool_value(density, slots, index) > 0:
+                command += " DENSITY%d=%g" % (
+                    index, creator5_tool_value(density, slots, index))
         command += " POOP=%g" % poop
     return command
 
@@ -155,6 +160,35 @@ def creator5_slot_list(key, *sources):
                     values.append(0.)
             return values
     return []
+
+
+def creator5_tool_slots(*sources):
+    """The tools a print uses, and the filament slot each tool prints. Orca's
+    filament_nozzle_map gives each slot's tool (0-based); filament_map
+    (1-based) when it's missing, since that one can be all 1s for the
+    Creator 5. Without either, slot n is tool n."""
+    used = creator5_slot_list(r"filament used \[mm\]", *sources)
+    mapping = ([v + 1 for v in creator5_slot_list(r"filament_nozzle_map",
+                                                  *sources)]
+               or creator5_slot_list(r"filament_map", *sources))
+    if not mapping:
+        return ([i for i, v in enumerate(used[:4]) if v > 0],
+                {i: i for i in range(4)})
+    tool_of = [int(v) - 1 for v in mapping]
+    order = [i for i, v in enumerate(used) if v > 0]
+    slots = {}
+    for slot in order + list(range(len(tool_of))):
+        if slot < len(tool_of) and 0 <= tool_of[slot] < 4:
+            slots.setdefault(tool_of[slot], slot)
+    tools = sorted({tool_of[s] for s in order
+                    if s < len(tool_of) and 0 <= tool_of[s] < 4})
+    return tools, slots
+
+
+def creator5_tool_value(values, slots, tool):
+    """A per-filament number for the slot the tool prints, 0 without one."""
+    slot = slots.get(tool)
+    return values[slot] if slot is not None and slot < len(values) else 0.
 
 
 def creator5_slicer_z_offset(line):
