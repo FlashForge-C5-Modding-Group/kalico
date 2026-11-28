@@ -2210,6 +2210,25 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board._offset_wizard_step(GCmd(), 'plate', '2')
         self.board._move.assert_not_called()
 
+    def test_purge_bucket_trip_takes_speed_and_accel(self):
+        self.board.prep_approach_x = self.board.prep_approach_y = 250.
+        self.board.purge_x, self.board.purge_y = 276.5, 257.
+        self.board._preflight = lambda command: ([], [], 1)
+        self.board._raise_z = mock.Mock()
+        self.board._run = mock.Mock()
+        for params, feeds, accel in (
+                ({}, [6000, 6000, 3000], None),
+                ({'SPEED': 300., 'ACCEL': 20000.}, [18000.] * 3, 20000.)):
+            with self.subTest(params=params):
+                self.board._move = mock.Mock()
+                motion = mock.Mock(
+                    side_effect=lambda command, operation, **kw: operation())
+                self.board._with_motion = motion
+                self.board.cmd_move_to_purge_bucket(GCmd(**params))
+                self.assertEqual([c.kwargs['feed'] for c in
+                                  self.board._move.call_args_list], feeds)
+                self.assertEqual(motion.call_args.kwargs['accel'], accel)
+
 
 if __name__ == '__main__':
     unittest.main()

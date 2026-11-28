@@ -661,6 +661,25 @@ class VirtualSDEOFTests(unittest.TestCase):
         self.assertTrue(command.startswith(
             'C5_PRINT_START TOOL=0 HOTEND=215 BED=60 '))
 
+    def test_poop_line_passes_grams_and_used_densities(self):
+        text = ('; poop=1.5\nM109 S220\nT0\nG1 X10\n'
+                '; filament used [mm] = 3745.08, 0.00, 0.00, 650.04\n'
+                '; filament_density = 1.24,1.27,1.04,1.38\n')
+        self.assertEqual(
+            MODULE.creator5_start_command(text, ''),
+            'C5_PRINT_START TOOL=0 HOTEND=220 BED=0 '
+            'MATERIAL0=UNKNOWN MATERIAL1=UNKNOWN '
+            'MATERIAL2=UNKNOWN MATERIAL3=UNKNOWN '
+            'USED_TOOLS=0,3 DENSITY0=1.24 DENSITY3=1.38 POOP=1.5')
+
+    def test_poop_without_grams_is_two_and_zero_is_off(self):
+        bare = MODULE.creator5_start_command('POOP=\nM109 S220\n', '')
+        self.assertTrue(bare.endswith(' POOP=2'))
+        off = MODULE.creator5_start_command('poop=0\nM109 S220\n', '')
+        self.assertNotIn('POOP', off)
+        self.assertNotIn('POOP',
+                         MODULE.creator5_start_command('M109 S220\n', ''))
+
 
 if __name__ == '__main__':
     unittest.main()
