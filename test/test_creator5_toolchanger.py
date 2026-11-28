@@ -4,6 +4,8 @@ import os
 import tempfile
 import sys
 import types
+import threading
+import time
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -74,6 +76,8 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board.toolchange_count_writer = MODULE.LatestFileWriter(
             self.board.toolchange_count_path, 'test_toolchanges')
         self.addCleanup(self.board.toolchange_count_writer.close)
+        self.addCleanup(lambda: self.board._zoffset_writer
+                        and self.board._zoffset_writer.close())
         self.board.toolchange_counts = [0] * 4
         self.board.measurements = [[15., 215., 1.] for _ in range(4)]
         self.board.docks = [[298., 50. + i * 50.] for i in range(4)]
@@ -1116,7 +1120,7 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board.printer.lookup_object.return_value.get_status.return_value = {
             'homing_origin': (0., 0., 2.45, 0.)}
         self.board.cmd_save_touchscreen_z_offset(GCmd())
-        data, suffix = self.board._read_stock_json(zpath)
+        data, suffix = self._saved(zpath)
         self.assertAlmostEqual(data['z_offset_t2'], 0.25)
         self.assertEqual(suffix, '/* stock comment */')
         self.assertAlmostEqual(self.board.z_adjustments[1], 0.25)
@@ -1139,6 +1143,11 @@ class Creator5OffsetTests(unittest.TestCase):
             'SET_GCODE_OFFSET Z=2.8500 MOVE=1 MOVE_SPEED=100')
         self.assertAlmostEqual(self.board.print_z_baseline[1], 2.8)
 
+    def _saved(self, zpath):
+        """zoffset.json once the background writer has written it."""
+        self.board._zoffset_file_writer().flush()
+        return self.board._read_stock_json(zpath)
+
     def _babystep_fixture(self, origin_after):
         zpath = os.path.join(self.temp.name, 'zoffset.json')
         with open(zpath, 'w') as target:
@@ -1159,7 +1168,7 @@ class Creator5OffsetTests(unittest.TestCase):
     def test_babystep_is_kept_for_later_prints(self):
         zpath = self._babystep_fixture(2.80)          # baby stepped -0.05
         self.board.cmd_save_babystep(GCmd())
-        data, suffix = self.board._read_stock_json(zpath)
+        data, suffix = self._saved(zpath)
         self.assertAlmostEqual(data['z_offset_t2'], 0.0)
         self.assertAlmostEqual(self.board.z_adjustments[1], 0.0)
         self.assertEqual(suffix, '/* stock comment */')
@@ -1176,7 +1185,7 @@ class Creator5OffsetTests(unittest.TestCase):
         gcmd = GCmd(Z_ADJUST=-0.02)
         self.board.cmd_set_gcode_offset(gcmd)
         self.board.prev_set_gcode_offset.assert_called_once_with(gcmd)
-        data, _ = self.board._read_stock_json(zpath)
+        data, _ = self._saved(zpath)
         self.assertAlmostEqual(data['z_offset_t2'], 0.03)
         self.assertEqual(list(Path(self.temp.name).glob(
             'zoffset.json.bak-*')), [])
@@ -1184,7 +1193,7 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board.printer.lookup_object.return_value.get_status.return_value = {
             'homing_origin': (0., 0., 2.9, 0.)}
         self.board.cmd_set_gcode_offset(GCmd(Z=2.9))
-        data, _ = self.board._read_stock_json(zpath)
+        data, _ = self._saved(zpath)
         self.assertAlmostEqual(data['z_offset_t2'], 0.03)
 
     def test_babystep_saved_after_a_restart_with_the_tool_on(self):
@@ -1196,7 +1205,7 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board.attached_tool_from_pins = lambda: 1
         self.board.prev_set_gcode_offset = mock.Mock()
         self.board.cmd_set_gcode_offset(GCmd(Z_ADJUST=-0.02))
-        data, _ = self.board._read_stock_json(zpath)
+        data, _ = self._saved(zpath)
         self.assertAlmostEqual(data['z_offset_t2'], 0.03)
 
     def test_babystep_is_not_counted_again_at_dock_or_save(self):
@@ -1206,7 +1215,7 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board.prev_set_gcode_offset = mock.Mock()
         self.board.cmd_set_gcode_offset(GCmd(Z_ADJUST=-0.02))
         self.board.cmd_save_babystep(GCmd())
-        data, _ = self.board._read_stock_json(zpath)
+        data, _ = self._saved(zpath)
         self.assertAlmostEqual(data['z_offset_t2'], 0.03)
 
     def test_babystep_keeps_a_value_written_by_something_else(self):
@@ -1218,7 +1227,7 @@ class Creator5OffsetTests(unittest.TestCase):
         with open(zpath, 'w') as target:
             target.write('{"z_offset_t2": 0.10}\n/* stock comment */\n')
         self.board.cmd_set_gcode_offset(GCmd(Z_ADJUST=-0.02))
-        data, _ = self.board._read_stock_json(zpath)
+        data, _ = self._saved(zpath)
         self.assertAlmostEqual(data['z_offset_t2'], 0.08)
 
     def test_pickup_applies_what_zoffset_json_says_now(self):
@@ -1252,13 +1261,13 @@ class Creator5OffsetTests(unittest.TestCase):
         # T1 attached: only T1's value (z_offset_t2) changes
         self.board.attached_tool_from_pins = lambda: 1
         self.board.cmd_set_gcode_offset(GCmd(Z_ADJUST=-0.02))
-        data, _ = self.board._read_stock_json(zpath)
+        data, _ = self._saved(zpath)
         self.assertEqual([round(data['z_offset_t%d' % n], 4) for n in range(1, 5)],
                          [0.01, 0.03, -0.02, 0.04])
         # then T3 attached: only T3's value (z_offset_t4) changes
         self.board.attached_tool_from_pins = lambda: 3
         self.board.cmd_set_gcode_offset(GCmd(Z_ADJUST=0.01))
-        data, _ = self.board._read_stock_json(zpath)
+        data, _ = self._saved(zpath)
         self.assertEqual([round(data['z_offset_t%d' % n], 4) for n in range(1, 5)],
                          [0.01, 0.03, -0.02, 0.05])
         # and each pickup applies its own nozzle's value
@@ -1279,7 +1288,7 @@ class Creator5OffsetTests(unittest.TestCase):
         self.assertIn('T1: +0.0500 mm', gcmd.messages[0])
         self.board._run.reset_mock()
         self.board.cmd_clear_babystep(GCmd(T='1'))
-        data, _ = self.board._read_stock_json(zpath)
+        data, _ = self._saved(zpath)
         self.assertAlmostEqual(data['z_offset_t2'], 0.)
         self.board._run.assert_called_once_with(
             'SET_GCODE_OFFSET Z=2.8000 MOVE=0')
@@ -1292,7 +1301,7 @@ class Creator5OffsetTests(unittest.TestCase):
         zpath = self._babystep_fixture(1.2)           # -1.65 mm
         gcmd = GCmd()
         self.board.cmd_save_babystep(gcmd)
-        data, _ = self.board._read_stock_json(zpath)
+        data, _ = self._saved(zpath)
         self.assertAlmostEqual(data['z_offset_t2'], 0.05)
         self.assertIn('not saved', gcmd.messages[0])
 
@@ -1300,10 +1309,10 @@ class Creator5OffsetTests(unittest.TestCase):
         zpath = self._babystep_fixture(2.90)
         self.board.persist_babystep = False
         self.board.cmd_save_babystep(GCmd())
-        data, _ = self.board._read_stock_json(zpath)
+        data, _ = self._saved(zpath)
         self.assertAlmostEqual(data['z_offset_t2'], 0.05)
         self.board.cmd_save_babystep(GCmd(FORCE=1))
-        data, _ = self.board._read_stock_json(zpath)
+        data, _ = self._saved(zpath)
         self.assertAlmostEqual(data['z_offset_t2'], 0.10)
 
     def test_factory_print_temperature_bed_and_layer_z_compensation(self):
@@ -2255,6 +2264,28 @@ class Creator5OffsetTests(unittest.TestCase):
                 self.assertEqual([c.kwargs['feed'] for c in
                                   self.board._move.call_args_list], feeds)
                 self.assertEqual(motion.call_args.kwargs['accel'], accel)
+
+    def test_babystep_save_does_not_wait_for_a_slow_disk(self):
+        # A Z_ADJUST in a tool change must not block on fsync, and a second
+        # one must build on the first while that is still being written
+        zpath = self._babystep_fixture(2.83)
+        self.board.busy = False
+        self.board.attached_tool_from_pins = lambda: 1
+        self.board.prev_set_gcode_offset = mock.Mock()
+        release = threading.Event()
+        real_fsync = os.fsync
+        def slow_fsync(fd):
+            release.wait(5.)
+            real_fsync(fd)
+        with mock.patch.object(os, 'fsync', slow_fsync):
+            start = time.monotonic()
+            self.board.cmd_set_gcode_offset(GCmd(Z_ADJUST=-0.07))
+            self.board.cmd_set_gcode_offset(GCmd(Z_ADJUST=0.01))
+            self.assertLess(time.monotonic() - start, 1.)
+            self.assertAlmostEqual(self.board.z_adjustments[1], -0.01)
+            release.set()
+            data, _ = self._saved(zpath)
+        self.assertAlmostEqual(data['z_offset_t2'], -0.01)
 
 
 if __name__ == '__main__':

@@ -46,3 +46,46 @@ def test_failed_write_does_not_stop_later_writes(tmp_path, monkeypatch):
     writer.close()
     assert target.read_text() == "second"
     assert os.listdir(tmp_path) == ["state.txt"]  # failed temp file removed
+
+
+def test_pending_is_the_newest_text_until_it_is_on_disk(tmp_path, monkeypatch):
+    path = tmp_path / "state.txt"
+    path.write_text("old")
+    release = threading.Event()
+    real_fsync = os.fsync
+
+    def slow_fsync(fd):
+        release.wait(5.)
+        real_fsync(fd)
+
+    monkeypatch.setattr(lfw.os, "fsync", slow_fsync)
+    writer = lfw.LatestFileWriter(str(path), "test_pending")
+    assert writer.pending() is None
+    writer.submit("first")
+    writer.submit("second")
+    assert writer.pending() == "second"  # the file still says "old"
+    release.set()
+    writer.close()
+    assert path.read_text() == "second"
+    assert writer.pending() is None
+
+
+def test_backup_of_a_superseded_text_is_still_written(tmp_path, monkeypatch):
+    path = tmp_path / "state.txt"
+    release = threading.Event()
+    real_fsync = os.fsync
+
+    def slow_fsync(fd):
+        release.wait(5.)
+        real_fsync(fd)
+
+    monkeypatch.setattr(lfw.os, "fsync", slow_fsync)
+    writer = lfw.LatestFileWriter(str(path), "test_backup")
+    writer.submit("busy")  # holds the writer thread in fsync
+    writer.submit("first", backup=(str(tmp_path / "a.bak"), "before first"))
+    writer.submit("second", backup=(str(tmp_path / "b.bak"), "before second"))
+    release.set()
+    writer.close()
+    assert path.read_text() == "second"
+    assert (tmp_path / "a.bak").read_text() == "before first"
+    assert (tmp_path / "b.bak").read_text() == "before second"
