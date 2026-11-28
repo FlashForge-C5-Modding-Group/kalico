@@ -87,6 +87,7 @@ class Creator5Toolchanger:
     # Overridden from the config in __init__ (persist_babystep defaults on)
     persist_babystep = False
     _applied_z = None
+    _zoffset_writer = None
     # (label, host time) at each point a toolchange waits on motion
     _tc_marks = None
     # The toolhead start delay to put back once AFC's return move after a
@@ -131,6 +132,12 @@ class Creator5Toolchanger:
             self.toolchange_count_path, 'c5_toolchanges')
         self.printer.register_event_handler(
             'klippy:disconnect', self.toolchange_count_writer.close)
+        # zoffset.json is written in the background: an fsync on the eMMC
+        # can block for seconds, too long during a print
+        self._zoffset_writer = LatestFileWriter(self.zoffset_json_path,
+                                                'c5_zoffset')
+        self.printer.register_event_handler(
+            'klippy:disconnect', self._zoffset_writer.close)
         self.print_z_baseline = [None] * 4
         self.print_z_corrections = [None] * 4
         self._button_objects = {}
@@ -554,7 +561,9 @@ class Creator5Toolchanger:
 
     def _read_stock_json(self, path):
         with open(path, 'r') as source:
-            raw = source.read()
+            return self._parse_stock_json(source.read(), path)
+
+    def _parse_stock_json(self, raw, path):
         data, end = json.JSONDecoder().raw_decode(raw.lstrip())
         if not isinstance(data, dict):
             raise ValueError('%s must contain a JSON object' % path)
@@ -562,6 +571,27 @@ class Creator5Toolchanger:
         if suffix and not (suffix.startswith('/*') and suffix.endswith('*/')):
             raise ValueError('%s has unexpected trailing content' % path)
         return data, suffix
+
+    def _zoffset_file_writer(self):
+        # One background writer per path; tests change the path
+        writer = self._zoffset_writer
+        if writer is None or writer.path != self.zoffset_json_path:
+            if writer is not None:
+                writer.close()
+            writer = self._zoffset_writer = LatestFileWriter(
+                self.zoffset_json_path, 'c5_zoffset')
+        return writer
+
+    def _read_zoffset_text(self):
+        """zoffset.json as the next read of the file will show it: a save
+        still being written counts, the file may hold the older text."""
+        writer = self._zoffset_writer
+        if writer is not None and writer.path == self.zoffset_json_path:
+            text = writer.pending()
+            if text is not None:
+                return text
+        with open(self.zoffset_json_path, 'r') as source:
+            return source.read()
 
     def _load_extruder_json(self):
         if not os.path.isfile(self.extruder_json_path):
@@ -602,7 +632,8 @@ class Creator5Toolchanger:
             self.z_adjustments = adjustments
             return
         try:
-            data, suffix = self._read_stock_json(self.zoffset_json_path)
+            data, suffix = self._parse_stock_json(self._read_zoffset_text(),
+                                                  self.zoffset_json_path)
             for tool in range(4):
                 key = 'z_offset_t%d' % (tool + 1)
                 value = float(data.get(key, 0.))
@@ -641,33 +672,21 @@ class Creator5Toolchanger:
         if not os.path.isfile(self.zoffset_json_path):
             raise gcmd.error('Missing stock %s; refusing to create it'
                              % self.zoffset_json_path)
-        temp_path = None
         try:
-            data, suffix = self._read_stock_json(self.zoffset_json_path)
+            raw = self._read_zoffset_text()
+            data, suffix = self._parse_stock_json(raw, self.zoffset_json_path)
             data['z_offset_t%d' % (tool + 1)] = round(adjustment, 4)
-            directory = os.path.dirname(self.zoffset_json_path)
-            if backup:
-                shutil.copy2(self.zoffset_json_path,
-                             self.zoffset_json_path + '.bak-' + (
-                                 datetime.now().strftime(
-                                     '%Y%m%d-%H%M%S-%f')))
-            fd, temp_path = tempfile.mkstemp(prefix='.zoffset-',
-                                             suffix='.tmp', dir=directory)
-            os.chmod(temp_path, os.stat(self.zoffset_json_path).st_mode)
-            with os.fdopen(fd, 'w') as target:
-                json.dump(data, target, indent=3, sort_keys=True)
-                target.write('\n')
-                if suffix:
-                    target.write(suffix + '\n')
-                target.flush()
-                os.fsync(target.fileno())
-            os.replace(temp_path, self.zoffset_json_path)
-            temp_path = None
+            text = json.dumps(data, indent=3, sort_keys=True) + '\n'
+            if suffix:
+                text += suffix + '\n'
         except (OSError, ValueError, TypeError) as exc:
             raise gcmd.error('Could not save touchscreen Z offset: %s' % exc)
-        finally:
-            if temp_path is not None and os.path.exists(temp_path):
-                os.unlink(temp_path)
+        backup_item = None
+        if backup:
+            backup_item = (self.zoffset_json_path + '.bak-' + datetime.now()
+                           .strftime('%Y%m%d-%H%M%S-%f'), raw)
+        # Written off the reactor; a failed write is logged by the writer
+        self._zoffset_file_writer().submit(text, backup=backup_item)
         self.z_adjustments[tool] = adjustment
 
     def _printing(self):

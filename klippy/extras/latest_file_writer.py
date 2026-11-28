@@ -23,20 +23,30 @@ class LatestFileWriter:
         self._lock = threading.Lock()  # guards _pending, _seq, _closed
         self._file_lock = threading.Lock()  # serializes writes to path
         self._wanted = threading.Event()
-        self._pending = None  # (seq, text) not yet written
+        self._pending = None  # (seq, text, backups) not yet written
+        self._latest = None  # newest submitted text
         self._seq = 0
         self._written_seq = 0
+        self._done_seq = 0  # newest seq that reached the disk
         self._closed = False
         self._thread = threading.Thread(
             target=self._run, name=name, daemon=True
         )
         self._thread.start()
 
-    def submit(self, text):
-        """Queue text without blocking; a newer submit supersedes it."""
+    def submit(self, text, backup=None):
+        """Queue text without blocking; a newer submit supersedes it.
+
+        backup, a (path, text) pair, is written before the file. Backups of
+        superseded texts are still written.
+        """
         with self._lock:
             self._seq += 1
-            item = (self._seq, text)
+            backups = list(self._pending[2]) if self._pending else []
+            if backup is not None:
+                backups.append(backup)
+            item = (self._seq, text, backups)
+            self._latest = text
             if not self._closed:
                 self._pending = item
         if self._closed:
@@ -44,6 +54,14 @@ class LatestFileWriter:
             self._write(*item)
             return
         self._wanted.set()
+
+    def pending(self):
+        """The newest submitted text while it isn't on disk yet, else None.
+
+        Read it instead of the file, which may still hold an older text.
+        """
+        with self._lock:
+            return self._latest if self._seq > self._done_seq else None
 
     def flush(self):
         """Synchronously write any pending text (blocks the caller)."""
@@ -72,8 +90,14 @@ class LatestFileWriter:
             if closed:
                 return
 
-    def _write(self, seq, text):
+    def _write(self, seq, text, backups=()):
         with self._file_lock:
+            for path, backup_text in backups:
+                try:
+                    with open(path, "w") as f:
+                        f.write(backup_text)
+                except Exception:
+                    logging.exception("Could not write %s", path)
             if seq <= self._written_seq:
                 return  # a newer text was already written
             self._written_seq = seq
@@ -85,6 +109,8 @@ class LatestFileWriter:
                     f.flush()
                     os.fsync(f.fileno())
                 os.replace(tmp_path, self.path)
+                with self._lock:
+                    self._done_seq = max(self._done_seq, seq)
             except Exception:  # a dead writer thread would lose saves
                 logging.exception("Could not write %s", self.path)
                 try:
