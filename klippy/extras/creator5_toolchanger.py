@@ -110,6 +110,36 @@ class Creator5Toolchanger:
             'zoffset_json_path', '/usr/data/firmwareRes/config/zoffset.json'))
         self.test_json_path = os.path.expanduser(config.get(
             'test_json_path', '/usr/data/firmwareRes/config/test.json'))
+        # Per-tool nozzle growth with temperature (C5_CALIBRATE_TEMP_OFFSETS),
+        # beside extruder.json. A tool without all three points measured uses
+        # test.json's tempOffset, as stock does.
+        self.temp_offset_json_path = os.path.expanduser(config.get(
+            'temp_offset_json_path', os.path.join(
+                os.path.dirname(self.extruder_json_path), 'temp_offset.json')))
+        self.temp_offsets = self._load_temp_offsets()
+        # PLA, PETG and ABS/ASA measuring temperatures
+        self.temp_offset_temps = config.getfloatlist(
+            'temp_offset_temps', (215., 245., 275.), count=3)
+        if not (170. <= self.temp_offset_temps[0] < self.temp_offset_temps[1]
+                < self.temp_offset_temps[2] <= 320.):
+            raise config.error('temp_offset_temps must rise within 170..320')
+        self.temp_offset_bed = config.getfloat('temp_offset_bed', 60.,
+                                               minval=0., maxval=120.)
+        # The cold reading is taken once the nozzle is at or below this
+        self.temp_offset_reference_temp = config.getfloat(
+            'temp_offset_reference_temp', 50., minval=20., maxval=100.)
+        self.temp_offset_soak = config.getfloat('temp_offset_soak', 60.,
+                                                minval=0., maxval=600.)
+        self.temp_offset_retract = config.getfloat(
+            'temp_offset_retract', 200., above=0., maxval=500.)
+        # Retract speed as volumetric flow, mm^3/s
+        self.temp_offset_retract_flow = config.getfloat(
+            'temp_offset_retract_flow', 10., above=0., maxval=30.)
+        self.temp_offset_samples = config.getint('temp_offset_samples', 3,
+                                                 minval=1, maxval=10)
+        self.temp_offset_timeout = config.getfloat(
+            'temp_offset_timeout', 900., above=0.)
+        self.temp_offset_pending = None
         self.z_adjustments = [0.] * 4
         self._load_zoffset_json()
         # Baby stepping (SET_GCODE_OFFSET Z_ADJUST) is added to the tool's
@@ -387,6 +417,7 @@ class Creator5Toolchanger:
             ('C5_FLOW_STROKES', self.cmd_flow_strokes),
             ('C5_EXTRUDER_ROTATION_CALIBRATE',
              self.cmd_extruder_rotation_calibrate),
+            ('C5_CALIBRATE_TEMP_OFFSETS', self.cmd_calibrate_temp_offsets),
             ('C5_MISC_FLOW_ON', self.cmd_flow_on),
             ('C5_MISC_FLOW_OFF', self.cmd_flow_off),
             ('C5_COOL_FOR_DOCK', self.cmd_cool_for_dock),
@@ -852,8 +883,20 @@ class Creator5Toolchanger:
             'T%d: %d\n' % (index, count) for index, count in enumerate(counts))
         self.toolchange_count_writer.submit(text)
 
-    def _print_correction(self, hotend, temp_coefficient, bed, first_layer):
-        return ((hotend - 120.) * temp_coefficient
+    def _thermal_correction(self, tool, hotend, temp_coefficient):
+        curve = self.temp_offsets[tool]
+        if curve is None:
+            return (hotend - 120.) * temp_coefficient
+        # Straight lines between the measured points; the first and last
+        # lines continue beyond them
+        for (t0, z0), (t1, z1) in zip(curve, curve[1:]):
+            if hotend <= t1:
+                break
+        return z0 + (z1 - z0) * (hotend - t0) / (t1 - t0)
+
+    def _print_correction(self, tool, hotend, temp_coefficient, bed,
+                          first_layer):
+        return (self._thermal_correction(tool, hotend, temp_coefficient)
                 - (0.08 if bed >= 100. else 0.)
                 - (0.06 if first_layer < 0.11 else 0.))
 
@@ -872,8 +915,9 @@ class Creator5Toolchanger:
         except (OSError, ValueError, TypeError, KeyError) as exc:
             raise gcmd.error('Invalid automatic nozzle Z calibration: %s' % exc)
         self.print_z_corrections = [
-            self._print_correction(hotend, temp_coefficient, bed, first_layer)
-            if hotend > 0. else None for hotend in hotends]
+            self._print_correction(tool, hotend, temp_coefficient, bed,
+                                   first_layer)
+            if hotend > 0. else None for tool, hotend in enumerate(hotends)]
 
     def _apply_print_z(self, tool):
         correction = self.print_z_corrections[tool]
@@ -926,8 +970,8 @@ class Creator5Toolchanger:
         except (OSError, ValueError, TypeError, KeyError) as exc:
             raise gcmd.error('Invalid automatic nozzle Z calibration: %s' % exc)
         baseline = tool_z - station_z
-        correction = self._print_correction(hotend, temp_coefficient, bed,
-                                            first_layer)
+        correction = self._print_correction(tool, hotend, temp_coefficient,
+                                            bed, first_layer)
         offset = baseline + correction + self.z_adjustments[tool]
         if not 0.5 <= offset <= 5.:
             raise gcmd.error('Automatic T%d nozzle Z %.4f mm outside 0.5..5 mm'
@@ -2987,6 +3031,321 @@ class Creator5Toolchanger:
                     self._run('RESTORE_GCODE_STATE NAME=C5_COOLDOWN_TRAVEL '
                               'MOVE=0')
 
+    # Per-tool temperature offset calibration. For each tool: unload at
+    # AFC's temperature for its material, let the user clean the nozzle,
+    # then measure its levelboard Z cold and at the PLA, PETG and ABS/ASA
+    # temperatures with the bed heated. The difference from cold is how far
+    # the nozzle grows; prints use it instead of test.json's tempOffset.
+
+    def _load_temp_offsets(self):
+        # {"t0": {"reference_temp": 48.5,
+        #         "points": [[215, 0.031], [245, 0.045], [275, 0.058]]}, ...}
+        curves = [None] * 4
+        try:
+            with open(self.temp_offset_json_path) as source:
+                data = json.load(source)
+        except (OSError, ValueError):
+            return curves
+        if not isinstance(data, dict):
+            return curves
+        for tool in range(4):
+            try:
+                entry = data['t%d' % tool]
+                curve = [(float(entry['reference_temp']), 0.)] + [
+                    (float(temp), float(dz)) for temp, dz in entry['points']]
+            except (TypeError, KeyError, ValueError):
+                continue
+            temps = [temp for temp, _ in curve]
+            if (len(curve) == 4
+                    and all(math.isfinite(v) for p in curve for v in p)
+                    and all(a < b for a, b in zip(temps, temps[1:]))):
+                curves[tool] = curve
+        return curves
+
+    def _save_temp_offset(self, gcmd, tool, reference_temp, points, bed):
+        data = {}
+        try:
+            with open(self.temp_offset_json_path) as source:
+                data = json.load(source)
+        except (OSError, ValueError):
+            pass
+        if not isinstance(data, dict):
+            data = {}
+        data['t%d' % tool] = {
+            'reference_temp': round(reference_temp, 1),
+            'points': [[temp, round(dz, 4)] for temp, dz in points],
+            'bed': bed,
+            'date': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+        temp_path = self.temp_offset_json_path + '.tmp'
+        try:
+            with open(temp_path, 'w') as target:
+                json.dump(data, target, indent=2, sort_keys=True)
+                target.write('\n')
+                target.flush()
+                os.fsync(target.fileno())
+            os.replace(temp_path, self.temp_offset_json_path)
+        except OSError as exc:
+            raise gcmd.error('Could not save %s: %s'
+                             % (self.temp_offset_json_path, exc))
+        self.temp_offsets = self._load_temp_offsets()
+
+    def cmd_calibrate_temp_offsets(self, gcmd):
+        cancel = 'Cancel|C5_CALIBRATE_TEMP_OFFSETS CANCEL=1|error'
+        if gcmd.get_int('CANCEL', 0, minval=0, maxval=1):
+            self._cancel_temp_offsets(gcmd)
+            return
+        if gcmd.get_int('CONTINUE', 0, minval=0, maxval=1):
+            self._measure_temp_offsets(gcmd)
+            return
+        tool = gcmd.get('TOOL', None)
+        if tool is None:
+            self._prompt('Temperature Offset Calibration',
+                         ['Measures how far each nozzle grows at PLA, PETG '
+                          'and ABS/ASA temperatures. Which tool?'],
+                         ['T%d|C5_CALIBRATE_TEMP_OFFSETS TOOL=%d|primary'
+                          % (t, t) for t in range(4)]
+                         + ['All tools|C5_CALIBRATE_TEMP_OFFSETS TOOL=ALL'
+                            '|primary'],
+                         [cancel])
+            return
+        tool = tool.strip().upper()
+        if tool == 'ALL':
+            tools = [0, 1, 2, 3]
+        elif tool in ('0', '1', '2', '3'):
+            tools = [int(tool)]
+        else:
+            raise gcmd.error('TOOL must be 0..3 or ALL')
+        temps = [gcmd.get_float(name, default, minval=170., maxval=320.)
+                 for name, default in zip(('PLA', 'PETG', 'ABS'),
+                                          self.temp_offset_temps)]
+        if not temps[0] < temps[1] < temps[2]:
+            raise gcmd.error('PLA, PETG and ABS temperatures must rise')
+        bed = gcmd.get_float('BED', self.temp_offset_bed, minval=0.,
+                             maxval=120.)
+        retract = gcmd.get_float('RETRACT', self.temp_offset_retract,
+                                 above=0., maxval=500.)
+        if not gcmd.get_int('BUILDPLATE_REMOVED', 0, minval=0, maxval=1):
+            self._prompt('Temperature Offset Calibration',
+                         ['The nozzle is measured on the levelboard. Remove '
+                          'the build plate, then press Continue.'],
+                         footer=[cancel,
+                                 'Continue|C5_CALIBRATE_TEMP_OFFSETS TOOL=%s '
+                                 'PLA=%.0f PETG=%.0f ABS=%.0f BED=%.0f '
+                                 'RETRACT=%.0f BUILDPLATE_REMOVED=1|primary'
+                                 % ((tool,) + tuple(temps) + (bed, retract))])
+            return
+        self.gcode.respond_raw('// action:prompt_end')
+        if self._printing():
+            raise gcmd.error('Finish or cancel the print before calibration')
+        _, _, attached = self._preflight(gcmd)
+        self.temp_offset_pending = None
+        # Heat the bed now so it has soaked by the time the nozzle is clean
+        self._run('SET_HEATER_TEMPERATURE HEATER=heater_bed TARGET=%.1f' % bed)
+        try:
+            with self._calibration_transaction():
+                self._dock_for_offset_reference(gcmd, attached)
+                # Plate check only; it also sets the levelboard approach floor
+                self._calibrate_offset_reference(gcmd, levelboard=False)
+            self._unload_for_temp_offsets(gcmd, {
+                'tools': tools, 'temps': temps, 'bed': bed,
+                'retract': retract})
+        except Exception:
+            self._end_temp_offsets(None)
+            raise
+
+    def _unload_for_temp_offsets(self, gcmd, pending):
+        tool = pending['tools'][0]
+        extruder = 'extruder' if tool == 0 else 'extruder%d' % tool
+        self._run('AFC_SELECT_TOOL TOOL=%s' % extruder)
+        _, _, attached = self._preflight(gcmd)
+        if attached != tool:
+            raise gcmd.error('T%d was not picked up' % tool)
+        # AFC's temperature for the lane's material (Spoolman, else
+        # default_material_temps), as the load macros use
+        temp = 0.
+        afc_extruder = self._afc_extruder(extruder)
+        if afc_extruder is not None:
+            try:
+                temp = float(afc_extruder.get_status().get('load_temp', 0.))
+            except Exception:
+                temp = 0.
+        if not 150. <= temp <= 320.:
+            temp = 220.
+        try:
+            self.cmd_move_to_purge_bucket(gcmd)
+            self._run('SET_HEATER_TEMPERATURE HEATER=%s TARGET=%.0f'
+                      % (extruder, temp))
+            self._run('TEMPERATURE_WAIT SENSOR=%s MINIMUM=%.0f'
+                      % (extruder, temp - 2.))
+            self._retract_filament(extruder, pending['retract'])
+        finally:
+            self._run('SET_HEATER_TEMPERATURE HEATER=%s TARGET=0' % extruder)
+        pending['tool'] = tool
+        self.temp_offset_pending = pending
+        self._prompt('Temperature Offset Calibration',
+                     ['T%d filament pulled back %.0f mm at %.0f C. Pull it '
+                      'the rest of the way out of the tool and clean the '
+                      'nozzle tip (it is still hot), then press Continue.'
+                      % (tool, pending['retract'], temp)],
+                     footer=['Cancel|C5_CALIBRATE_TEMP_OFFSETS CANCEL=1|error',
+                             'Continue|C5_CALIBRATE_TEMP_OFFSETS CONTINUE=1'
+                             '|primary'])
+        self._start_temp_offset_timeout(pending)
+
+    def _retract_filament(self, extruder, length):
+        heater = self.printer.lookup_object(extruder)
+        area = getattr(heater, 'filament_area', math.pi * .875 ** 2)
+        feed = self.temp_offset_retract_flow / area * 60.
+        # One extrude-only move may not exceed max_extrude_only_distance
+        step = getattr(heater, 'max_e_dist', 50.)
+        self._run('SAVE_GCODE_STATE NAME=C5_TEMP_OFFSET_RETRACT')
+        try:
+            self._run('M83')
+            remaining = length
+            while remaining > 1e-6:
+                move = min(remaining, step)
+                self._run('G1 E-%.3f F%.1f' % (move, feed))
+                remaining -= move
+            self._run('M400')
+        finally:
+            self._run('RESTORE_GCODE_STATE NAME=C5_TEMP_OFFSET_RETRACT')
+
+    def _start_temp_offset_timeout(self, pending):
+        reactor = self.printer.get_reactor()
+
+        def expire(eventtime):
+            reactor.unregister_timer(timer)
+            if self.temp_offset_pending is not pending:
+                return reactor.NEVER
+            self._end_temp_offsets(pending['tool'])
+            self.gcode.respond_raw('// action:prompt_end')
+            self.gcode.respond_raw(
+                '!! Temperature offset calibration timed out waiting for '
+                'Continue; heaters turned off. T%d is still attached.'
+                % pending['tool'])
+            return reactor.NEVER
+        timer = reactor.register_timer(
+            expire, reactor.monotonic() + self.temp_offset_timeout)
+
+    def _end_temp_offsets(self, tool):
+        self.temp_offset_pending = None
+        self._stock_pin_approach_z = None
+        self._run('SET_HEATER_TEMPERATURE HEATER=heater_bed TARGET=0')
+        if tool is not None:
+            self._run('SET_HEATER_TEMPERATURE HEATER=%s TARGET=0'
+                      % ('extruder' if tool == 0 else 'extruder%d' % tool))
+
+    def _cancel_temp_offsets(self, gcmd):
+        pending = self.temp_offset_pending
+        self.gcode.respond_raw('// action:prompt_end')
+        if pending is None:
+            gcmd.respond_info('Temperature offset calibration cancelled')
+            return
+        tool = pending['tool']
+        self._end_temp_offsets(tool)
+        gcmd.respond_info('Temperature offset calibration cancelled')
+        _, _, attached = self._preflight(gcmd)
+        if attached == tool:
+            self._cool_tool(gcmd, tool, self.temp_offset_temps[0] - 100.)
+            self._run('AFC_UNSELECT_TOOL')
+
+    def _cool_tool(self, gcmd, tool, target):
+        # Over the bucket with the part fan on and the heater off
+        extruder = 'extruder' if tool == 0 else 'extruder%d' % tool
+        heater = self.printer.lookup_object(extruder)
+        reactor = self.printer.get_reactor()
+        self.cmd_move_to_purge_bucket(gcmd)
+        self._run('SET_HEATER_TEMPERATURE HEATER=%s TARGET=0' % extruder)
+        self._run('SET_FAN_SPEED FAN=fanM106 SPEED=1')
+        try:
+            deadline = reactor.monotonic() + 900.
+            while True:
+                now = reactor.monotonic()
+                actual = heater.get_status(now).get('temperature')
+                if actual is None or not math.isfinite(actual):
+                    raise gcmd.error('Cannot verify T%d temperature' % tool)
+                if actual <= target:
+                    return actual
+                if now >= deadline:
+                    raise gcmd.error('T%d did not cool to %.0f C' % (tool, target))
+                reactor.pause(min(deadline, now + 1.))
+        finally:
+            self._run('SET_FAN_SPEED FAN=fanM106 SPEED=0')
+
+    def _levelboard_z(self, gcmd, tool):
+        # The tool's contact Z on the levelboard, as offset calibration
+        # measures it, averaged over several touches
+        def measure():
+            self._run('SET_GCODE_OFFSET X=0 Y=0 MOVE=0')
+            try:
+                return [self._probe_fixture_z(
+                    gcmd, self.station_x + self.tool_fixture_shift_x,
+                    self.station_y) for _ in range(self.temp_offset_samples)]
+            finally:
+                self._lift_after_offset_calibration(gcmd)
+        with self._calibration_transaction():
+            values = self._with_motion(gcmd, measure)
+        if max(values) - min(values) > .05:
+            raise gcmd.error('T%d levelboard Z not repeatable within 0.05 mm '
+                             '(%s)' % (tool, ', '.join('%.4f' % v
+                                                       for v in values)))
+        return sum(values) / len(values)
+
+    def _measure_temp_offsets(self, gcmd):
+        pending = self.temp_offset_pending
+        if pending is None:
+            raise gcmd.error('Start with C5_CALIBRATE_TEMP_OFFSETS TOOL=...')
+        self.temp_offset_pending = None
+        self.gcode.respond_raw('// action:prompt_end')
+        tool = pending['tool']
+        extruder = 'extruder' if tool == 0 else 'extruder%d' % tool
+        try:
+            _, _, attached = self._preflight(gcmd)
+            if attached != tool:
+                raise gcmd.error('T%d is no longer attached' % tool)
+            if pending['bed'] > 0.:
+                self._run('TEMPERATURE_WAIT SENSOR=heater_bed MINIMUM=%.1f'
+                          % (pending['bed'] - 2.))
+            reference_temp = self._cool_tool(
+                gcmd, tool, self.temp_offset_reference_temp)
+            reference_z = self._levelboard_z(gcmd, tool)
+            gcmd.respond_info('T%d levelboard Z %.4f at %.0f C'
+                              % (tool, reference_z, reference_temp))
+            points = []
+            for temp in pending['temps']:
+                self.cmd_move_to_purge_bucket(gcmd)
+                self._run('SET_HEATER_TEMPERATURE HEATER=%s TARGET=%.0f'
+                          % (extruder, temp))
+                self._run('TEMPERATURE_WAIT SENSOR=%s MINIMUM=%.0f'
+                          % (extruder, temp - 2.))
+                self._pause_ms(int(self.temp_offset_soak * 1000.))
+                z = self._levelboard_z(gcmd, tool)
+                points.append((temp, z - reference_z))
+                gcmd.respond_info('T%d at %.0f C: nozzle %+.4f mm'
+                                  % (tool, temp, z - reference_z))
+            self._cool_tool(gcmd, tool, pending['temps'][-1] - 100.)
+            self._run('AFC_UNSELECT_TOOL')
+            self._save_temp_offset(gcmd, tool, reference_temp, points,
+                                   pending['bed'])
+        except Exception:
+            self._end_temp_offsets(tool)
+            raise
+        gcmd.respond_info('T%d temperature offsets saved: %s (from %.0f C)'
+                          % (tool, ', '.join('%.0f C %+.4f mm' % p
+                                             for p in points),
+                             reference_temp))
+        pending['tools'] = pending['tools'][1:]
+        if pending['tools']:
+            try:
+                self._unload_for_temp_offsets(gcmd, pending)
+            except Exception:
+                self._end_temp_offsets(pending['tools'][0])
+                raise
+            return
+        self._end_temp_offsets(None)
+        gcmd.respond_info('Temperature offset calibration done. Put the '
+                          'build plate back and reload filament.')
+
     def get_status(self, eventtime=None):
         cached = self._ui_sensor_cache
         if (eventtime is not None and cached is not None
@@ -3005,7 +3364,8 @@ class Creator5Toolchanger:
                 'busy': self.busy,
                 'build_plate_detected': self.build_plate_detected,
                 'dock_positions': [list(p) for p in self.docks],
-                'tool_measurements': [list(p) for p in self.measurements]}
+                'tool_measurements': [list(p) for p in self.measurements],
+                'temp_offset_tools': [c is not None for c in self.temp_offsets]}
 
 
 def load_config(config):

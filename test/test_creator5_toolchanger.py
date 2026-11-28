@@ -92,6 +92,7 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board._stock_pin_approach_z = None
         self.board.print_z_baseline = [None] * 4
         self.board.print_z_corrections = [None] * 4
+        self.board.temp_offsets = [None] * 4
         self.board._button_objects = {}
         self.board.dock_buttons = ['dock%d' % i for i in range(4)]
         self.board.grab_buttons = ['grab%d' % i for i in range(4)]
@@ -2286,6 +2287,37 @@ class Creator5OffsetTests(unittest.TestCase):
             release.set()
             data, _ = self._saved(zpath)
         self.assertAlmostEqual(data['z_offset_t2'], -0.01)
+
+    def test_print_z_uses_stock_temp_offset_without_a_full_calibration(self):
+        self.board.temp_offset_json_path = os.path.join(
+            self.temp.name, 'temp_offset.json')
+        with open(self.board.temp_offset_json_path, 'w') as target:
+            json.dump({'t0': {'reference_temp': 45.,
+                              'points': [[215, .03], [245, .05]]}}, target)
+        self.board.temp_offsets = self.board._load_temp_offsets()
+        self.board.cmd_print_z_plan(GCmd(HOTEND0=220., BED=60.))
+        self.assertAlmostEqual(self.board.print_z_corrections[0],
+                               (220. - 120.) * .00045)
+
+    def test_print_z_follows_a_tools_measured_temp_offsets(self):
+        self.board.temp_offset_json_path = os.path.join(
+            self.temp.name, 'temp_offset.json')
+        with open(self.board.temp_offset_json_path, 'w') as target:
+            json.dump({'t1': {'reference_temp': 45., 'points': [
+                [215, .03], [245, .05], [275, .08]]}}, target)
+        self.board.temp_offsets = self.board._load_temp_offsets()
+        self.board.cmd_print_z_plan(GCmd(HOTEND0=230., HOTEND1=230.,
+                                         HOTEND2=290., BED=60.))
+        # T1 between its 215 and 245 C points; T0 has no calibration
+        self.assertAlmostEqual(self.board.print_z_corrections[1], .04)
+        self.assertAlmostEqual(self.board.print_z_corrections[0],
+                               (230. - 120.) * .00045)
+        self.board.temp_offsets[2] = self.board.temp_offsets[1]
+        self.board.cmd_print_z_plan(GCmd(HOTEND2=290., BED=110.,
+                                         FIRST_LAYER_HEIGHT=.08))
+        # Above 275 C the last line continues; bed and first layer still apply
+        self.assertAlmostEqual(self.board.print_z_corrections[2],
+                               .095 - .08 - .06)
 
 
 if __name__ == '__main__':
