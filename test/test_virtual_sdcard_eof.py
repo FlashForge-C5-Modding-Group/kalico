@@ -672,9 +672,9 @@ class VirtualSDEOFTests(unittest.TestCase):
             'MATERIAL2=UNKNOWN MATERIAL3=UNKNOWN '
             'USED_TOOLS=0,3 DENSITY0=1.24 DENSITY3=1.38 POOP=1.5')
 
-    def test_poop_without_grams_is_two_and_zero_is_off(self):
+    def test_poop_without_grams_is_the_default_and_zero_is_off(self):
         bare = MODULE.creator5_start_command('POOP=\nM109 S220\n', '')
-        self.assertTrue(bare.endswith(' POOP=2'))
+        self.assertTrue(bare.endswith(' POOP=0.05'))
         off = MODULE.creator5_start_command('poop=0\nM109 S220\n', '')
         self.assertNotIn('POOP', off)
         self.assertNotIn('POOP',

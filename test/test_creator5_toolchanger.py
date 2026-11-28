@@ -115,6 +115,8 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board.offset_calibration_lift = 3.
         self.board.offset_calibration_lift_speed = 10.
         self.board.safe_z = 10.
+        self.board.purge_exit_x = 5.
+        self.board.prep_approach_x = self.board.prep_approach_y = 250.
         self.board.scan_spans = {
             ('X', 1): 7., ('Y', 1): 7.,
             ('X', -1): 7., ('Y', -1): 7.}
@@ -152,6 +154,19 @@ class Creator5OffsetTests(unittest.TestCase):
             afc.tools[physical] = extruder
             afc.lanes[alias] = lane
         return afc
+
+    def test_leaving_the_bucket_goes_straight_out_along_x_first(self):
+        self.board._move = mock.Mock()
+        toolhead = self.board.printer.lookup_object.return_value
+        toolhead.get_position.return_value = [277.5, 257., 10., 0.]
+        self.board._leave_bucket()
+        self.board._move.assert_called_once_with(x=272.5, feed=3000)
+        self.board._move.reset_mock()
+        # beside a dock, or anywhere else, it stays put
+        for position in ([298., 207., 10., 0.], [150., 257., 10., 0.]):
+            toolhead.get_position.return_value = position
+            self.board._leave_bucket()
+        self.board._move.assert_not_called()
 
     def test_dock_keeps_a_unit_fed_lane_loaded(self):
         afc = self._afc_tool_fixture('extruder0')
@@ -1831,8 +1846,10 @@ class Creator5OffsetTests(unittest.TestCase):
         heater = mock.Mock()
         heater.get_status.side_effect = [
             {'temperature': 220.}, {'temperature': 121.}]
+        toolhead = mock.Mock()
+        toolhead.get_position.return_value = [277.5, 257., 10., 0.]
         self.board.printer.lookup_object.side_effect = (
-            lambda name: {'extruder1': heater}[name])
+            lambda name: {'extruder1': heater, 'toolhead': toolhead}[name])
         reactor = self.board.printer.get_reactor.return_value
         reactor.monotonic.side_effect = [0., 1., 2.]
         self.board.cmd_cool_for_dock(GCmd(HOTEND=220.))
@@ -1843,7 +1860,9 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board._run.assert_any_call('SET_FAN_SPEED FAN=fanM106 SPEED=0')
         self.board.cmd_verify_nozzle_z.assert_called_once()
         self.board._raise_z.assert_called_once()
+        # Straight out of the bucket along X before the inboard waypoint
         self.assertEqual(self.board._move.call_args_list, [
+            mock.call(x=272.5, feed=3000),
             mock.call(x=250., y=250., feed=6000, machine=False),
             mock.call(y=13.8, feed=6000, machine=False),
             mock.call(x=266.5, feed=3000, machine=False),
@@ -1863,8 +1882,10 @@ class Creator5OffsetTests(unittest.TestCase):
         self.board.cooldown_fan_speed = .6
         heater = mock.Mock()
         heater.get_status.return_value = {'temperature': 220.}
+        toolhead = mock.Mock()
+        toolhead.get_position.return_value = [277.5, 257., 10., 0.]
         self.board.printer.lookup_object.side_effect = (
-            lambda name: {'extruder1': heater}[name])
+            lambda name: {'extruder1': heater, 'toolhead': toolhead}[name])
         reactor = self.board.printer.get_reactor.return_value
         reactor.monotonic.side_effect = [0., 181.]
         with self.assertRaisesRegex(RuntimeError, 'did not cool'):

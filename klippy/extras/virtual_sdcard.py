@@ -131,13 +131,13 @@ def creator5_start_command(header, footer=""):
 
 
 def creator5_poop(*sources):
-    """Grams from the first 'poop=<grams>' line (';' optional), 2 without a
+    """Grams from the first 'poop=<grams>' line (';' optional), 0.05 without a
     number; None without the line or for 0."""
     for source in sources:
         match = re.search(r"^[ \t]*;?[ \t]*poop[ \t]*=[ \t]*([0-9]*\.?[0-9]+)?[ \t]*$",
                           source, re.I | re.M)
         if match:
-            grams = float(match.group(1)) if match.group(1) else 2.
+            grams = float(match.group(1)) if match.group(1) else .05
             return grams if grams > 0 else None
     return None
 
